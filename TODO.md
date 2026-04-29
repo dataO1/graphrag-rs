@@ -215,3 +215,132 @@ Out of Scope (separate phases)
   not graphrag-rs proper.
 - Refactoring graphrag-cli into a graphrag-server REST client. That's
   a much larger conversation and orthogonal to schema parity.
+
+----
+
+Phase F: Claude Code skill — "graphrag" (⬜ NOT STARTED)
+⬜ Author SKILL.md describing WHEN to consult the graph
+⬜ Concrete example questions / triggers (Obsidian-vault context)
+⬜ Decision tree: "should I query the graph for this?"
+⬜ Anti-patterns: don't query for code questions, ephemeral state, etc.
+⬜ Pair with the existing graphrag-mcp tools (query, list_documents,
+   graph_stats) — skill describes activation, MCP provides the call
+⬜ Equivalent system-prompt addendum for opencode/crush (non-Claude
+   clients can't load skills; render the same activation guidance into
+   their custom_instructions)
+
+----
+
+Implementation Plan — Phase F: Claude Code "graphrag" skill
+
+Goal
+
+graphrag-mcp exposes the *capability* (six tools wired to the REST
+server: query, graph_stats, list_documents, add_document,
+delete_document, build_graph) to any MCP-aware agent. What's missing
+is *activation* — a description of when an agent should reach for the
+graph instead of just answering from its own context. Tool schema
+descriptions in MCP are one-liners; they're enough for the model to
+pick a tool when it's already decided to use one, but not enough to
+prompt the decision in the first place.
+
+A Claude Code skill at ~/.claude/skills/graphrag/SKILL.md provides
+that activation layer. It's loaded into context only when the
+description matches the user's request, so the cost is zero on
+unrelated turns and high signal on relevant ones.
+
+Non-Goals
+
+- Replace the MCP server. Skill describes; MCP executes. Removing the
+  MCP server would break opencode and crush, which can't load skills.
+- Bundle the skill into the graphrag-rs repo. Skills are agent-specific
+  artifacts and live with the user's agent config (dotfiles), not with
+  the underlying tool repo. Tracked here only because the design
+  choices (when to query, what counts as a "graph question") are
+  intrinsic to graphrag-rs's value proposition.
+
+Proposed Skill Content
+
+1. Frontmatter
+
+       ---
+       name: graphrag
+       description: Use when the user asks about content in their
+         personal knowledge base (Obsidian vault) — questions like
+         "what have I written about X", "what do my notes say about
+         Y", "summarize my thinking on Z", or anything where the
+         answer should come from prior personal notes rather than
+         general knowledge or current code.
+       ---
+
+2. Body sections
+
+   - **What this skill is for**: one paragraph framing graphrag as
+     personal-knowledge retrieval over the user's Obsidian vault.
+     Distinguish from: code search (use ripgrep), web search (use
+     searxng MCP), and current-state lookups (use git log / file
+     read).
+   - **Activation triggers** (positive): list 6–8 concrete prompt
+     shapes that should fire the skill. Examples:
+       "what have I written about ..."
+       "what notes do I have on ..."
+       "summarize my thinking on ..."
+       "what was my conclusion about ..."
+       "find my notes that touch on ..."
+   - **Anti-triggers**: list shapes that should NOT fire it. Examples:
+       code questions, "how does X work" general explainers,
+       greenfield brainstorming, anything in the current conversation
+       context, ephemeral state (clipboard, git status).
+   - **How to query**: invoke `mcp__graphrag__query` with the user's
+     phrasing. Don't paraphrase aggressively — the embedding match is
+     better with the user's own terms.
+   - **When the graph is empty**: if `graph_stats` shows 0 entities,
+     fall back to listing documents and reading a chunk directly via
+     `list_documents`. Surface this gap to the user — it's a config
+     issue, not a skill issue.
+   - **Result handling**: the query response includes `documentId`,
+     `title`, `similarity`, `excerpt`. Use the excerpt to ground the
+     answer; cite the title; don't fabricate beyond what the excerpts
+     contain.
+
+3. Examples (literal Q→tool-call→A traces)
+
+   - Q: "what did I write about LLM evaluation last quarter?"
+     Tool: query(question="LLM evaluation 2026-Q1")
+     Show how to thread top results into a synthesized answer.
+   - Q: "summarize my notes on the Transformer paper"
+     Tool: query(question="Transformer architecture self-attention")
+     Show how to handle multiple matches with overlapping content.
+   - Q (anti-trigger): "how does Rust's Send trait work?"
+     → don't fire skill; this isn't personal-knowledge retrieval.
+
+4. Cross-client parity
+
+   For opencode and crush, render an equivalent block as
+   custom_instructions in their JSON config. Same triggers, same
+   anti-patterns, but reference the MCP server name as configured
+   in each client (graphrag for both today). Source of truth: keep
+   the SKILL.md as canonical and copy the activation/anti-pattern
+   bullets into the JSON via a small generator if drift becomes a
+   problem. For now, hand-sync.
+
+Verification Plan
+
+- Manual: ask Claude five "what have I written about X" variants,
+  check the skill loads (visible via "Skill loaded: graphrag" in the
+  trace) and a query MCP call follows.
+- Manual: ask five anti-trigger variants (code questions, current-
+  state lookups), check the skill does NOT load.
+- Cross-client: same first round of tests against opencode and
+  crush; verify their system prompt matches the SKILL.md content.
+
+Out of Scope
+
+- Skill bundling for sharing. If we ever want to publish this for
+  other Obsidian + graphrag-rs users, that's a separate distribution
+  story (probably a small companion repo). The skill itself is
+  user-specific in its examples.
+- Auto-generating SKILL.md content from graphrag-rs metadata
+  (entity counts, document titles). Static text is fine and easier
+  to reason about; introducing a generator adds maintenance burden
+  for a small win.
