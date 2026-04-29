@@ -385,6 +385,420 @@ review, PRs B and C can be filed together. Default is sequential.
 - Any preference for `extra_body` structure (`Option<Value>` vs
   typed per-server enum like `extra_body: BackendExtras`)?
 
+## Drafted PR bodies (for user review before filing)
+
+These are the bodies that would go into `gh pr create --body`. Wrap
+in a HEREDOC at filing time. All three branches are prepared off
+`upstream/main` (`c46e287`) and validated locally; nothing is filed.
+
+### PR A body draft
+
+**Title**: `Server-side fixes: scope shadowing, OLLAMA_PORT env, doubled resource, qdrant build, deep-merge /config`
+
+**Branch**: `pr/server-fixes` (5 commits, ~60 LOC).
+
+```markdown
+Five small fixes against issues that surface when graphrag-server is
+exercised in a real deployment. None of them touch the feature
+surface; they all sit in graphrag-server (plus a one-line workspace
+Cargo.toml change). Filing them together because each is too small
+to justify its own PR overhead.
+
+## Motivation
+
+Hit each of these standing up a graphrag-rs deployment over a personal
+Obsidian vault with Qdrant + Ollama on the server. Submitting upstream
+because they all behave the same way for any deployment, not just
+mine.
+
+## Goals
+
+- Fix `/api/config` so it's reachable.
+- Fix `POST /api/documents` so it doesn't 405.
+- Make `OLLAMA_PORT` actually configurable from the environment.
+- Unbreak the qdrant-client build under restricted/sandboxed builds.
+- Fix `POST /config` partial updates clobbering unset fields.
+
+## Changes
+
+Five commits, each independent:
+
+1. **qdrant-client: opt out of generate-snippets default feature**
+   The default `generate-snippets` feature panics in build.rs when
+   network access is restricted (Nix sandbox, isolated CI). Disabling
+   it doesn't affect runtime functionality — only the snippet
+   generator that builds in offline-incompatible ways.
+
+2. **graphrag-server: rename /api/config → /config to fix scope shadowing**
+   `App` registers two services on the same prefix:
+
+       .service(scope("/api") ...)                  // apistos
+       ...
+       .service(web::scope("/api/config") ...)      // plain actix
+
+   actix-web matches services by registration order, prefix-first.
+   The apistos `/api` scope claims any `/api/*` request that doesn't
+   match an explicit sub-route — there's no `/api/config` inside that
+   scope, so requests 404. The plain-actix block below `.build()` is
+   dead code as written.
+
+   Three constraints make a fix in place tricky:
+   - `/api` can't move past `.build()` (apistos `scope` ≠ plain
+     `web::scope`).
+   - `config_endpoints::*` handlers can't move into the apistos `/api`
+     scope without `#[api_operation]` macros (apistos's typed scope
+     requires `PathItemDefinition`).
+   - Plain `web::scope` can't be registered before `.build()`.
+
+   Renaming `/api/config` → `/config` sidesteps all three: no overlap
+   with `/api`, no shadowing, block stays plain actix post-`.build()`.
+   The endpoint becomes reachable for the first time.
+
+   **Back-compat note**: technically a path change. Since the old
+   path 404'd in stock builds, no working caller could have depended
+   on it. Happy to add a `/api/config` alias if preferred.
+
+3. **graphrag-server: read OLLAMA_PORT from env (was hardcoded 11434)**
+   Mirrors the existing `OLLAMA_URL` env var. One-liner.
+
+4. **graphrag-server: merge doubled resource("") in /api/documents scope**
+   Two `resource("")` registrations under `/api/documents`, one for
+   `GET` (list) and one for `POST` (add). actix-web treats the second
+   as duplicate-route and silently drops one — `POST` returned 405.
+   Combine into a single `resource("")` with both methods chained.
+
+5. **config: deep-merge POST /config bodies over defaults**
+   Previously `POST /config` deserialized the body to `Config`,
+   replacing the in-memory config wholesale. Partial bodies (very
+   common — set just the openai or just the embeddings section) reset
+   every unset field to its default. Now does a recursive deep merge
+   over the existing config: only fields explicitly present in the
+   body change.
+
+   **Back-compat note**: behavior change for callers that were
+   relying on the wholesale-replace semantics. Most callers I'd
+   expect to want the new behavior — they were probably re-sending
+   the entire config to avoid this — but worth flagging.
+
+## Methodology
+
+- Cherry-picked off `upstream/main` (c46e287).
+- `cargo check -p graphrag-server --features qdrant,ollama` clean.
+- `cargo test -p graphrag-server --lib` 12/12 pass.
+- `cargo fmt --check` clean on touched files. Pre-existing fmt
+  warnings in untouched upstream files left alone.
+- `cargo clippy` introduces no new warnings; pre-existing warnings
+  in upstream untouched.
+```
+
+### PR B body draft
+
+**Title**: `Add OpenAI-compatible chat and embedding backends`
+
+**Branch**: `pr/openai-backend` (8 commits, ~810 LOC).
+
+```markdown
+Adds an OpenAI-compatible backend on parity with the existing Ollama
+path — for both chat (entity extraction, query, gleaning) and
+embeddings. Lets users drive graphrag-rs against any server that
+speaks `/v1/chat/completions` and `/v1/embeddings`: vLLM, llama.cpp's
+`llama-server`, OpenVINO Model Server, OpenRouter, OpenAI itself,
+self-hosted text-generation-inference, etc.
+
+Includes the small diagnostic endpoint (`GET /api/embeddings/stats`)
+that lets users verify which backend is actually serving — useful
+specifically when standing up a new local OpenAI-compat stack.
+
+## Motivation
+
+Local LLM deployments increasingly run on OpenAI-compatible servers
+(vLLM, llama.cpp, OVMS, etc.) rather than Ollama, partly because they
+support more modern features (tool calling, structured output,
+chat-template knobs) and partly because they integrate better with
+existing OpenAI client tooling. graphrag-rs's chat path was hardcoded
+to Ollama protocol and the embedding side had a parsed-but-unused
+"openai" config branch that fell back to hash. This PR closes the gap.
+
+## Goals
+
+- Drive graphrag-rs against any OpenAI-compat chat server with no
+  forking, on parity with the Ollama path.
+- Same for embeddings.
+- Per-request escape hatch for backend-specific knobs without
+  growing the config struct for every quirk (motivating case:
+  `chat_template_kwargs.enable_thinking=false` for Qwen3 on
+  llama.cpp; `response_format` for vLLM JSON mode).
+- Make uncapped extraction work for local LLMs (no token billing,
+  reasoning models truncate JSON when capped).
+- Feature-gate it the same way `ollama` is gated, to keep
+  WASM/minimal builds slim.
+
+## Changes
+
+### Chat (graphrag-core)
+
+- New `OpenAIConfig` struct alongside `OllamaConfig` on `Config`.
+  Fields: `enabled`, `base_url`, `chat_model`, `api_key`,
+  `timeout_seconds`, `max_retries`, `max_tokens` (`Option<u32>`),
+  `temperature`, `enable_caching`, `extra_body`.
+- New `OpenAIClient` (ureq + `tokio::task::spawn_blocking`, mirrors
+  `OllamaClient`'s sync-wrapped-async pattern).
+- New `ChatClient` enum dispatcher in `graphrag-core::chat`.
+  `ChatClient::from_config` picks the active backend based on
+  `openai.enabled` / `ollama.enabled`. Every consumer of chat —
+  entity extraction, query planning, gleaning — now takes
+  `ChatClient` instead of `OllamaClient` directly.
+- `Config::chat_enabled()` helper that returns true when either
+  backend is enabled. `build_graph` and friends gate on this so the
+  graph build cleanly skips LLM extraction when no chat backend is
+  available, instead of failing midway.
+
+### Embeddings (graphrag-server)
+
+- `EmbeddingService` got an OpenAI-compat branch alongside the
+  existing Ollama path. Activated by `EMBEDDING_BACKEND=openai` plus
+  `OPENAI_URL` / `OPENAI_EMBEDDING_MODEL` / `OPENAI_API_KEY` envs.
+  Reqwest-based (already a non-optional dep), so the gate is purely
+  a code-path toggle.
+
+### Per-request extras (extra_body)
+
+- New optional `OpenAIConfig.extra_body: Option<serde_json::Value>`
+  field. Merged into every `/chat/completions` request body at the
+  top level. Existing keys win — set fields on `OpenAIConfig`
+  (model, max_tokens, temperature, stop, top_p) take precedence
+  over `extra_body` collisions, so users can't accidentally
+  overwrite a typed field with a raw JSON blob.
+- Motivating cases (in the README):
+  - `chat_template_kwargs.enable_thinking=false` for Qwen3 on
+    llama.cpp's `--jinja` path (suppresses reasoning output that
+    truncates JSON extraction within a token cap).
+  - `response_format = { type = "json_object" }` for vLLM JSON mode.
+
+### Token-cap rework
+
+- `LLMEntityExtractor.max_tokens: usize` → `Option<usize>`. `None`
+  means "no cap" — `num_predict` / `max_tokens` is omitted from the
+  request body, server uses its own default (llama.cpp: -1 /
+  unlimited up to ctx). Useful for local LLMs where token cost is
+  just compute time and reasoning models truncate JSON when capped.
+  Default stays at `Some(1500)`; existing call sites keep working.
+- Drive-by bug fix: `lib.rs::build_graph` was reading
+  `ollama.max_tokens` even when `openai.enabled` — silently capping
+  openai extraction at the ollama default. Now reads the active
+  backend's cap.
+
+### Feature gate
+
+- `graphrag-core`: `openai = ["ureq", "async"]`. Added to the
+  `starter` bundle. Mirrors the existing `ollama` feature.
+- `graphrag-server`: `openai = ["graphrag-core/openai"]`.
+- `OpenAIConfig` itself stays unconditional so user configs round-
+  trip through serde regardless. Without the feature,
+  `ChatClient::from_config` falls through to ollama / None, with a
+  `tracing::warn!` explaining how to enable it.
+
+### Diagnostic endpoint
+
+- `GET /api/embeddings/stats` reports the live
+  `EmbeddingService.backend_name()` (openai / ollama / hash-fallback),
+  dimension, and per-source request counters. Plain Actix route
+  below `.build()`, same OpenAPI-bypass dance as `/config` — the
+  handler returns `serde_json::Value` rather than an apistos-typed
+  struct, which doesn't satisfy `PathItemDefinition`.
+
+  Useful precisely when verifying a new OpenAI-compat backend is
+  serving — separately from `/config`, which reflects graphrag-core's
+  internal embedding-generator config (a different layer that's not
+  the user-facing path).
+
+### Documentation
+
+- README: `[openai]` chat block alongside the existing `[ollama]`
+  block. Quick Start gets an "Option B" path showing the
+  `EMBEDDING_BACKEND=openai` flow against vLLM.
+
+## Methodology
+
+- Cherry-picked off `upstream/main` (c46e287).
+- All three feature combos compile clean: `qdrant,ollama` /
+  `qdrant,openai` / `qdrant,ollama,openai`.
+- Nine inline unit tests in `graphrag-core/src/openai/mod.rs`:
+  - serde round-trip with `extra_body` objects
+  - `max_tokens=None` round-trip (skip-on-None)
+  - `extra_body=None` round-trip
+  - request body shape (model, messages, stream, defaults)
+  - params override config (temperature, num_predict)
+  - `max_tokens` omitted when uncapped
+  - `extra_body` unique-key merge
+  - **`extra_body` precedence rule** (set fields beat collisions)
+  - defensive: non-object `extra_body` silently dropped
+- Run with: `cargo test -p graphrag-core --lib --features openai openai::`. 9/9 pass.
+- `cargo fmt --check` clean on touched files. Pre-existing fmt
+  warnings in untouched upstream files left alone.
+
+## Open questions
+
+- `extra_body` is `Option<serde_json::Value>` for maximum flexibility.
+  Considered a typed enum (e.g., `BackendExtras::LlamaCpp { ... } |
+  BackendExtras::Vllm { ... }`) but settled on raw Value because the
+  server-specific knobs change faster than this codebase's release
+  cadence. Open to switching if you'd rather have validation.
+- The feature gate is opt-in (mirrors `ollama`). Happy to flip to
+  default-on or add to `default = [...]`.
+- `/api/embeddings/stats` is folded in here because its primary use
+  case is diagnosing the new OpenAI embedding backend. Happy to
+  split into a follow-up PR if you'd prefer.
+```
+
+### PR C body draft
+
+**Title**: `Server UX: list_documents, user-id resolution, content-hash dedup, last_built_at, /api/graph/append`
+
+**Branch**: `pr/agent-ux` (1 squashed commit, ~430 LOC).
+
+```markdown
+Five small UX fixes plus one new endpoint, all clustered around the
+same root: what an LLM agent (or any client driving the API
+end-to-end without reading source) hits when actually exercising
+graphrag-server.
+
+## Motivation
+
+Driving graphrag-server from an MCP-bridged agent (Claude Code,
+opencode, crush) over a personal knowledge base, several rough edges
+showed up consistently:
+
+- `list_documents` returns `[]` with a "not implemented" note —
+  the agent can't discover what's indexed.
+- Deleting by the id passed at ingest returns 500 — only the
+  server-assigned UUID works, but the agent doesn't keep that.
+- Ingesting the same content twice produces two Qdrant points with
+  slightly different similarity scores in queries.
+- `graph_stats` doesn't say when the graph was built, so agents
+  can't tell if it's stale relative to recent ingests.
+- Triggering entity extraction means a full `build_graph` even
+  after one new ingest — Microsoft GraphRAG has the
+  `graphrag append` pattern for exactly this case, but
+  graphrag-server has no analogue.
+
+These cluster naturally — `last_built_at` and `/api/graph/append`
+are the same conceptual unit (the timestamp gives clients the
+signal to call append). Filed together so the contract makes sense
+as a whole.
+
+## Goals
+
+- Make `list_documents` actually return documents.
+- Let clients refer to documents by the id they supplied at ingest.
+- Stop duplicate-content ingest from creating duplicate vectors.
+- Surface graph-build freshness through the stats endpoint.
+- Add an append endpoint so clients/cron don't have to choose
+  between full rebuild and never rebuild.
+
+## Changes
+
+### list_documents (was a stub)
+
+`GET /api/documents` previously returned
+`{documents: [], total: N, note: "Full document listing from Qdrant not implemented yet"}`.
+Now pages through the collection via Qdrant's scroll API and returns
+real summaries `{id, userId, title, excerpt (160 chars), addedAt}`.
+Capped at 256 entries with a "use search to drill in beyond that"
+note when truncated.
+
+### User-supplied IDs
+
+`POST /api/documents` accepts an optional `id` JSON field. Stored in
+the Qdrant payload's new `user_id` field, alongside the UUID Qdrant
+requires for the point id itself.
+
+`DELETE /api/documents/{id}` resolves the path id as a `user_id`
+first (one Qdrant scroll-with-filter call), falls back to treating
+it as a UUID. Fixes the 500 callers hit when trying to delete by an
+id they remembered handing in at ingest.
+
+### Content-hash dedup
+
+`POST /api/documents` computes SHA-256 of the sanitized content
+before embedding. If a Qdrant point with the same `content_hash`
+already exists, returns the existing id without re-embedding.
+Mirrors Microsoft GraphRAG's stable-id pattern (v0.5.0+, enables
+upsert-merge).
+
+### last_built_at
+
+`GET /api/graph/stats` includes `lastBuiltAt` (RFC 3339 timestamp
+of the last successful `/api/graph/build`, null pre-first-build).
+Set on every successful build/append.
+
+### POST /api/graph/append
+
+Mirrors Microsoft GraphRAG's `graphrag append` semantics — a cheap
+call to fire after a batch of `/api/documents` so newly-ingested
+content shows up in queries, without paying for a full re-extraction.
+
+`AppState` got a new `processed_chunk_count: AtomicUsize`, set to
+the post-build chunk count after every successful build/append. The
+append handler snapshots the live chunk count first; if it hasn't
+grown since `processed_chunk_count`, returns immediately with
+`{success: true, documentCount: 0, message: "No new chunks since last build…"}`.
+Cron / MCP-driven callers can fire this on a tight cadence without
+paying LLM cost when nothing's changed.
+
+**Implementation note**: today this delegates to
+`GraphRAG::build_graph()` because graphrag-core's `incremental`
+module isn't yet wired into the runtime pipeline. The LLM-call
+cache (`enable_caching=true`) makes repeat extraction near-free for
+unchanged chunks, so the cost scales with new content rather than
+corpus size — but it's not a true incremental update yet. Worth
+landing the endpoint shape now so clients can adopt the right
+semantic; a follow-up will route through
+`graphrag-core::incremental::add_content`.
+
+## Wire-format additions (back-compat)
+
+All new fields use `#[serde(default, skip_serializing_if = "Option::is_none")]`
+so older payloads parse cleanly and older clients see no change:
+
+- `qdrant_store::DocumentMetadata.content_hash: Option<String>`.
+- `qdrant_store::DocumentMetadata.user_id: Option<String>`.
+- `models::GraphStatsResponse.lastBuiltAt: Option<String>`.
+- `models::DocumentSummary.userId`, `excerpt`, `contentLength`
+  (the Qdrant backend uses `excerpt`; the in-memory backend uses
+  `contentLength`).
+- `models::AddDocumentRequest.id: Option<String>` (request field).
+
+## Methodology
+
+- Cherry-picked off `upstream/main` (c46e287); squashed into one
+  commit because the changes tell one story and review's easier
+  that way. Happy to split if you'd rather see commit-per-fix.
+- `cargo check -p graphrag-server --features qdrant,ollama` clean.
+- `cargo test -p graphrag-server --lib --features qdrant,ollama`
+  12/12 pass (existing tests; the qdrant_store test fixture needed
+  updating for the new optional fields, included in this commit).
+- `cargo fmt --check` clean on touched files. Pre-existing fmt
+  warnings in untouched upstream files left alone.
+- New `sha2` dep is already a workspace dep used elsewhere; one
+  Cargo.lock line added.
+
+## Open questions
+
+- The append endpoint's "delegates to build_graph today" caveat is
+  honest but might prompt "why merge if it's just a thin wrapper?"
+  Answer: the endpoint shape is what matters — clients adopt the
+  right semantic now, the internal wiring tightens later. Open to
+  holding it back until the real incremental wiring lands if you'd
+  prefer.
+- Squashed into one commit for review ergonomics. Can split into
+  five smaller commits (one per fix) if that's easier to review.
+- Considered making `delete_document`'s user-id fallback configurable
+  (some deployments might want strict UUID-only). Settled on
+  always-try-user-id-first because it's the only reasonable default
+  for clients that handed us an id.
+```
+
 ## PR filing log
 
 (append rows when filed/updated)
