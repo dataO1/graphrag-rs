@@ -129,9 +129,12 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 16 | `0bd7018` | add PR-PLAN.md | 209 | **internal — do NOT PR** |
 | 17 | `9135482` | graphrag-server: real list_documents, user-id resolution, content-hash dedup, last_built_at | 344 | **PR C** |
 | 18 | `82f271c` | PR-PLAN: motivation + writing-style sections | 84 | **internal — do NOT PR** |
-| 19 | `f9bcfac` | graphrag-server: POST /api/graph/append for incremental updates | 164 | **PR C** (folded — was its own PR pre-consolidation) |
+| 19 | `f9bcfac` | graphrag-server: POST /api/graph/append (full-rebuild stub) | 164 | **superseded by 9979a13** — do NOT cherry-pick |
 | 20 | `c2f19b9` | PR-PLAN: row-19 sha fill | 1 | **internal — do NOT PR** |
-| 21 | `4af92ae` | Cargo.lock: register sha2 (added in 9135482) | 1 | **PR C** — only needed by 9135482's sha2 dep; squash into the cherry-pick of 9135482 or carry as a trailing commit |
+| 21 | `4af92ae` | Cargo.lock: register sha2 (added in 9135482) | 1 | **PR C** — needed by 9135482's sha2 dep |
+| 22 | `7f51cdc` | PR-PLAN: 5-PR → 3-PR consolidation | 167 | **internal — do NOT PR** |
+| 23 | `82f271c` (`ecddf23`) | PR-PLAN: motivation + writing-style + drafted PR bodies | many | **internal — do NOT PR** |
+| 24 | `9979a13` | graphrag-core: real incremental extend_graph; wire /api/graph/append to it | 904 | **PR C** — replaces f9bcfac entirely. Note the openai-compat-branch version uses ChatClient/chat_enabled; the cherry-pick onto pr/agent-ux uses Ollama-only primitives (`27a7c4e`) |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -227,20 +230,28 @@ embedding flexibility, feature-gating choices.
 **Pre-flight** to call out: feature gate is opt-in, mirroring
 `ollama`. Happy to flip to default-on or rename if preferred.
 
-### PR C — Agent-friendly UX
-**~500 LOC across 2 commits** — server UX cluster + append endpoint.
+### PR C — Agent-friendly UX + real incremental extend_graph
+**~1.2k LOC across 3 commits** — server UX cluster + real
+incremental graph extension (`extend_graph`).
 
-**Cherry-pick**: `9135482 f9bcfac`.
+**Cherry-pick onto `pr/agent-ux` (already prepared)**: `9135482`
++ a refactored version of `9979a13` (Ollama-only, since PR C must
+land independently of PR B's `ChatClient` additions) + Cargo.lock.
+The pre-prepared branch has commits `97a0e97 27a7c4e bbfff36`.
 
-**Title**: `Server UX: list_documents, user-id resolution, content-hash dedup, last_built_at, /api/graph/append`.
+**Title**: `Server UX + real incremental graph extension (extend_graph)`
 
 **Story for the maintainer**: five small fixes that all surface from
 the same root cause — what an LLM agent (or any client driving the
 API end-to-end without reading source) hits when exercising the
-documents/graph endpoints. `last_built_at` and `/api/graph/append`
-are the same conceptual unit: the timestamp gives agents/cron the
-information they need to decide whether to call append. Filed
-together so the contract makes sense as a whole.
+documents/graph endpoints. The marquee piece is a real
+`extend_graph` that walks only the delta chunks, dedupes entities
+by id (mentions of an existing entity extend the existing node's
+`mentions` in place), and dedupes relationships by
+`(source, target, relation_type)`. `last_built_at` and
+`/api/graph/append` are the same conceptual unit: the timestamp
+gives agents/cron the information they need to decide whether to
+call append. Filed together so the contract makes sense as a whole.
 
 **Sections to include in body**:
 - *list_documents*: previously returned `[]` with a "not implemented"
@@ -653,15 +664,20 @@ to Ollama protocol and the embedding side had a parsed-but-unused
 
 ### PR C body draft
 
-**Title**: `Server UX: list_documents, user-id resolution, content-hash dedup, last_built_at, /api/graph/append`
+**Title**: `Server UX + real incremental graph extension (extend_graph)`
 
-**Branch**: `pr/agent-ux` (1 squashed commit, ~430 LOC).
+**Branch**: `pr/agent-ux` (3 commits, ~1.2k LOC). Split by concern;
+happy to squash on merge.
+
+- `97a0e97` — server UX (list_documents, dedup, user-id, last_built_at)
+- `27a7c4e` — graphrag-core `extend_graph` + 4 inline tests + handler wiring
+- `bbfff36` — Cargo.lock for the new sha2 dep
 
 ```markdown
-Five small UX fixes plus one new endpoint, all clustered around the
-same root: what an LLM agent (or any client driving the API
-end-to-end without reading source) hits when actually exercising
-graphrag-server.
+Five small UX fixes plus a real incremental graph-extension API,
+all clustered around the same root: what an LLM agent (or any
+client driving the API end-to-end without reading source) hits
+when actually exercising graphrag-server.
 
 ## Motivation
 
@@ -693,8 +709,9 @@ as a whole.
 - Let clients refer to documents by the id they supplied at ingest.
 - Stop duplicate-content ingest from creating duplicate vectors.
 - Surface graph-build freshness through the stats endpoint.
-- Add an append endpoint so clients/cron don't have to choose
-  between full rebuild and never rebuild.
+- Add a **real** incremental extend endpoint — only walks the
+  delta chunks since the last build/extend, dedupes entities by
+  id, merges relationships. Not a wrapper around build_graph.
 
 ## Changes
 
@@ -732,29 +749,47 @@ upsert-merge).
 of the last successful `/api/graph/build`, null pre-first-build).
 Set on every successful build/append.
 
-### POST /api/graph/append
+### Real incremental graph extension
 
-Mirrors Microsoft GraphRAG's `graphrag append` semantics — a cheap
-call to fire after a batch of `/api/documents` so newly-ingested
-content shows up in queries, without paying for a full re-extraction.
+New `pub async fn GraphRAG::extend_graph(&mut self) -> Result<ExtendSummary>`
+in graphrag-core. Mirrors Microsoft GraphRAG's `graphrag append`
+semantics, properly:
 
-`AppState` got a new `processed_chunk_count: AtomicUsize`, set to
-the post-build chunk count after every successful build/append. The
-append handler snapshots the live chunk count first; if it hasn't
-grown since `processed_chunk_count`, returns immediately with
-`{success: true, documentCount: 0, message: "No new chunks since last build…"}`.
-Cron / MCP-driven callers can fire this on a tight cadence without
-paying LLM cost when nothing's changed.
+- Tracks `processed_chunks: HashSet<ChunkId>` on `GraphRAG`.
+  Populated at the end of `build_graph` (every chunk) and at the
+  end of `extend_graph` (only the delta).
+- `extend_graph` filters `knowledge_graph.chunks()` against
+  `processed_chunks` and runs the same extractor `build_graph`
+  would pick (gleaning / LLM single-pass / pattern-based) over
+  **only the delta**. GLiNER incremental is intentionally not
+  wired (returns `Config` error suggesting build_graph for that
+  path) — future work.
+- **Dedupes entities by id** before adding to the graph. If a
+  delta chunk re-mentions an entity that already exists, the
+  existing entity's `mentions` are extended in place (compared
+  by `(chunk_id, start_offset)`); confidence is bumped to the
+  max. No duplicate node. Mirrors Microsoft's stable-id pattern.
+- **Dedupes relationships** by `(source, target, relation_type)`
+  before adding. Skips edges already present.
+- Returns `ExtendSummary { chunks_processed, new_entities,
+  new_relationships, mentions_merged, total_entities,
+  total_relationships }` so callers can tell whether the extend
+  enriched existing nodes vs added new ones — useful for
+  downstream community/PageRank recompute decisions, mirroring
+  Microsoft's append heuristic.
+- `clear_processed_chunks()` resets the tracking set so the next
+  `extend_graph` re-walks every chunk. Useful after a config
+  change (entity_types, prompts) where you want to re-extract
+  without wiping the graph first.
 
-**Implementation note**: today this delegates to
-`GraphRAG::build_graph()` because graphrag-core's `incremental`
-module isn't yet wired into the runtime pipeline. The LLM-call
-cache (`enable_caching=true`) makes repeat extraction near-free for
-unchanged chunks, so the cost scales with new content rather than
-corpus size — but it's not a true incremental update yet. Worth
-landing the endpoint shape now so clients can adopt the right
-semantic; a follow-up will route through
-`graphrag-core::incremental::add_content`.
+`POST /api/graph/append` is a thin wrapper around `extend_graph`:
+fast no-op when no delta, real incremental work when there is.
+
+`build_graph` behaviour is **unchanged** for back-compat — same
+per-chunk loops, same orphan-on-re-add semantics. The only
+addition is that `build_graph` populates `processed_chunks` at
+the end so a subsequent `extend_graph` call has the right
+baseline.
 
 ## Wire-format additions (back-compat)
 
@@ -768,16 +803,32 @@ so older payloads parse cleanly and older clients see no change:
   (the Qdrant backend uses `excerpt`; the in-memory backend uses
   `contentLength`).
 - `models::AddDocumentRequest.id: Option<String>` (request field).
+- `GraphRAG::ExtendSummary` (new public type, returned by
+  `extend_graph`).
+- `GraphRAG::processed_chunk_count() -> usize`,
+  `GraphRAG::clear_processed_chunks()` (new public methods).
 
 ## Methodology
 
-- Cherry-picked off `upstream/main` (c46e287); squashed into one
-  commit because the changes tell one story and review's easier
-  that way. Happy to split if you'd rather see commit-per-fix.
+- Cherry-picked off `upstream/main` (c46e287). Three commits,
+  one per concern.
 - `cargo check -p graphrag-server --features qdrant,ollama` clean.
 - `cargo test -p graphrag-server --lib --features qdrant,ollama`
-  12/12 pass (existing tests; the qdrant_store test fixture needed
-  updating for the new optional fields, included in this commit).
+  12/12 pass.
+- **Four new inline `extend_graph` tests** in
+  `graphrag-core/src/lib.rs`, all using the pattern-based
+  extractor (no LLM dependency, deterministic):
+  - `extend_graph_no_new_chunks_is_a_fast_noop` — extend after a
+    fresh build returns chunks_processed=0.
+  - `extend_graph_processes_only_delta_chunks` — second doc gets
+    a chunks_processed=1 extend (not 2).
+  - `extend_graph_dedupes_entities_by_id` — entity re-mentioned
+    in a delta chunk does NOT create a duplicate node;
+    mentions are merged in place.
+  - `extend_graph_after_clear_processed_re_extracts_everything`
+    — `clear_processed_chunks()` resets the tracking set.
+  Run with: `cargo test -p graphrag-core --lib extend_graph`.
+  4/4 pass.
 - `cargo fmt --check` clean on touched files. Pre-existing fmt
   warnings in untouched upstream files left alone.
 - New `sha2` dep is already a workspace dep used elsewhere; one
@@ -785,18 +836,17 @@ so older payloads parse cleanly and older clients see no change:
 
 ## Open questions
 
-- The append endpoint's "delegates to build_graph today" caveat is
-  honest but might prompt "why merge if it's just a thin wrapper?"
-  Answer: the endpoint shape is what matters — clients adopt the
-  right semantic now, the internal wiring tightens later. Open to
-  holding it back until the real incremental wiring lands if you'd
-  prefer.
-- Squashed into one commit for review ergonomics. Can split into
-  five smaller commits (one per fix) if that's easier to review.
 - Considered making `delete_document`'s user-id fallback configurable
   (some deployments might want strict UUID-only). Settled on
   always-try-user-id-first because it's the only reasonable default
-  for clients that handed us an id.
+  for clients that handed us an id. Open to making it opt-in.
+- `extend_graph` doesn't currently support GLiNER incremental
+  (returns `Config` error suggesting `build_graph` for that path).
+  GLiNER's per-chunk surface is the same shape as the LLM and
+  pattern paths, so it's a small follow-up — happy to add to this
+  PR if you'd prefer it complete now.
+- The three commits are split by concern (server UX / core
+  incremental / Cargo.lock). Happy to squash on merge.
 ```
 
 ## PR filing log
