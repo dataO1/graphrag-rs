@@ -212,6 +212,8 @@ graphrag-wasm/dist/models/minilm-l6.onnx
 # but keep general .md (article.md, README.md, etc.)
 /*.md
 !README.md
+!TODO.md
+!PR-PLAN.md
 
 # exclude files with hidden extensions
 .*.*
