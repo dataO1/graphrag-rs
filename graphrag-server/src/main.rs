@@ -953,42 +953,22 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
 /// chunk count hasn't grown since the previous build/append. Cheap
 /// for cron-driven callers that fire periodically regardless of
 /// whether anything new was ingested.
+///
+/// Internally calls `GraphRAG::extend_graph` — a real incremental
+/// pass that only walks the chunks ingested since the last build /
+/// extend, dedupes entities by id (mentions of an existing entity
+/// extend its `mentions` in place rather than creating a duplicate
+/// node), and merges relationships keyed by (source, target,
+/// relation_type). Cost scales with the size of the delta, not with
+/// the total corpus.
 #[api_operation(
     tag = "graph",
     summary = "Append new chunks to the knowledge graph",
-    description = "Run entity extraction on chunks ingested since the last build. Cheap no-op when nothing new. Use after a batch of /api/documents calls; do NOT call once per document.",
+    description = "Run entity extraction on chunks ingested since the last build. Walks only the delta (no full rebuild), dedupes entities by id, merges relationships. Cheap no-op when nothing new. Use after a batch of /api/documents calls; do NOT call once per document.",
     error_code = 500
 )]
 async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, ApiError> {
     let start = std::time::Instant::now();
-
-    // Snapshot live chunk count vs the count we processed last time.
-    let live_chunks = {
-        let g = state.graphrag.read().await;
-        g.as_ref()
-            .and_then(|gr| gr.knowledge_graph())
-            .map(|kg| kg.chunks().count())
-            .unwrap_or(0)
-    };
-    let last_processed = state
-        .processed_chunk_count
-        .load(std::sync::atomic::Ordering::SeqCst);
-
-    if live_chunks <= last_processed {
-        let elapsed = start.elapsed().as_millis() as u64;
-        return Ok(Json(BuildGraphResponse {
-            success: true,
-            document_count: 0,
-            processing_time_ms: elapsed,
-            message: format!(
-                "No new chunks since last build ({} processed). Nothing to append.",
-                last_processed
-            ),
-            backend: "graphrag-pipeline".to_string(),
-        }));
-    }
-
-    let new_chunks = live_chunks - last_processed;
 
     let mut graphrag_guard = state.graphrag.write().await;
     let Some(graphrag) = graphrag_guard.as_mut() else {
@@ -997,36 +977,59 @@ async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>,
         ));
     };
 
-    match graphrag.build_graph().await {
-        Ok(_) => {
+    match graphrag.extend_graph().await {
+        Ok(summary) => {
             let processing_time = start.elapsed().as_millis() as u64;
-            let (entities, relationships, chunk_count) = graphrag
-                .knowledge_graph()
-                .map(|kg| (
-                    kg.entities().count(),
-                    kg.relationships().count(),
-                    kg.chunks().count(),
-                ))
-                .unwrap_or((0, 0, 0));
+
+            // No-op fast path: nothing was ingested since last build.
+            // Cron-callers fire this regardless of whether anything's
+            // changed; surface that as a clear message rather than a
+            // misleading "appended 0 chunks".
+            if summary.chunks_processed == 0 {
+                return Ok(Json(BuildGraphResponse {
+                    success: true,
+                    document_count: 0,
+                    processing_time_ms: processing_time,
+                    message: format!(
+                        "No new chunks since last build ({} processed). Nothing to append.",
+                        graphrag.processed_chunk_count()
+                    ),
+                    backend: "graphrag-pipeline".to_string(),
+                }));
+            }
 
             *state.graph_built.write().await = true;
             *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-            state
-                .processed_chunk_count
-                .store(chunk_count, std::sync::atomic::Ordering::SeqCst);
+            // Mirror processed_chunks count into AppState for /health
+            // and /api/embeddings/stats consumers.
+            state.processed_chunk_count.store(
+                graphrag.processed_chunk_count(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
 
             tracing::info!(
-                "Appended {} new chunks via pipeline in {}ms (graph now: {} entities, {} relationships)",
-                new_chunks, processing_time, entities, relationships
+                "extend_graph: {} delta chunks, +{} entities, +{} rels, {} mentions merged ({}ms; graph: {} entities, {} rels)",
+                summary.chunks_processed,
+                summary.new_entities,
+                summary.new_relationships,
+                summary.mentions_merged,
+                processing_time,
+                summary.total_entities,
+                summary.total_relationships,
             );
 
             Ok(Json(BuildGraphResponse {
                 success: true,
-                document_count: new_chunks,
+                document_count: summary.chunks_processed,
                 processing_time_ms: processing_time,
                 message: format!(
-                    "Appended {} new chunks: {} entities, {} relationships in graph",
-                    new_chunks, entities, relationships
+                    "Appended {} new chunks: +{} entities, +{} relationships, {} mentions merged ({} entities, {} relationships total)",
+                    summary.chunks_processed,
+                    summary.new_entities,
+                    summary.new_relationships,
+                    summary.mentions_merged,
+                    summary.total_entities,
+                    summary.total_relationships,
                 ),
                 backend: "graphrag-pipeline".to_string(),
             }))
