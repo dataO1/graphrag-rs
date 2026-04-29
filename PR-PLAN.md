@@ -760,10 +760,8 @@ semantics, properly:
   end of `extend_graph` (only the delta).
 - `extend_graph` filters `knowledge_graph.chunks()` against
   `processed_chunks` and runs the same extractor `build_graph`
-  would pick (gleaning / LLM single-pass / pattern-based) over
-  **only the delta**. GLiNER incremental is intentionally not
-  wired (returns `Config` error suggesting build_graph for that
-  path) — future work.
+  would pick (gleaning / LLM single-pass / GLiNER /
+  pattern-based) over **only the delta**.
 - **Dedupes entities by id** before adding to the graph. If a
   delta chunk re-mentions an entity that already exists, the
   existing entity's `mentions` are extended in place (compared
@@ -815,6 +813,9 @@ so older payloads parse cleanly and older clients see no change:
 - `cargo check -p graphrag-server --features qdrant,ollama` clean.
 - `cargo test -p graphrag-server --lib --features qdrant,ollama`
   12/12 pass.
+- All three relevant feature combos compile clean:
+  default features, `--features gliner`, and (for graphrag-server)
+  `qdrant,ollama`.
 - **Four new inline `extend_graph` tests** in
   `graphrag-core/src/lib.rs`, all using the pattern-based
   extractor (no LLM dependency, deterministic):
@@ -829,6 +830,15 @@ so older payloads parse cleanly and older clients see no change:
     — `clear_processed_chunks()` resets the tracking set.
   Run with: `cargo test -p graphrag-core --lib extend_graph`.
   4/4 pass.
+- **GLiNER incremental path is wired but untested**, matching
+  build_graph's GLiNER branch which is also untested upstream
+  (GLiNER needs a downloaded ONNX model and produces non-
+  deterministic output, so neither extractor side has a
+  deterministic test). Visual parity with build_graph's GLiNER
+  branch + the shared `merge_entity` / `merge_relationship`
+  helpers (which the four pattern-based tests exercise) are the
+  evidence base. Marked **untested** in the
+  `extend_with_gliner` doc comment.
 - `cargo fmt --check` clean on touched files. Pre-existing fmt
   warnings in untouched upstream files left alone.
 - New `sha2` dep is already a workspace dep used elsewhere; one
@@ -840,11 +850,6 @@ so older payloads parse cleanly and older clients see no change:
   (some deployments might want strict UUID-only). Settled on
   always-try-user-id-first because it's the only reasonable default
   for clients that handed us an id. Open to making it opt-in.
-- `extend_graph` doesn't currently support GLiNER incremental
-  (returns `Config` error suggesting `build_graph` for that path).
-  GLiNER's per-chunk surface is the same shape as the LLM and
-  pattern paths, so it's a small follow-up — happy to add to this
-  PR if you'd prefer it complete now.
 - The three commits are split by concern (server UX / core
   incremental / Cargo.lock). Happy to squash on merge.
 ```
