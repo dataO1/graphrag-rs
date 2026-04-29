@@ -129,7 +129,7 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 16 | `0bd7018` | add PR-PLAN.md | 209 | **internal — do NOT PR** |
 | 17 | `9135482` | graphrag-server: real list_documents, user-id resolution, content-hash dedup, last_built_at | 344 | D — UX |
 | 18 | `82f271c` | PR-PLAN: motivation + writing-style sections | 84 | **internal — do NOT PR** |
-| 19 | _next_ | graphrag-server: POST /api/graph/append for incremental updates | ~140 | E — append |
+| 19 | `f9bcfac` | graphrag-server: POST /api/graph/append for incremental updates | 164 | E — append |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
