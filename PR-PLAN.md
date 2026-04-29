@@ -43,6 +43,8 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 13 | `662c86b` | TODO.md Phase F (Claude skill) | 129 | **internal — do NOT PR** |
 | 14 | `ff39c84` | README: document OpenAI-compatible chat backend | 42 | B (folded into PR 2) |
 | 15 | `79e3034` | feature-gate the openai-compat backend | 287 | B (folded into PR 2) |
+| 16 | `0bd7018` | add PR-PLAN.md | 209 | **internal — do NOT PR** |
+| 17 | _next_ | server quick wins: list_documents proper, delete-by-user-id, content-hash dedup, last_built_at | ~250 | D — UX |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -115,6 +117,39 @@ gated behind a cargo feature flag. Already done — call it out explicitly.
 
 **Title**: `Add GET /api/embeddings/stats endpoint`.
 
+### PR 4 — Server UX quick wins (Group D)
+**~250 LOC across 1 commit (server quick-wins).**
+
+**Cherry-pick**: row 17 (sha to be filled in once committed).
+
+**Title**: `Server UX: real list_documents, delete by user id, content-hash dedup, last_built_at`.
+
+Four small fixes against issues that surface when an LLM agent
+exercises the API end-to-end:
+
+- `GET /api/documents` previously returned `[]` with a "not implemented"
+  note. Now pages through Qdrant via scroll API; returns
+  `{id, user_id, title, excerpt, added_at}` capped at 256 entries (use
+  search to drill in beyond that).
+- `POST /api/documents` accepts an optional caller-supplied `id` field
+  (camelCase: `id` in the JSON body). Stored in `payload.user_id` so
+  callers can later refer to documents by an id they remember.
+- `DELETE /api/documents/{id}` resolves the path id as a `user_id`
+  first, falling back to treating it as the Qdrant point UUID. Fixes
+  the 500 error agents hit when deleting by their own id.
+- `POST /api/documents` rejects exact-content duplicates. Computes
+  SHA-256 of the sanitized content; if a Qdrant point with the same
+  `content_hash` already exists, returns the existing id instead of
+  inserting. Mirrors Microsoft GraphRAG's stable-id pattern (v0.5.0+,
+  enables upsert-merge).
+- `GET /api/graph/stats` now returns `last_built_at` (RFC 3339 timestamp
+  of the last successful build, null pre-first-build). Lets agents
+  decide whether the graph is fresh enough to query.
+
+Independent of PR 2/3; can land in any order. Touches the same
+`models.rs` / `qdrant_store.rs` / `main.rs` files but in
+non-conflicting regions.
+
 **Body**: reports the live `EmbeddingService.backend_name()` (openai /
 ollama / hash-fallback), dimension, and per-source request counters.
 Lets callers (e2e harness, monitoring) verify which path is actually
@@ -141,6 +176,8 @@ Independent of PR 2; can land in any order.
 - `GET /api/embeddings/stats` — runtime EmbeddingService backend + counters.
 - `POST /config` — formerly `POST /api/config`, now reachable (was 404 in
   upstream due to apistos scope shadowing).
+- `GET /api/documents` — was a stub returning `[]`; now pages through
+  Qdrant and returns real summaries.
 
 ### Changed behavior
 - `POST /config` deep-merges over current config; previously partial
@@ -150,6 +187,10 @@ Independent of PR 2; can land in any order.
   but was never reachable.
 - `Config.openai.max_tokens` is honored for entity extraction when
   `openai.enabled` (was always reading `Config.ollama.max_tokens`).
+- `POST /api/documents` accepts optional `id` field; rejects exact-content
+  duplicates by `content_hash`.
+- `DELETE /api/documents/{id}` resolves user-supplied id → Qdrant UUID.
+- `GET /api/graph/stats` includes `last_built_at`.
 
 ### New config fields
 - `Config.openai` (always present, defaults to disabled). Fields:
