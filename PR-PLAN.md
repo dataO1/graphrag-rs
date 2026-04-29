@@ -12,6 +12,89 @@ affects the upstream-facing surface.
 tracks **the state of upstream contributions**: what's ready, what's
 filed, what landed.
 
+## About these contributions
+
+graphrag-rs is being used here as the discovery layer for local LLM
+agents — the goal is a single MCP-shaped surface where coding/research
+agents (Claude Code, opencode, crush) can ingest, index, and query a
+personal knowledge base that lives entirely on the local machine. No
+hosted APIs in the loop. The setup is:
+
+- **Chat backend**: `llama-server` (`llama.cpp`'s OpenAI-compatible
+  HTTP server) running a Qwen3-class GGUF locally. Same model is shared
+  across multiple agent clients, which is why per-request controls like
+  `chat_template_kwargs.enable_thinking=false` matter — Qwen3's
+  reasoning would otherwise truncate JSON extraction output.
+- **Embedding backend**: OpenVINO Model Server (OVMS) on the Intel NPU,
+  serving the standard OpenAI-compat `/v1/embeddings` endpoint. mxbai-
+  embed-large-v1 baked into a static-shape graph, ~350 ms per call,
+  graph runs on dedicated NPU cores.
+- **Vector store**: Qdrant running locally.
+- **Agent surface**: `graphrag-mcp` (MCP-over-stdio bridge that proxies
+  to the REST server), wired into MCP-aware editors so agents can
+  search the user's notes inline during a coding session.
+
+Graphrag-rs was the only project in the Rust ecosystem that hit the
+right shape for this — full GraphRAG pipeline (chunking, entity
+extraction, relationship graph, community detection, retrieval), MIT
+licensed, embedded library plus REST server, and already built around
+the right abstractions. The code is well-organized, the trait surface
+is sensible, the configuration model is rich. Genuine respect for the
+work that's gone in — the project's value to this use case is what
+made the local-first agent setup viable in the first place. Thank you
+for it.
+
+The roadblocks that produced these patches were all in the
+"non-OpenAI-non-Ollama backend" direction. The chat path was hardcoded
+to Ollama protocol; the embedding side had a parsed-but-unused OpenAI
+config branch; the request body had no escape hatch for server-specific
+knobs (Qwen3 reasoning suppression, vLLM JSON mode). A few smaller
+issues turned up alongside: the `/api/config` endpoint was unreachable
+due to apistos scope shadowing, partial config posts were resetting
+unset fields, and the agent UX surface (list_documents, delete by user
+id, dedup, last-built timestamp) had visible rough edges once an LLM
+client started exercising it end-to-end.
+
+These PRs aim to land that "OpenAI-compatible local stack" path as a
+first-class option in graphrag-rs, on parity with the existing Ollama
+path — same feature-gate pattern, same config shape, same tests. The
+goal is that anyone running a local OpenAI-compat server (vLLM,
+llama.cpp, OVMS, OpenRouter, OpenAI proper) can drive graphrag-rs
+without forking. None of the changes alter the existing Ollama or
+hash-fallback paths.
+
+We're aware these are non-trivial PRs against a project we don't
+maintain. Happy to iterate on style, scope, or shape — split a PR
+further, hold one back, change a feature-gate name, drop a commit
+that doesn't fit the project's direction. Reasonable to say no to any
+of them.
+
+## PR writing style
+
+When drafting PR bodies, the voice should be:
+
+- Concise, informative, unambiguous. No filler.
+- Structured for fast human reading: **(1) motivation**, **(2) goals**,
+  **(3) what changed**, **(4) methodology** (testing + implementation
+  approach). One paragraph or short bullet list per section is the
+  default — only expand when the change genuinely needs it.
+- No emojis. No marketing language. No "we hope" / "we believe"
+  hedging — state facts and decisions.
+- Tone: open-source colleague. Professional but not distanced.
+  Acknowledge the maintainer's work where natural (once per PR is
+  enough, not every section). Treat the maintainer as a human reviewer
+  whose time you respect, not a process to be navigated.
+- Open to suggestions. Make alternatives explicit ("happy to gate this
+  behind X instead", "open to splitting this further") so the
+  maintainer doesn't have to fight the framing to push back.
+- Assume the maintainer doesn't know us. No personal introduction,
+  no backstory beyond what's relevant to the change.
+- The maintainer can say no. Don't pre-argue every objection — note
+  the obvious alternative once, then let the discussion happen in
+  review. Avoid sentences that start with "we strongly believe".
+- Flag breaking-but-fix changes explicitly with a one-line "back-compat
+  note" so reviewers don't have to dig.
+
 ## Upstream posture
 
 - Repo: [`automataIA/graphrag-rs`](https://github.com/automataIA/graphrag-rs), MIT, not archived.
