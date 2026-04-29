@@ -128,6 +128,8 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 15 | `79e3034` | feature-gate the openai-compat backend | 287 | B (folded into PR 2) |
 | 16 | `0bd7018` | add PR-PLAN.md | 209 | **internal — do NOT PR** |
 | 17 | `9135482` | graphrag-server: real list_documents, user-id resolution, content-hash dedup, last_built_at | 344 | D — UX |
+| 18 | `82f271c` | PR-PLAN: motivation + writing-style sections | 84 | **internal — do NOT PR** |
+| 19 | _next_ | graphrag-server: POST /api/graph/append for incremental updates | ~140 | E — append |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -200,6 +202,39 @@ gated behind a cargo feature flag. Already done — call it out explicitly.
 
 **Title**: `Add GET /api/embeddings/stats endpoint`.
 
+### PR 5 — Append-only graph extraction (Group E)
+**~140 LOC across 1 commit.**
+
+**Cherry-pick**: row 19 (sha to be filled in once committed).
+
+**Title**: `Add POST /api/graph/append for incremental graph updates`.
+
+Mirrors Microsoft GraphRAG's `graphrag append` semantics: cheap call
+agents/cron can fire after a batch of /api/documents to surface
+newly-ingested content in queries, without a full rebuild.
+
+**Implementation note** (called out in the commit body and the
+endpoint's description): under the hood this currently delegates to
+`GraphRAG::build_graph()` because graphrag-core's `incremental`
+module isn't yet wired into the runtime pipeline. The LLM-call cache
+makes repeat extraction near-free for unchanged chunks, so the cost
+scales with new content rather than corpus size — but it's not a
+true incremental update yet. A follow-up will route through
+`graphrag-core::incremental::add_content`.
+
+Two callable improvements regardless of internal wiring:
+
+- **Fast no-op**: tracks `processed_chunk_count` after every build/
+  append; returns immediately with `documentCount: 0` and a clear
+  message when the live chunk count hasn't grown. Cron can call
+  this every 30 min without paying LLM cost when nothing changed.
+- **Distinct semantic for agents**: the MCP tool surface can expose
+  `append` as the right tool to call after batch ingest, with
+  `build_graph` reserved for cold-start ("graph empty but documents
+  exist") or recovery scenarios.
+
+Independent of PR 1–4. Touches only `main.rs`.
+
 ### PR 4 — Server UX quick wins (Group D)
 **~250 LOC across 1 commit (server quick-wins).**
 
@@ -261,6 +296,8 @@ Independent of PR 2; can land in any order.
   upstream due to apistos scope shadowing).
 - `GET /api/documents` — was a stub returning `[]`; now pages through
   Qdrant and returns real summaries.
+- `POST /api/graph/append` — incremental-extraction analogue of
+  `/api/graph/build`; cheap no-op when nothing new since last build.
 
 ### Changed behavior
 - `POST /config` deep-merges over current config; previously partial

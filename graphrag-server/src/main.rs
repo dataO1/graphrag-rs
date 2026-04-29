@@ -98,6 +98,12 @@ struct AppState {
     /// before the first build). Surfaced via /api/graph/stats so agents
     /// can decide whether the graph is fresh enough to query.
     last_built_at: Arc<RwLock<Option<String>>>,
+    /// Number of chunks already passed through entity extraction. Set
+    /// to the post-build chunk count after every /api/graph/build and
+    /// /api/graph/append. Drives the no-op fast-path on /append: if
+    /// the live chunk count hasn't grown since this counter, return
+    /// early without re-running extraction.
+    processed_chunk_count: Arc<std::sync::atomic::AtomicUsize>,
     query_count: Arc<RwLock<usize>>,
 }
 
@@ -194,6 +200,7 @@ impl AppState {
                         documents: Arc::new(RwLock::new(Vec::new())),
                         graph_built: Arc::new(RwLock::new(false)),
                         last_built_at: Arc::new(RwLock::new(None)),
+                        processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         query_count: Arc::new(RwLock::new(0)),
                     }
                 },
@@ -214,6 +221,7 @@ impl AppState {
                         documents: Arc::new(RwLock::new(Vec::new())),
                         graph_built: Arc::new(RwLock::new(false)),
                         last_built_at: Arc::new(RwLock::new(None)),
+                        processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         query_count: Arc::new(RwLock::new(0)),
                     }
                 },
@@ -234,6 +242,7 @@ impl AppState {
                 documents: Arc::new(RwLock::new(Vec::new())),
                 graph_built: Arc::new(RwLock::new(false)),
                 last_built_at: Arc::new(RwLock::new(None)),
+                processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 query_count: Arc::new(RwLock::new(0)),
             }
         }
@@ -288,6 +297,7 @@ async fn root(state: Data<AppState>) -> impl Responder {
             },
             "graph": {
                 "build": "POST /api/graph/build",
+                "append": "POST /api/graph/append",
                 "stats": "GET /api/graph/stats"
             }
         }
@@ -817,13 +827,20 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
             match graphrag.build_graph().await {
                 Ok(_) => {
                     let processing_time = start.elapsed().as_millis() as u64;
-                    let (entities, relationships) = graphrag
+                    let (entities, relationships, chunk_count) = graphrag
                         .knowledge_graph()
-                        .map(|kg| (kg.entities().count(), kg.relationships().count()))
-                        .unwrap_or((0, 0));
+                        .map(|kg| (
+                            kg.entities().count(),
+                            kg.relationships().count(),
+                            kg.chunks().count(),
+                        ))
+                        .unwrap_or((0, 0, 0));
 
                     *state.graph_built.write().await = true;
                     *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
+                    state
+                        .processed_chunk_count
+                        .store(chunk_count, std::sync::atomic::Ordering::SeqCst);
 
                     tracing::info!(
                         "Built knowledge graph via pipeline in {}ms ({} entities, {} relationships)",
@@ -913,6 +930,112 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
         message: "Knowledge graph built from memory successfully".to_string(),
         backend: "memory".to_string(),
     }))
+}
+
+/// Append-extract entities for chunks ingested since the last build.
+///
+/// Semantic-equivalent of Microsoft GraphRAG's `graphrag append`: run
+/// after a batch of /api/documents calls so newly-ingested content
+/// shows up in queries, without paying for a wholesale re-extraction
+/// of everything that was already indexed.
+///
+/// **Implementation note** (today): under the hood this still calls
+/// `GraphRAG::build_graph()` because graphrag-core's `incremental`
+/// module isn't yet wired into the runtime pipeline. The LLM-call
+/// cache (`enable_caching = true`) makes repeat extraction near-free
+/// for unchanged chunks, so the cost scales with new content rather
+/// than corpus size — but it's not a true incremental update yet.
+/// A follow-up will route this through `graphrag-core::incremental::
+/// add_content` for genuine incremental behavior.
+///
+/// Fast-paths: returns `{success: true, document_count: 0,
+/// message: "no new chunks since last build"}` immediately when the
+/// chunk count hasn't grown since the previous build/append. Cheap
+/// for cron-driven callers that fire periodically regardless of
+/// whether anything new was ingested.
+#[api_operation(
+    tag = "graph",
+    summary = "Append new chunks to the knowledge graph",
+    description = "Run entity extraction on chunks ingested since the last build. Cheap no-op when nothing new. Use after a batch of /api/documents calls; do NOT call once per document.",
+    error_code = 500
+)]
+async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, ApiError> {
+    let start = std::time::Instant::now();
+
+    // Snapshot live chunk count vs the count we processed last time.
+    let live_chunks = {
+        let g = state.graphrag.read().await;
+        g.as_ref()
+            .and_then(|gr| gr.knowledge_graph())
+            .map(|kg| kg.chunks().count())
+            .unwrap_or(0)
+    };
+    let last_processed = state
+        .processed_chunk_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    if live_chunks <= last_processed {
+        let elapsed = start.elapsed().as_millis() as u64;
+        return Ok(Json(BuildGraphResponse {
+            success: true,
+            document_count: 0,
+            processing_time_ms: elapsed,
+            message: format!(
+                "No new chunks since last build ({} processed). Nothing to append.",
+                last_processed
+            ),
+            backend: "graphrag-pipeline".to_string(),
+        }));
+    }
+
+    let new_chunks = live_chunks - last_processed;
+
+    let mut graphrag_guard = state.graphrag.write().await;
+    let Some(graphrag) = graphrag_guard.as_mut() else {
+        return Err(ApiError::BadRequest(
+            "GraphRAG not initialized. Call POST /config first.".to_string(),
+        ));
+    };
+
+    match graphrag.build_graph().await {
+        Ok(_) => {
+            let processing_time = start.elapsed().as_millis() as u64;
+            let (entities, relationships, chunk_count) = graphrag
+                .knowledge_graph()
+                .map(|kg| (
+                    kg.entities().count(),
+                    kg.relationships().count(),
+                    kg.chunks().count(),
+                ))
+                .unwrap_or((0, 0, 0));
+
+            *state.graph_built.write().await = true;
+            *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
+            state
+                .processed_chunk_count
+                .store(chunk_count, std::sync::atomic::Ordering::SeqCst);
+
+            tracing::info!(
+                "Appended {} new chunks via pipeline in {}ms (graph now: {} entities, {} relationships)",
+                new_chunks, processing_time, entities, relationships
+            );
+
+            Ok(Json(BuildGraphResponse {
+                success: true,
+                document_count: new_chunks,
+                processing_time_ms: processing_time,
+                message: format!(
+                    "Appended {} new chunks: {} entities, {} relationships in graph",
+                    new_chunks, entities, relationships
+                ),
+                backend: "graphrag-pipeline".to_string(),
+            }))
+        },
+        Err(e) => Err(ApiError::InternalError(format!(
+            "Append failed: {}",
+            e
+        ))),
+    }
 }
 
 /// Get graph statistics
@@ -1195,6 +1318,7 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         scope("/graph")
                             .service(resource("/build").route(post().to(build_graph)))
+                            .service(resource("/append").route(post().to(append_graph)))
                             .service(resource("/stats").route(get().to(graph_stats)))
                     )
             )
