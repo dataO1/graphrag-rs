@@ -344,3 +344,75 @@ Out of Scope
   (entity counts, document titles). Static text is fine and easier
   to reason about; introducing a generator adds maintenance burden
   for a small win.
+
+----
+
+Phase G: rehydrate graphrag-core's KnowledgeGraph from Qdrant on startup (⬜ NOT STARTED)
+⬜ On graphrag-server startup, scroll the Qdrant collection and replay every payload through `add_document_from_text`
+⬜ Re-run `extend_graph` after rehydration so the graph is queryable
+⬜ Honor a `GRAPHRAG_REHYDRATE_ON_STARTUP={true,false,timer}` env so slow-start setups can opt out
+⬜ Surface rehydrate progress / completion via /health
+⬜ Add an integration test that proves /api/graph/stats reports the right `documentCount` after a server restart
+
+----
+
+Implementation Plan — Phase G: rehydrate KnowledgeGraph from Qdrant on startup
+
+Goal
+
+graphrag-server keeps two stores: Qdrant (persistent, vectors + payloads) and graphrag-core's in-memory KnowledgeGraph (chunks, documents, entities, relationships). Today only Qdrant survives across restarts. After a restart:
+
+  /health                → documentCount: N    (Qdrant)
+  /api/graph/stats       → documentCount: 0    (graphrag-core)
+  Qdrant collection      → N points
+
+The agent can ingest into both via `POST /api/documents`, so the disconnect is invisible until you query: `/api/graph/build` and `/api/graph/append` walk graphrag-core's chunks, which are zero post-restart, so extraction produces nothing — the graph stays empty until everything is re-ingested.
+
+Phase G fixes this by replaying every Qdrant payload through `graphrag.add_document_from_text` on startup so graphrag-core's chunk store matches Qdrant. The user's content_hash dedup means re-issuing the same content via `add_document` is also safe — but on the rehydration path we go straight into graphrag-core, no re-embedding.
+
+Non-Goals
+
+- Persisting the entity/relationship graph itself — we re-extract from chunks via `extend_graph`. Entities / relationships are a derived view; persisting them is Phase H.
+- Replacing Qdrant with a different store. Qdrant stays the source of truth for vectors + payloads.
+
+Proposed Changes
+
+1. New `graphrag-server/src/rehydrate.rs` module:
+
+       pub async fn rehydrate_from_qdrant(
+           qdrant: &QdrantStore,
+           graphrag: &mut GraphRAG,
+       ) -> Result<usize, RehydrateError>;
+
+   Scrolls the collection in pages of 256 (matches list_documents cap). For each DocumentMetadata, calls graphrag.add_document_from_text(text). Returns total rehydrated count.
+
+2. Wire into AppState::new. Three delivery modes via env:
+
+   - GRAPHRAG_REHYDRATE_ON_STARTUP=true (default): block startup until rehydration completes. Server starts in a usable state. Slow on large corpora (~5ms per doc; 1k docs ≈ 5s; 100k ≈ 8min).
+   - GRAPHRAG_REHYDRATE_ON_STARTUP=timer: spawn a background task that rehydrates after server bind. /health reports progress.
+   - GRAPHRAG_REHYDRATE_ON_STARTUP=false: skip entirely, current behaviour.
+
+3. Optional extend_graph call after rehydration. Without Phase H persistent entity storage, /api/graph/append re-extracts everything once.
+
+4. /health surfaces rehydration state:
+
+       {
+         "status": "healthy",
+         "documentCount": 39,
+         "rehydration": {
+           "completed": true | false,
+           "processed": 39,
+           "total": 39,
+           "started_at": "RFC3339",
+           "completed_at": "RFC3339" | null
+         }
+       }
+
+5. Verification
+
+   - Integration test: populate Qdrant; restart; assert `/api/graph/stats.documentCount` equals Qdrant's count after rehydration.
+   - Manual: ingest 50 docs; restart; verify /health.rehydration.completed flips true; /api/graph/stats shows 50 chunks; /api/graph/build extracts entities normally.
+
+Out of Scope (Phase H)
+
+- Persistent entity/relationship storage so clean shutdowns don't lose the graph. Bigger refactor — serialization format for entities/relationships/mentions, a save_to_qdrant method writing to a sibling collection, a load_from_qdrant mirror. Punt until G ships.
