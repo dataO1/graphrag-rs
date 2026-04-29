@@ -44,7 +44,7 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 14 | `ff39c84` | README: document OpenAI-compatible chat backend | 42 | B (folded into PR 2) |
 | 15 | `79e3034` | feature-gate the openai-compat backend | 287 | B (folded into PR 2) |
 | 16 | `0bd7018` | add PR-PLAN.md | 209 | **internal — do NOT PR** |
-| 17 | _next_ | server quick wins: list_documents proper, delete-by-user-id, content-hash dedup, last_built_at | ~250 | D — UX |
+| 17 | `9135482` | graphrag-server: real list_documents, user-id resolution, content-hash dedup, last_built_at | 344 | D — UX |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
