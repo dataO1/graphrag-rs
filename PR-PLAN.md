@@ -139,6 +139,8 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 26 | `ca92f86` | graphrag-server: graph-aware /api/query (mode=ask\|explain\|reason) | 313 | **PR D** |
 | 27 | `14e7f85` | graphrag-server: hydrate KnowledgeGraph from Qdrant on /config (Phase G) | 168 | **PR D** |
 | 28 | `76daa04` | graphrag-server: persist entity graph across restarts (Phase H) | 469 | **PR D** |
+| 29 | `c38542b` | graphrag-server: deprecate /api/graph/build for routine use | 16 | **PR D** |
+| 30 | `143b9a3` | graphrag-core: KnowledgeGraph::add_entity/add_relationship dedupe by id | 249 | **PR C** (cherry-picked onto `pr/agent-ux` as `c17b5f6`; also onto `pr/graph-query-and-persistence` as `ac07a0c` so PR D builds standalone on its base) |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -890,11 +892,65 @@ semantics, properly:
 `POST /api/graph/append` is a thin wrapper around `extend_graph`:
 fast no-op when no delta, real incremental work when there is.
 
-`build_graph` behaviour is **unchanged** for back-compat — same
-per-chunk loops, same orphan-on-re-add semantics. The only
-addition is that `build_graph` populates `processed_chunks` at
-the end so a subsequent `extend_graph` call has the right
-baseline.
+### KnowledgeGraph::add_entity / add_relationship dedupe by id
+
+While `extend_graph` was working around the duplicate-node bug
+via the private `merge_entity` / `merge_relationship` helpers, the
+canonical `KnowledgeGraph::add_entity` / `add_relationship` methods
+still appended a fresh petgraph node every time — so `build_graph`
+(and any direct library user) still produced duplicate-id nodes
+with orphaned mentions. This commit promotes the dedup logic
+from the private helpers into the canonical public API, so the
+two extraction paths agree on graph state.
+
+Before:
+```rust
+pub fn add_entity(&mut self, entity: Entity) -> Result<NodeIndex> {
+    let entity_id = entity.id.clone();
+    let node_index = self.graph.add_node(entity);
+    self.entity_index.insert(entity_id, node_index); // overwrites
+    Ok(node_index)
+}
+```
+
+After: checks `entity_index` first; if the id already exists, merges
+mentions in place (dedupe by `(chunk_id, start_offset)`), bumps
+confidence to `max(existing, new)`, and takes the new embedding
+only if the existing was None. Returns the existing `NodeIndex`.
+
+`add_relationship` similarly scans outgoing edges of the source
+node for an identical `(target, relation_type)` pair and silently
+returns `Ok(())` if found.
+
+Symptom this fixes (from the maintainer's user perspective):
+calling `build_graph` over a corpus where the LLM extracts the
+same entity from 3 chunks previously produced 3 petgraph nodes.
+`graph.entities().count()` returned 3; `entity_index` only mapped
+the id to the most-recent node; the other 2 nodes' mentions were
+unreachable. Any persistence layer keying on `entity.id` would
+silently dedupe on the way out, hiding the in-memory bloat.
+
+API surface impact: `add_entity` returns `Result<NodeIndex>` as
+before; on a dedup-hit it returns the existing NodeIndex instead
+of allocating a new one. No caller in the tree retains NodeIndex
+across calls in a way that would break.
+
+The private `merge_entity` / `merge_relationship` helpers in
+extend_graph become thin wrappers — they only count metrics now,
+since the underlying dedup happens inside the canonical add path.
+
+Four new inline tests in `core::dedup_tests`:
+- `add_entity_dedupes_by_id_and_merges_mentions`
+- `add_relationship_dedupes_by_source_target_relation_type`
+- `add_entity_takes_max_confidence_and_first_embedding`
+- `add_relationship_returns_ok_on_dedup_not_err`
+
+The four existing `extend_graph_*` tests still pass — the public
+dedup matches what the private helpers were doing.
+
+So with this PR: `build_graph` and `extend_graph` both produce
+the same dedupe-correct in-memory graph, removing a long-standing
+silent-correctness gap.
 
 ## Wire-format additions (back-compat)
 
