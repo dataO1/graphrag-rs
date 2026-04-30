@@ -1459,3 +1459,4 @@ MS-GraphRAG-flavored modes.
 | #9 | 2026-04-30 | PR B — OpenAI-compatible chat + embeddings backend (feature-gated) | filed | https://github.com/automataIA/graphrag-rs/pull/9 |
 | #10 | 2026-04-30 | PR C — Agent UX + real incremental extend_graph + add_entity dedup | filed | https://github.com/automataIA/graphrag-rs/pull/10 |
 | #11 | 2026-04-30 | PR D — Graph-aware /api/query (ask/explain/reason/local) + persistence | filed | https://github.com/automataIA/graphrag-rs/pull/11 |
+| #12 | 2026-04-30 | PR E — LightRAG dual-level retrieval (global / hybrid / mix modes) | **draft** | https://github.com/automataIA/graphrag-rs/pull/12 — stacks on #11 |
