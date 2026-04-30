@@ -311,7 +311,20 @@ PR D, `graphrag-server`'s `/api/query` is a thin Qdrant wrapper that
 ignores the entity graph it builds, and the LLM-extracted graph
 itself is wiped on every restart. PR D fixes both.
 
-**Cherry-pick**: `ca92f86 14e7f85 76daa04`.
+**Cherry-pick**: `ca92f86 14e7f85 76daa04` on top of `pr/agent-ux`
+(branch `pr/graph-query-and-persistence`, pushed).
+
+**Stack dependency**: PR D depends on PR C
+(`GraphRAG::extend_graph` + `processed_chunks` tracking). The
+cherry-pick branch is stacked on `pr/agent-ux`, so PR D should be
+filed after PR C lands or rebased onto `upstream/main` once C
+merges. The Phase H commit needed one tiny reconcile during the
+cherry-pick: the `state.processed_chunk_count` AppState atomic
+counter (which exists on `openai-compat` from an earlier,
+since-superseded commit) doesn't exist on `pr/agent-ux`, so the
+two mirror-into-AppState lines in `build_graph` and `set_config`
+were dropped. Functionally a no-op — `graphrag.processed_chunk_count()`
+is still readable directly where the values are actually used.
 
 **Title**: `Graph-aware /api/query (ask/explain/reason) + cross-restart persistence`.
 
