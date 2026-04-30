@@ -141,6 +141,7 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 28 | `76daa04` | graphrag-server: persist entity graph across restarts (Phase H) | 469 | **PR D** |
 | 29 | `c38542b` | graphrag-server: deprecate /api/graph/build for routine use | 16 | **PR D** |
 | 30 | `143b9a3` | graphrag-core: KnowledgeGraph::add_entity/add_relationship dedupe by id | 249 | **PR C** (cherry-picked onto `pr/agent-ux` as `c17b5f6`; PR D inherits it via the stack — no separate cherry-pick needed onto `pr/graph-query-and-persistence` since that branch is rebased on `pr/agent-ux`) |
+| 31 | `91c2125` | graphrag-server: embed entity/relationship descriptions on persist (Phase H+) | 164 | **PR D** (cherry-picked onto `pr/graph-query-and-persistence` as `cd45672`) |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -313,8 +314,8 @@ PR D, `graphrag-server`'s `/api/query` is a thin Qdrant wrapper that
 ignores the entity graph it builds, and the LLM-extracted graph
 itself is wiped on every restart. PR D fixes both.
 
-**Cherry-pick**: `ca92f86 14e7f85 76daa04` on top of `pr/agent-ux`
-(branch `pr/graph-query-and-persistence`, pushed).
+**Cherry-pick**: `ca92f86 14e7f85 76daa04 c38542b 91c2125` on top of
+`pr/agent-ux` (branch `pr/graph-query-and-persistence`, pushed).
 
 **Stack dependency**: PR D depends on PR C
 (`GraphRAG::extend_graph` + `processed_chunks` tracking). The
@@ -354,13 +355,16 @@ The three commits split cleanly:
   of the corpus.
 - `76daa04` — Phase H: persist + restore the LLM-extracted entity +
   relationship graph itself. Two new sidecar Qdrant collections
-  (`{coll}-entities` / `{coll}-relationships`), 1-D placeholder
-  vectors today, payload is the serde-serialized
-  `Entity`/`Relationship`. Stable point ids via UUID5 over the
-  natural identity. Persist runs at the end of every successful
-  build/extend; restore runs at the end of `POST /config` after
-  chunk hydration. After this commit, `/api/graph/build`'s LLM
-  work genuinely survives restarts.
+  (`{coll}-entities` / `{coll}-relationships`) carrying real
+  description embeddings (mirrors MS GraphRAG's `description_embedding`
+  convention), payload is the serde-serialized `Entity`/`Relationship`.
+  Stable point ids via UUID5 over the natural identity. Persist
+  runs at the end of every successful build/extend; restore runs at
+  the end of `POST /config` after chunk hydration. After this
+  commit, `/api/graph/build`'s LLM work genuinely survives restarts
+  AND the entity store is searchable by vector — the substrate MS
+  uses for `local_search`-style seed-point retrieval, ready for a
+  follow-on PR to wire into `/api/query`.
 
 **Why these belong together**: the modes in commit 1 are useful but
 fragile without commits 2-3 (a server restart wipes the entity graph
@@ -1021,12 +1025,14 @@ so older payloads parse cleanly and older clients see no change:
 
 **Title**: `Graph-aware /api/query (ask/explain/reason) + cross-restart persistence`
 
-**Branch**: `pr/graph-query-and-persistence` (3 commits, ~950 LOC).
+**Branch**: `pr/graph-query-and-persistence` (5 commits, ~1.1k LOC).
 Split by concern; happy to squash on merge.
 
 - `ca92f86` — graphrag-server: graph-aware `/api/query`
 - `14e7f85` — graphrag-server: hydrate `KnowledgeGraph` from Qdrant on `/config` (Phase G)
 - `76daa04` — graphrag-server: persist entity graph across restarts (Phase H)
+- `c38542b` — graphrag-server: deprecate `/api/graph/build` for routine use
+- `91c2125` — graphrag-server: embed entity/relationship descriptions on persist (Phase H+)
 
 ```markdown
 graphrag-cli already exposes the four query modes graphrag-core
@@ -1161,9 +1167,22 @@ graphrag-core `Entity` / `Relationship`. Stable point ids:
 UUID5 over the entity id (entities) or
 `source|relation_type|target` (relationships).
 
-Vectors are 1-dimensional placeholders. Persistence is the only goal
-in this PR; entity-level vector embeddings (so agents can search
-the entity graph directly) is a deliberate future PR.
+Vectors carry real description embeddings, mirroring Microsoft
+GraphRAG's `description_embedding` convention:
+- Entities are embedded as `"{name} ({entity_type})"`.
+- Relationships are embedded as `"{source_name} {relation_type} {target_name}"`.
+- Vector dim matches the document collection's dim, so entity
+  searches and document searches are in the same embedding space.
+- Reuses `Entity.embedding` / `Relationship.embedding` if the
+  extractor already populated it (today's extractors don't, but a
+  future extractor PR could without changing this code path).
+  Otherwise batches through the same `EmbeddingService` the
+  document path uses.
+
+This makes the sidecars a real vector index over the entity graph,
+not just a key-value store — the substrate MS uses to power
+`local_search`. A follow-on PR can wire entity-vector-search into
+`/api/query`'s graph-aware modes for seed-point retrieval.
 
 Wiring:
 - `POST /api/graph/build` → after success, persist entire current
@@ -1213,25 +1232,44 @@ graphrag-core's `Entity`/`Relationship` to the wire envelopes.
 
 ## Open questions
 
-- The 1-D placeholder vectors on the entity/relationship sidecars
-  feel wrong long-term — they're inert today. I deliberately
-  punted on entity-level embeddings to keep this PR focused.
-  Happy to discuss whether you'd prefer the persistence layer to
-  embed entity descriptions on write (hooked into the same
-  `EmbeddingService` the document path uses) and use the
-  collections for entity-vector-search alongside persistence.
-- Restore order is "entities first, then relationships." If you
-  later add hierarchical relationships
-  (`relationship_hierarchy: Option<RelationshipHierarchy>`) that
-  also need persistence, the right place is a follow-on commit;
-  this PR doesn't touch that field.
-- The persist-on-build approach is "wipe and repopulate" — simple
-  but writes O(|entities| + |relationships|) on every build. For
-  a 100K-entity graph this is still bounded but worth optimizing
-  to delta upserts later. Not a blocker.
-- Three commits split by concern (modes / chunk hydration /
-  graph persistence). Happy to squash on merge if that reads
-  better.
+- **Entity / relationship description embeddings — done in this PR.**
+  Earlier draft of this PR persisted with 1-D placeholder vectors;
+  Microsoft GraphRAG embeds entity and relationship descriptions
+  and uses those embeddings as the seed-point engine for its
+  `local_search` mode. This PR follows MS's shape: each entity is
+  embedded as `"{name} ({entity_type})"`, each relationship as
+  `"{source_name} {relation_type} {target_name}"`, vectors live in
+  the same dim as the document collection (so entity searches and
+  document searches are directly comparable), reuses `Entity.embedding`
+  / `Relationship.embedding` if the extractor populated it (today's
+  extractors don't, but a future extractor PR could without
+  changing this code path). One batch embed call per build/append
+  for entities, one for relationships — not N×M. Unlocks future
+  graph-aware retrieval work without a follow-up persistence
+  refactor.
+- **Hierarchical / community persistence is deliberately out of
+  scope.** Restore order is "entities first, then relationships"
+  because `add_relationship` validates endpoint existence —
+  this is per-implementation, not a parallel to MS architecture
+  (MS sidesteps the question with a batch parquet pipeline that
+  doesn't have a long-running daemon to rehydrate). graphrag-core
+  has a `relationship_hierarchy: Option<RelationshipHierarchy>`
+  field on `KnowledgeGraph` and a graph-analytics module with
+  Leiden community detection — both currently unpopulated by any
+  code path. The closer mirror to MS would be Leiden communities
+  + LLM-generated community reports persisted as a third sidecar;
+  that's a follow-on PR (it requires the chat backend and a
+  community-summary prompt). This PR establishes the persistence
+  substrate so that work fits in cleanly later.
+- **Persistence is "wipe and repopulate" on every build.** Simple
+  but writes O(|entities| + |relationships|) per build. For a
+  100K-entity graph this is bounded; not a blocker. A future
+  delta-upsert path could track per-entity dirtiness (mirror of
+  the `processed_chunks` set used by `extend_graph`) and write
+  only changed rows. Out of scope here.
+- Four commits split by concern (modes / chunk hydration / graph
+  persistence / build_graph deprecation). Happy to squash on merge
+  if that reads better.
 ```
 
 ## PR filing log
