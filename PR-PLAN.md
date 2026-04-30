@@ -142,6 +142,8 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 29 | `c38542b` | graphrag-server: deprecate /api/graph/build for routine use | 16 | **PR D** |
 | 30 | `143b9a3` | graphrag-core: KnowledgeGraph::add_entity/add_relationship dedupe by id | 249 | **PR C** (cherry-picked onto `pr/agent-ux` as `c17b5f6`; PR D inherits it via the stack — no separate cherry-pick needed onto `pr/graph-query-and-persistence` since that branch is rebased on `pr/agent-ux`) |
 | 31 | `91c2125` | graphrag-server: embed entity/relationship descriptions on persist (Phase H+) | 164 | **PR D** (cherry-picked onto `pr/graph-query-and-persistence` as `cd45672`) |
+| 32 | `9d1e190` | graphrag-server: add mode=local — MS GraphRAG-style entity-vector-seeded retrieval | 408 | **PR D** (cherry-picked onto `pr/graph-query-and-persistence` as `f8e3409`) |
+| 33 | `1c5b3bf` | graphrag: full LightRAG dual-level retrieval (global / hybrid / mix) | 723 | **PR E** |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -402,6 +404,34 @@ state.
 graphrag-core's actual capabilities. Demos well: `curl /api/query
 -d '{"query":"...","mode":"explain"}'` returns a typed answer with
 source attribution.
+
+### PR E — LightRAG dual-level retrieval (global / hybrid / mix)
+**~720 LOC, one commit.** Adds the LightRAG-paper retrieval
+algorithm (arXiv:2410.05779) on top of the entity + relationship
+vector indexes PR D persists. Three new query modes — `global`,
+`hybrid`, `mix` — round out the LightRAG mode set (`local` was
+already shipped in PR D).
+
+**Cherry-pick**: `1c5b3bf` on top of `pr/graph-query-and-persistence`
+(branch `pr/lightrag-dual-retrieval`).
+
+**Title**: `LightRAG dual-level retrieval (global / hybrid / mix modes)`.
+
+**Stack dependency**: PR E depends on PR D (entity AND relationship
+vector indexes from Phase H+). File after PR D lands or rebase onto
+`upstream/main` once D merges.
+
+**Story for the maintainer**: graphrag-rs already implements two of
+LightRAG's three signature properties (skip community detection;
+true incremental updates via PR C's `extend_graph`). This PR adds
+the third — query-time dual-level keyword retrieval — so graphrag-rs
+becomes a LightRAG-paper-faithful implementation alongside its
+existing MS-GraphRAG-flavored modes. Users pick per-query, no
+new dependencies, no schema changes.
+
+**Audience**: reviewer who's read the LightRAG paper and wants to
+see the algorithm reproduced cleanly in Rust without inventing new
+abstractions on top.
 
 ## NOT for upstream
 
@@ -1270,6 +1300,153 @@ graphrag-core's `Entity`/`Relationship` to the wire envelopes.
 - Four commits split by concern (modes / chunk hydration / graph
   persistence / build_graph deprecation). Happy to squash on merge
   if that reads better.
+```
+
+### PR E body draft
+
+**Title**: `LightRAG dual-level retrieval (global / hybrid / mix modes)`
+
+**Branch**: `pr/lightrag-dual-retrieval` (1 commit, ~720 LOC). Stacks on
+`pr/graph-query-and-persistence` (PR D) because it builds on the
+entity/relationship vector indexes Phase H+ persists.
+
+- `1c5b3bf` — graphrag: full LightRAG dual-level retrieval (global / hybrid / mix)
+
+```markdown
+Implements the LightRAG paper (Guo et al., arXiv:2410.05779) dual-level
+retrieval algorithm in graphrag-rs, on top of the entity AND
+relationship vector indexes already persisted by `/api/graph/build` and
+`/api/graph/append` (PR #11). Three new query modes — global, hybrid,
+mix — round out the retrieval menu so graphrag-rs can serve both
+MS-GraphRAG-flavored and LightRAG-flavored queries against the same
+graph state, with the user picking per-query.
+
+## Motivation
+
+PR #11 already shipped LightRAG-paper `local` mode (entity-vector
+seeded retrieval). The remaining LightRAG modes — global, hybrid, mix —
+require a query-time dual-level keyword extraction step (one LLM call
+producing two keyword sets) and a parallel retrieval over the
+relationship vector index. Both pieces are small additions:
+
+1. The relationship vector index already exists (Phase H+ embeds
+   relationship descriptions just like entity descriptions). All that's
+   missing is a `search_relationships` primitive on `QdrantStore`.
+2. graphrag-core needs one new method that takes seed populations
+   (entities, relations, chunks) and produces an `ExplainedAnswer`.
+   The four LightRAG modes are then characterized by which seed
+   populations are non-empty:
+
+   | LightRAG mode | seeds.entities | seeds.relations | seeds.chunks |
+   |---|---|---|---|
+   | local   | non-empty | empty | empty |
+   | global  | empty | non-empty | empty |
+   | hybrid  | non-empty | non-empty | empty |
+   | mix     | non-empty | non-empty | non-empty |
+
+Implementation choice: one unified `ask_with_dual_seeds` method for all
+four modes, rather than four separate methods. The orchestration
+differences are at the seeding layer (server-side); the graph
+expansion + context assembly + LLM call is identical.
+
+## Goals
+
+- LightRAG `global`, `hybrid`, `mix` modes addressable through
+  the existing `/api/query` `mode` field.
+- One LLM call per query for dual-keyword extraction (LightRAG-paper
+  prompt; JSON output; robust parser).
+- Reuse the existing entity + relationship vector indexes — no new
+  storage requirements.
+- Expose all three modes through the MCP tool list with sharp,
+  agent-facing descriptions.
+
+## Changes
+
+### graphrag-core
+
+- New public types `QueryKeywords { low_level, high_level }` and
+  `DualSeeds { entities, relations, chunks }`.
+- New `pub async fn GraphRAG::extract_query_keywords(query) -> Result<QueryKeywords>`
+  — one LLM call, JSON output, falls back to empty keyword sets on
+  parse failure so callers can degrade gracefully (e.g. caller can
+  fall back to chunk-vector retrieval).
+- New `pub async fn GraphRAG::ask_with_dual_seeds(query, &DualSeeds, max_neighbors_per_seed) -> Result<retrieval::ExplainedAnswer>`
+  — unified retrieval over entity, relation, and chunk seeds. Expands
+  every entity seed to 1-hop neighbors; resolves every relation
+  seed's source/target endpoints (and expands those too); merges
+  direct chunk seeds; deduplicates everything; sends an MS-style
+  ENTITIES / RELATIONSHIPS / SOURCE TEXT block to the chat backend.
+
+### graphrag-server
+
+- New `QdrantStore::search_relationships(query_embedding, limit) -> Vec<((source, target, relation_type), score)>`.
+  Mirror of `search_entities`; reads source/target/relation_type out
+  of the `PersistedRelationship` payload (NOT the Qdrant point UUID,
+  which is a UUID5 hash).
+- New `QueryMode::Global`, `QueryMode::Hybrid`, `QueryMode::Mix`
+  variants.
+- New handler arm in `graph_aware_query` (one arm covers all three
+  modes via mode-pattern matching). Pipeline:
+    1. `extract_query_keywords` once.
+    2. For non-global modes: embed `low_level` keywords, search entity
+       sidecar, populate `seeds.entities`.
+    3. For all three modes: embed `high_level` keywords, search
+       relationship sidecar, populate `seeds.relations`.
+    4. For mix only: embed the original query, search the chunk
+       sidecar, populate `seeds.chunks`.
+    5. Call `ask_with_dual_seeds` and pack the answer.
+- The handler prepends a reasoning step documenting the extracted
+  keywords, so callers can audit which keywords drove retrieval.
+- New backend labels: `graphrag-lightrag-global`, `-hybrid`, `-mix`
+  (so callers can confirm the LightRAG path actually ran).
+
+## Methodology
+
+- Cherry-picked off `pr/graph-query-and-persistence` (PR #11). One
+  commit, intentionally focused — the keyword extraction, the search
+  primitive, and the unified retrieval method ship together because
+  none of them is useful alone.
+- `cargo check -p graphrag-core --features async` and
+  `cargo check -p graphrag-server --features qdrant` clean.
+- 12 pre-existing test failures unrelated; same set fails on
+  `upstream/main`.
+- The LightRAG-paper prompt is reproduced in `extract_query_keywords`
+  with minor wording tweaks for robustness against models that don't
+  perfectly follow JSON-only output instructions (the parser strips
+  ```json fences, finds the first `{` and last `}`, and falls back
+  to empty keyword sets on parse failure).
+
+## Reference
+
+[Guo, Wang, Lin, Hu, Bei, Chen, Liao, Lu, Zhang, Yan, Lu —
+"LightRAG: Simple and Fast Retrieval-Augmented Generation"
+(arXiv:2410.05779, 2024)](https://arxiv.org/abs/2410.05779).
+
+The paper's argument: skip MS GraphRAG's expensive Leiden +
+community-report index step; shift intelligence to query time via
+dual-level keyword extraction; index just entities + relations + their
+descriptions. graphrag-rs already skips community detection (no code
+path runs it), already does incremental updates (PR #10's
+`extend_graph`), already persists entity + relationship vector
+indexes (PR #11's Phase H+). This PR adds the missing piece —
+query-time dual-keyword retrieval — turning graphrag-rs into a
+LightRAG-paper-faithful implementation alongside its existing
+MS-GraphRAG-flavored modes.
+
+## Open questions
+
+- Mode naming: I kept the LightRAG-paper names (`local`/`global`/
+  `hybrid`/`mix`) for the modes that map directly. `local` was already
+  named that in PR #11, so this stays consistent. Happy to rename if
+  the maintainer prefers different labels.
+- The chunk-seed path in `mix` mode currently uses the document-level
+  Qdrant collection and treats document ids as chunk ids (one chunk
+  per doc today). When chunk granularity diverges from document
+  granularity, the mix path needs to scroll for actual chunk ids. Not
+  a blocker for current behavior; flagged as a future PR.
+- Stack note: builds on top of PR #11. Cherry-pick branch is
+  `pr/lightrag-dual-retrieval` stacked on `pr/graph-query-and-persistence`.
+  Easy to rebase onto `upstream/main` once PR #11 lands.
 ```
 
 ## PR filing log
