@@ -1278,4 +1278,7 @@ graphrag-core's `Entity`/`Relationship` to the wire envelopes.
 
 | PR | Date | Title | Status | Notes |
 |---|---|---|---|---|
-| _none filed yet_ | | | | |
+| #8 | 2026-04-30 | PR A — Server-side fixes & build cleanup | filed | https://github.com/automataIA/graphrag-rs/pull/8 |
+| #9 | 2026-04-30 | PR B — OpenAI-compatible chat + embeddings backend (feature-gated) | filed | https://github.com/automataIA/graphrag-rs/pull/9 |
+| #10 | 2026-04-30 | PR C — Agent UX + real incremental extend_graph + add_entity dedup | filed | https://github.com/automataIA/graphrag-rs/pull/10 |
+| #11 | 2026-04-30 | PR D — Graph-aware /api/query (ask/explain/reason/local) + persistence | filed | https://github.com/automataIA/graphrag-rs/pull/11 |
