@@ -135,6 +135,10 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 22 | `7f51cdc` | PR-PLAN: 5-PR → 3-PR consolidation | 167 | **internal — do NOT PR** |
 | 23 | `82f271c` (`ecddf23`) | PR-PLAN: motivation + writing-style + drafted PR bodies | many | **internal — do NOT PR** |
 | 24 | `9979a13` | graphrag-core: real incremental extend_graph; wire /api/graph/append to it | 904 | **PR C** — replaces f9bcfac entirely. Note the openai-compat-branch version uses ChatClient/chat_enabled; the cherry-pick onto pr/agent-ux uses Ollama-only primitives (`27a7c4e`) |
+| 25 | `5464fa2` | TODO: Phase G/H — graph rehydration & persistence | 23 | **internal — do NOT PR** |
+| 26 | `ca92f86` | graphrag-server: graph-aware /api/query (mode=ask\|explain\|reason) | 313 | **PR D** |
+| 27 | `14e7f85` | graphrag-server: hydrate KnowledgeGraph from Qdrant on /config (Phase G) | 168 | **PR D** |
+| 28 | `76daa04` | graphrag-server: persist entity graph across restarts (Phase H) | 469 | **PR D** |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -301,6 +305,85 @@ to the maintainer in case the framing matters for review.
 **Audience**: reviewer focused on the API contract from a client's
 point of view.
 
+### PR D — Graph-aware query API + cross-restart persistence
+**~950 LOC across 3 commits.** This is the qualitative jump: until
+PR D, `graphrag-server`'s `/api/query` is a thin Qdrant wrapper that
+ignores the entity graph it builds, and the LLM-extracted graph
+itself is wiped on every restart. PR D fixes both.
+
+**Cherry-pick**: `ca92f86 14e7f85 76daa04`.
+
+**Title**: `Graph-aware /api/query (ask/explain/reason) + cross-restart persistence`.
+
+**Story for the maintainer**: graphrag-cli already exposes the four
+query modes graphrag-core implements — `search` (vector-only), `ask`
+(graph-aware + LLM answer), `explain` (`ask` + confidence + sources +
+reasoning), `reason` (multi-hop decomposition). graphrag-server's
+REST `/api/query` only ever did `search`. This PR ports the other
+three modes onto the REST surface, gated by an optional `mode` field
+on `QueryRequest` (default `search`, fully back-compatible). Then
+because graph-aware modes are pointless if the graph is empty after
+every restart, two follow-on commits add chunk hydration + entity/
+relationship persistence to Qdrant sidecar collections.
+
+The three commits split cleanly:
+
+- `ca92f86` — `/api/query` learns `mode=ask|explain|reason`. Pure
+  feature add over `QueryRequest` and `QueryResponse`. Calls into
+  existing `GraphRAG::ask`, `ask_explained`, `ask_with_reasoning`.
+- `14e7f85` — Phase G: hydrate `KnowledgeGraph` chunks from Qdrant
+  on `POST /config`. Adds `GraphRAG::seed_processed_chunks` public
+  helper to graphrag-core; `QdrantStore::list_full_documents` to
+  graphrag-server. Without this, `/api/graph/build` after a restart
+  only walks chunks added since restart — typically a tiny fraction
+  of the corpus.
+- `76daa04` — Phase H: persist + restore the LLM-extracted entity +
+  relationship graph itself. Two new sidecar Qdrant collections
+  (`{coll}-entities` / `{coll}-relationships`), 1-D placeholder
+  vectors today, payload is the serde-serialized
+  `Entity`/`Relationship`. Stable point ids via UUID5 over the
+  natural identity. Persist runs at the end of every successful
+  build/extend; restore runs at the end of `POST /config` after
+  chunk hydration. After this commit, `/api/graph/build`'s LLM
+  work genuinely survives restarts.
+
+**Why these belong together**: the modes in commit 1 are useful but
+fragile without commits 2-3 (a server restart wipes the entity graph
+they read from). Splitting commit 1 off as its own PR would land a
+feature that silently regresses to vector-only retrieval after every
+deploy. Splitting commit 3 off as a "future-PR" stranded persistence
+scaffolding without a payoff. The three together tell one story:
+"graphrag-server now uses the graph it builds, and keeps it across
+restarts."
+
+**Surface area on graphrag-core** (small, additive):
+- `GraphRAG::seed_processed_chunks<I: IntoIterator<Item = ChunkId>>(self, chunk_ids)`
+
+**Surface area on graphrag-server**:
+- `QueryRequest.mode: Option<QueryMode>` (default `search`)
+- `QueryResponse` gains optional `answer`, `confidence`,
+  `key_entities`, `reasoning_steps`, `sources` (all
+  `skip_serializing_if = "Option::is_none"` so search responses are
+  byte-identical to before).
+- `QdrantStore::list_full_documents`, `persist_graph`,
+  `load_persisted_entities`, `load_persisted_relationships`,
+  `clear_graph_collections`, `ensure_graph_collections`.
+- New module `graph_persistence` glues `Entity`/`Relationship` to
+  the wire envelopes.
+- `POST /config` response gains a `hydrated: {documents, chunks,
+  skipped, entities, relationships, relationships_skipped_orphan}`
+  summary.
+
+**No schema migrations needed** for existing Qdrant collections.
+The two sidecar collections are auto-created on first persist;
+older deploys without them work fine, just with empty restored
+state.
+
+**Audience**: reviewer focused on whether the REST API is using
+graphrag-core's actual capabilities. Demos well: `curl /api/query
+-d '{"query":"...","mode":"explain"}'` returns a typed answer with
+source attribution.
+
 ## NOT for upstream
 
 | Item | Why |
@@ -325,6 +408,10 @@ point of view.
 ### Changed behavior
 - `POST /config` deep-merges over current config; previously partial
   bodies replaced wholesale (resetting unset fields to defaults).
+- `POST /config` now triggers graph hydration from Qdrant
+  (chunks + entities + relationships) so `/api/graph/build` and
+  graph-aware query modes see the full corpus on first call after
+  a restart, not just chunks ingested since restart.
 - `EmbeddingService` now picks `openai` backend when `EMBEDDING_BACKEND=openai`
   + the new feature flag. Previously the openai branch existed in code
   but was never reachable.
@@ -333,6 +420,13 @@ point of view.
 - `POST /api/documents` accepts optional `id` field; rejects exact-content
   duplicates by `content_hash`.
 - `DELETE /api/documents/{id}` resolves user-supplied id → Qdrant UUID.
+- `POST /api/query` accepts an optional `mode` field
+  (`search`/`ask`/`explain`/`reason`); default `search` is
+  byte-identical to the previous behavior.
+- `POST /api/graph/build` and `POST /api/graph/append` now persist
+  the resulting entity + relationship graph to Qdrant sidecar
+  collections so the graph survives a restart instead of forcing
+  full re-extraction at every boot.
 - `GET /api/graph/stats` includes `last_built_at`.
 
 ### New config fields
@@ -852,6 +946,223 @@ so older payloads parse cleanly and older clients see no change:
   for clients that handed us an id. Open to making it opt-in.
 - The three commits are split by concern (server UX / core
   incremental / Cargo.lock). Happy to squash on merge.
+```
+
+### PR D body draft
+
+**Title**: `Graph-aware /api/query (ask/explain/reason) + cross-restart persistence`
+
+**Branch**: `pr/graph-query-and-persistence` (3 commits, ~950 LOC).
+Split by concern; happy to squash on merge.
+
+- `ca92f86` — graphrag-server: graph-aware `/api/query`
+- `14e7f85` — graphrag-server: hydrate `KnowledgeGraph` from Qdrant on `/config` (Phase G)
+- `76daa04` — graphrag-server: persist entity graph across restarts (Phase H)
+
+```markdown
+graphrag-cli already exposes the four query modes graphrag-core
+implements: `search` (vector-only), `ask` (graph-aware + LLM
+answer), `explain` (`ask` + confidence + sources + reasoning),
+`reason` (multi-hop decomposition). graphrag-server's REST
+`/api/query` only ever did `search`. This PR ports the other
+three modes onto the REST surface, then makes the LLM-extracted
+graph survive restarts so those modes have something to ground
+against.
+
+## Motivation
+
+Driving graphrag-server through an MCP-bridged agent (Claude Code,
+opencode, crush) the gap between the CLI surface and the REST
+surface keeps showing up:
+
+- `graphrag-cli /mode explain "..."` returns a typed answer with
+  confidence, source attribution, and reasoning steps.
+- `graphrag-server POST /api/query` returns vector-search excerpts
+  and nothing else.
+
+This is a server-implementation gap, not a graphrag-rs limitation —
+the core has `GraphRAG::ask`, `ask_explained`, `ask_with_reasoning`
+public APIs. The server just doesn't call them.
+
+The second half of the gap is restart survival. Even if you wire
+the modes through, they're useless when the server's in-memory
+entity graph is empty — and today it always is, because nothing
+persists the LLM-extracted graph. Every restart wipes ~minutes of
+LLM extraction work. Graph-aware retrieval that has nothing to
+retrieve from is worse than honest vector search.
+
+So PR D is one coherent unit: REST `/api/query` learns the modes,
+*and* the graph survives the server lifecycle.
+
+## Goals
+
+- `POST /api/query` accepts an optional `mode` field —
+  `search` (default) / `ask` / `explain` / `reason`. Search stays
+  byte-identical for back-compat.
+- Graph-aware modes call into the existing graphrag-core
+  `GraphRAG::ask*` APIs, surface the results through `QueryResponse`
+  optional fields (`answer`, `confidence`, `key_entities`,
+  `reasoning_steps`, `sources`).
+- `KnowledgeGraph` chunks rehydrate from Qdrant on `POST /config`
+  so `/api/graph/build` and the new modes see the full corpus.
+- LLM-extracted entities + relationships persist to Qdrant sidecar
+  collections at the end of every successful build/extend, restore
+  on `POST /config`. Restart no longer wipes the graph.
+
+## Changes
+
+### Graph-aware /api/query (commit `ca92f86`)
+
+`QueryRequest`:
+
+```rust
+pub struct QueryRequest {
+    pub query: String,
+    #[serde(default)]
+    pub top_k: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<QueryMode>,  // search | ask | explain | reason
+}
+```
+
+`QueryResponse` gains optional fields populated per-mode:
+
+- `answer: Option<String>` — `ask` / `explain` / `reason`
+- `confidence: Option<f32>` — `explain`
+- `key_entities: Option<Vec<String>>` — `explain`
+- `reasoning_steps: Option<Vec<ReasoningStepDto>>` — `explain`
+- `sources: Option<Vec<SourceReferenceDto>>` — `explain`
+- `mode: String` — always set, echoes the mode used
+
+Every field except `mode` is `skip_serializing_if = "Option::is_none"`,
+so a `mode=search` (or no-mode) response is byte-identical to the
+pre-PR shape. Existing clients break nothing.
+
+Implementation: a single `graph_aware_query` helper handles
+`ask`/`explain`/`reason`. It runs vector search in parallel so the
+caller still gets `results` (source excerpts) alongside the LLM
+answer — useful for UI rendering even when the user only wanted the
+synthesized response.
+
+`Mode != search` requires a configured chat backend; without one,
+the handler returns 400 with a hint to `POST /config` first.
+
+### Phase G — chunk hydration from Qdrant on /config (commit `14e7f85`)
+
+graphrag-core gains one public helper:
+
+```rust
+impl GraphRAG {
+    pub fn seed_processed_chunks<I: IntoIterator<Item = ChunkId>>(
+        &mut self,
+        chunk_ids: I,
+    );
+}
+```
+
+graphrag-server's `POST /config` handler now scrolls the Qdrant
+collection, re-chunks each document through the configured
+`TextProcessor`, pushes the chunks into the in-memory
+`KnowledgeGraph`, and seeds `processed_chunks` with their ids.
+
+Why: before this commit, after a server restart, the in-memory
+chunk index started empty. `/api/graph/build` only walked chunks
+ingested *since* restart — typically a tiny fraction of the corpus.
+`/api/graph/append`'s no-op fast path was a lie: it claimed
+"5 of 5 processed" while Qdrant held 45 docs that had never been
+extracted.
+
+`POST /config` response gains a `hydrated: {documents, chunks,
+skipped, ...}` summary so deploys can verify hydration ran.
+
+New API on `QdrantStore`:
+```rust
+pub async fn list_full_documents(&self, limit: u32)
+    -> Result<Vec<(String, DocumentMetadata)>>;
+```
+Like `list_documents` but returns full payloads so callers can
+rechunk for hydration.
+
+### Phase H — persist entity graph across restarts (commit `76daa04`)
+
+Two new sidecar Qdrant collections, suffixed off the main collection:
+`{coll}-entities` and `{coll}-relationships`. One Qdrant point per
+entity / relationship; payload is the serde-serialized
+graphrag-core `Entity` / `Relationship`. Stable point ids:
+UUID5 over the entity id (entities) or
+`source|relation_type|target` (relationships).
+
+Vectors are 1-dimensional placeholders. Persistence is the only goal
+in this PR; entity-level vector embeddings (so agents can search
+the entity graph directly) is a deliberate future PR.
+
+Wiring:
+- `POST /api/graph/build` → after success, persist entire current
+  graph (clear-and-repopulate so in-memory deletions propagate).
+- `POST /api/graph/append` → same; the no-op fast path skips the
+  persist call since the graph is unchanged.
+- `POST /config` → after Phase G chunk hydration, restore entities
+  first (so relationships have endpoints) and then relationships.
+  Orphan relationship rows (whose source/target weren't restored)
+  are logged and skipped, not fatal.
+
+Schema versioning: each persisted row carries a `schema_version: u32`
+field (currently `1`) for future incompatible migrations.
+
+New API on `QdrantStore`:
+```rust
+pub async fn persist_graph(
+    &self,
+    entities: Vec<PersistedEntity>,
+    relationships: Vec<PersistedRelationship>,
+) -> Result<(usize, usize)>;
+pub async fn load_persisted_entities(&self) -> Result<Vec<PersistedEntity>>;
+pub async fn load_persisted_relationships(&self) -> Result<Vec<PersistedRelationship>>;
+pub async fn ensure_graph_collections(&self) -> Result<()>;  // idempotent
+pub async fn clear_graph_collections(&self) -> Result<()>;  // delete + recreate
+pub fn entities_collection(&self) -> String;
+pub fn relationships_collection(&self) -> String;
+```
+
+A new module `graphrag-server/src/graph_persistence.rs` glues
+graphrag-core's `Entity`/`Relationship` to the wire envelopes.
+
+## Methodology
+
+- Cherry-picked off `upstream/main` (c46e287). Three commits, one
+  per concern (modes / Phase G / Phase H).
+- `cargo check -p graphrag-server --features qdrant` clean.
+- 12 pre-existing test failures in graphrag-core
+  (`normalize_name`, `boundary_detection`, etc.) are unrelated;
+  they fail on `upstream/main` too.
+- e2e suite (in graphrag-rs-nix) has new Tests 11 and 12 covering
+  `mode=ask`/`mode=explain` plus the entity/relationship sidecar
+  collections; tests pass against a real local LLM (Qwen3.6 27B
+  via vLLM) and a real Qdrant.
+- Workspace dep change: `uuid` gains the `v5` feature for
+  deterministic point ids.
+
+## Open questions
+
+- The 1-D placeholder vectors on the entity/relationship sidecars
+  feel wrong long-term — they're inert today. I deliberately
+  punted on entity-level embeddings to keep this PR focused.
+  Happy to discuss whether you'd prefer the persistence layer to
+  embed entity descriptions on write (hooked into the same
+  `EmbeddingService` the document path uses) and use the
+  collections for entity-vector-search alongside persistence.
+- Restore order is "entities first, then relationships." If you
+  later add hierarchical relationships
+  (`relationship_hierarchy: Option<RelationshipHierarchy>`) that
+  also need persistence, the right place is a follow-on commit;
+  this PR doesn't touch that field.
+- The persist-on-build approach is "wipe and repopulate" — simple
+  but writes O(|entities| + |relationships|) on every build. For
+  a 100K-entity graph this is still bounded but worth optimizing
+  to delta upserts later. Not a blocker.
+- Three commits split by concern (modes / chunk hydration /
+  graph persistence). Happy to squash on merge if that reads
+  better.
 ```
 
 ## PR filing log
