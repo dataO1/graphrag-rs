@@ -140,7 +140,7 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 27 | `14e7f85` | graphrag-server: hydrate KnowledgeGraph from Qdrant on /config (Phase G) | 168 | **PR D** |
 | 28 | `76daa04` | graphrag-server: persist entity graph across restarts (Phase H) | 469 | **PR D** |
 | 29 | `c38542b` | graphrag-server: deprecate /api/graph/build for routine use | 16 | **PR D** |
-| 30 | `143b9a3` | graphrag-core: KnowledgeGraph::add_entity/add_relationship dedupe by id | 249 | **PR C** (cherry-picked onto `pr/agent-ux` as `c17b5f6`; also onto `pr/graph-query-and-persistence` as `ac07a0c` so PR D builds standalone on its base) |
+| 30 | `143b9a3` | graphrag-core: KnowledgeGraph::add_entity/add_relationship dedupe by id | 249 | **PR C** (cherry-picked onto `pr/agent-ux` as `c17b5f6`; PR D inherits it via the stack — no separate cherry-pick needed onto `pr/graph-query-and-persistence` since that branch is rebased on `pr/agent-ux`) |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
