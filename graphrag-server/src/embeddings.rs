@@ -1,67 +1,27 @@
 //! Embeddings module for GraphRAG Server
 //!
-//! Provides a unified interface for generating embeddings using various backends:
-//! - Ollama (local LLM service)
-//! - Hash-based fallback (deterministic, no external dependencies)
+//! Single concrete embedder that the whole server uses for both the
+//! document and query paths. Driven entirely by
+//! [`graphrag_core::config::EmbeddingConfig`] — there is no
+//! server-local config struct anymore. The same struct lives in the
+//! persisted server config, in `/api/embeddings/stats`, in `/health`,
+//! and in graphrag-core's retrieval system, so the four answers can't
+//! drift.
 //!
-//! ## Usage
-//!
-//! ```rust
-//! let embedder = EmbeddingService::new(EmbeddingConfig::default()).await?;
-//! let embedding = embedder.generate(&["Hello world"]).await?;
-//! ```
+//! Backends:
+//! - `openai` — any OpenAI-compatible HTTP server (vLLM, OVMS, llama.cpp, etc.)
+//! - `ollama` — native Ollama API (parsed out of `api_endpoint`)
+//! - `hash`   — deterministic hash-based fallback (no I/O)
 
+use graphrag_core::config::EmbeddingConfig;
 use graphrag_core::vector::EmbeddingGenerator;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
 
 #[cfg(feature = "ollama")]
 use ollama_rs::{generation::embeddings::request::GenerateEmbeddingsRequest, Ollama};
-
-/// Embedding service configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingConfig {
-    /// Embedding backend: "ollama", "openai", or "hash"
-    pub backend: String,
-    /// Embedding dimension (384 for MiniLM, 768 for BERT, 1024 for mxbai)
-    pub dimension: usize,
-    /// Ollama base URL (if using Ollama)
-    pub ollama_url: String,
-    /// Ollama port (separate from URL because ollama-rs takes them split)
-    pub ollama_port: u16,
-    /// Ollama embedding model name
-    pub ollama_model: String,
-    /// OpenAI-compatible base URL (e.g. "http://localhost:8000/v1" for
-    /// vLLM, "http://localhost:9000/v3" for OpenVINO Model Server,
-    /// "http://localhost:17171/v1" for llama-server, or
-    /// "https://api.openai.com/v1" for the real thing).
-    pub openai_url: String,
-    /// OpenAI-compat model name (sent in the JSON body's `model` field).
-    pub openai_model: String,
-    /// API key. Empty string is fine for self-hosted servers (vLLM, OVMS,
-    /// llama-server) that don't authenticate.
-    pub openai_api_key: String,
-    /// Enable caching
-    pub enable_cache: bool,
-}
-
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            backend: "ollama".to_string(),
-            dimension: 384,
-            ollama_url: "http://localhost".to_string(),
-            ollama_port: 11434,
-            ollama_model: "nomic-embed-text".to_string(),
-            openai_url: "http://localhost:8000/v1".to_string(),
-            openai_model: "BAAI/bge-m3".to_string(),
-            openai_api_key: String::new(),
-            enable_cache: true,
-        }
-    }
-}
 
 /// OpenAI-compatible embedding HTTP client. Holds the configured URL,
 /// model name, and API key; used by `generate_with_openai`.
@@ -73,7 +33,8 @@ struct OpenAIClient {
     api_key: String,
 }
 
-/// Embedding service with automatic fallback
+/// Embedding service. Constructed once at boot from
+/// `Config.embeddings`, then re-constructed atomically by `POST /config`.
 pub struct EmbeddingService {
     config: EmbeddingConfig,
     #[cfg(feature = "ollama")]
@@ -88,8 +49,8 @@ pub struct EmbeddingService {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingStats {
     pub total_requests: usize,
-    pub ollama_success: usize,
-    pub ollama_failures: usize,
+    pub backend_success: usize,
+    pub backend_failures: usize,
     pub fallback_used: usize,
     pub cache_hits: usize,
 }
@@ -109,7 +70,8 @@ pub enum EmbeddingError {
     GenerationFailed(String),
 
     #[error("Invalid dimension: expected {expected}, got {actual}")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Only constructed inside the openai / ollama
+    // feature-gated branches.
     DimensionMismatch { expected: usize, actual: usize },
 }
 
@@ -127,97 +89,58 @@ impl From<ollama_rs::error::OllamaError> for EmbeddingError {
 }
 
 impl EmbeddingService {
-    /// Create a new embedding service
-    pub async fn new(config: EmbeddingConfig) -> Result<Self, EmbeddingError> {
-        info!(
-            "Initializing embedding service with backend: {}",
-            config.backend
-        );
-
-        // Try to initialize Ollama if requested
-        #[cfg(feature = "ollama")]
-        let ollama_client = if config.backend == "ollama" {
-            let ollama = Ollama::new(config.ollama_url.clone(), config.ollama_port);
-
-            // Check if Ollama is available
-            match ollama.list_local_models().await {
-                Ok(models) => {
-                    info!("✓ Ollama connection established");
-
-                    // Check if embedding model exists
-                    let model_exists = models.iter().any(|m| m.name == config.ollama_model);
-
-                    if model_exists {
-                        info!("✓ Embedding model '{}' is available", config.ollama_model);
-                        Some(Arc::new(ollama))
-                    } else {
-                        warn!(
-                            "⚠ Embedding model '{}' not found. Using fallback. Run: ollama pull {}",
-                            config.ollama_model, config.ollama_model
-                        );
-                        None
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        "⚠ Ollama service not available: {}. Using fallback embeddings.",
-                        e
-                    );
-                    None
-                },
-            }
-        } else {
-            info!("Using hash-based fallback embeddings (no Ollama)");
-            None
-        };
-
-        #[cfg(not(feature = "ollama"))]
-        if config.backend == "ollama" {
-            warn!("⚠ Ollama support not compiled in. Using fallback embeddings. Rebuild with --features ollama");
-        }
-
-        // OpenAI-compat backend (vLLM, OVMS, llama-server, etc.). Gated
-        // behind feature = "openai" — when off, the user's
-        // `EMBEDDING_BACKEND=openai` falls through to hash with a clear
-        // log line, mirroring the ollama-feature-off behavior.
+    /// Build a service from the core `EmbeddingConfig`. This is the
+    /// only constructor — boot and `POST /config` both go through here.
+    /// On success the caller should log the unified backend line so
+    /// users see exactly which path was wired.
+    pub async fn from_config(cfg: &EmbeddingConfig) -> Result<Self, EmbeddingError> {
+        // OpenAI-compat backend (vLLM, OVMS, llama-server, OpenAI itself).
+        // Probes /models to confirm reachability; doesn't fail-hard if the
+        // server doesn't list our model name (some servers expose synthetic
+        // names via Mediapipe graphs / single-model mode).
         #[cfg(feature = "openai")]
-        let openai_client = if config.backend == "openai" {
+        let openai_client = if cfg.backend == "openai" {
+            let endpoint = cfg.api_endpoint.as_deref().unwrap_or("");
+            let api_key = cfg.api_key.clone().unwrap_or_default();
+            let model = cfg.model.clone().unwrap_or_default();
+
+            if endpoint.is_empty() {
+                return Err(EmbeddingError::OpenAIError(
+                    "embeddings.api_endpoint is required for backend=openai".to_string(),
+                ));
+            }
+
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .map_err(|e| EmbeddingError::OpenAIError(format!("client build failed: {e}")))?;
 
-            // Probe the /models endpoint to confirm the server is up. We
-            // don't fail-hard if the model isn't listed — some servers
-            // (vLLM single-model mode, OVMS Mediapipe graphs) report
-            // synthetic names that don't match config.openai_model.
-            let probe_url = format!("{}/models", config.openai_url.trim_end_matches('/'));
+            let probe_url = format!("{}/models", endpoint.trim_end_matches('/'));
             let mut req = http.get(&probe_url);
-            if !config.openai_api_key.is_empty() {
-                req = req.bearer_auth(&config.openai_api_key);
+            if !api_key.is_empty() {
+                req = req.bearer_auth(&api_key);
             }
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    info!("✓ OpenAI-compat server reachable at {}", config.openai_url);
                     Some(Arc::new(OpenAIClient {
                         http,
-                        base_url: config.openai_url.clone(),
-                        model: config.openai_model.clone(),
-                        api_key: config.openai_api_key.clone(),
+                        base_url: endpoint.to_string(),
+                        model,
+                        api_key,
                     }))
                 },
                 Ok(resp) => {
                     warn!(
-                        "⚠ OpenAI-compat /models returned {}. Using fallback embeddings. URL: {}",
+                        "OpenAI-compat /models returned {} at {}; falling through to hash fallback",
                         resp.status(),
-                        config.openai_url
+                        endpoint
                     );
                     None
                 },
                 Err(e) => {
                     warn!(
-                        "⚠ OpenAI-compat probe failed: {}. Using fallback embeddings. URL: {}",
-                        e, config.openai_url
+                        "OpenAI-compat probe failed at {}: {}; falling through to hash fallback",
+                        endpoint, e
                     );
                     None
                 },
@@ -227,15 +150,56 @@ impl EmbeddingService {
         };
 
         #[cfg(not(feature = "openai"))]
-        if config.backend == "openai" {
-            warn!("⚠ OpenAI-compat embeddings not compiled in. Using fallback. Rebuild with --features openai");
+        if cfg.backend == "openai" {
+            warn!("backend=openai but openai feature not compiled in — falling through to hash");
         }
 
-        // Always create fallback generator
-        let fallback_generator = Arc::new(RwLock::new(EmbeddingGenerator::new(config.dimension)));
+        // Ollama backend. `api_endpoint` may be either "host:port",
+        // "http://host:port", or unset (defaults to localhost:11434) —
+        // `parse_ollama_endpoint` handles all three.
+        #[cfg(feature = "ollama")]
+        let ollama_client = if cfg.backend == "ollama" {
+            let model = cfg.model.clone().unwrap_or_else(|| "nomic-embed-text".to_string());
+            let (host, port) = parse_ollama_endpoint(cfg.api_endpoint.as_deref());
+            let ollama = Ollama::new(host.clone(), port);
+
+            match ollama.list_local_models().await {
+                Ok(models) => {
+                    if models.iter().any(|m| m.name == model) {
+                        Some(Arc::new(ollama))
+                    } else {
+                        warn!(
+                            "Ollama embedding model '{}' not present at {}:{}; falling through to hash. \
+                             Run: ollama pull {}",
+                            model, host, port, model
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "Ollama unreachable at {}:{}: {}; falling through to hash",
+                        host, port, e
+                    );
+                    None
+                },
+            }
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "ollama"))]
+        if cfg.backend == "ollama" {
+            warn!("backend=ollama but ollama feature not compiled in — falling through to hash");
+        }
+
+        // Always available: hash-based fallback. Sized to the configured
+        // dimension so the fallback path produces vectors the rest of the
+        // pipeline accepts (Qdrant collection dim, retrieval cosine, etc.).
+        let fallback_generator = Arc::new(RwLock::new(EmbeddingGenerator::new(cfg.dimension)));
 
         Ok(Self {
-            config,
+            config: cfg.clone(),
             #[cfg(feature = "ollama")]
             ollama_client,
             #[cfg(feature = "openai")]
@@ -246,12 +210,11 @@ impl EmbeddingService {
     }
 
     /// Generate embeddings for a batch of texts. Tries the configured
-    /// backend (ollama or openai), falls through to the hash generator if
-    /// the backend errors.
+    /// backend; falls through to the hash generator if the backend errors.
     pub async fn generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let mut stats = self.stats.write().await;
         stats.total_requests += texts.len();
-        drop(stats); // Release lock
+        drop(stats);
 
         // OpenAI-compat backend (vLLM, OVMS, llama-server, ...).
         #[cfg(feature = "openai")]
@@ -259,13 +222,13 @@ impl EmbeddingService {
             match self.generate_with_openai(client, texts).await {
                 Ok(embeddings) => {
                     let mut stats = self.stats.write().await;
-                    stats.ollama_success += texts.len();
+                    stats.backend_success += texts.len();
                     return Ok(embeddings);
                 },
                 Err(e) => {
                     warn!("OpenAI-compat embedding failed: {}. Using fallback.", e);
                     let mut stats = self.stats.write().await;
-                    stats.ollama_failures += texts.len();
+                    stats.backend_failures += texts.len();
                 },
             }
         }
@@ -276,13 +239,13 @@ impl EmbeddingService {
             match self.generate_with_ollama(ollama, texts).await {
                 Ok(embeddings) => {
                     let mut stats = self.stats.write().await;
-                    stats.ollama_success += texts.len();
+                    stats.backend_success += texts.len();
                     return Ok(embeddings);
                 },
                 Err(e) => {
                     warn!("Ollama embedding failed: {}. Using fallback.", e);
                     let mut stats = self.stats.write().await;
-                    stats.ollama_failures += texts.len();
+                    stats.backend_failures += texts.len();
                 },
             }
         }
@@ -296,9 +259,8 @@ impl EmbeddingService {
     }
 
     /// Generate embeddings using an OpenAI-compatible server (vLLM, OVMS,
-    /// llama-server, OpenAI itself, …). Sends one POST per text — most
-    /// servers also accept a batch (input as an array) but using
-    /// per-text requests keeps the dimension-validation path simple.
+    /// llama-server, OpenAI itself, …). One POST per text — keeps the
+    /// dimension-validation path simple.
     #[cfg(feature = "openai")]
     async fn generate_with_openai(
         &self,
@@ -370,13 +332,16 @@ impl EmbeddingService {
         ollama: &Ollama,
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let model = self
+            .config
+            .model
+            .clone()
+            .unwrap_or_else(|| "nomic-embed-text".to_string());
         let mut results = Vec::with_capacity(texts.len());
 
         for text in texts {
-            let request = GenerateEmbeddingsRequest::new(
-                self.config.ollama_model.clone(),
-                text.to_string().into(),
-            );
+            let request =
+                GenerateEmbeddingsRequest::new(model.clone(), text.to_string().into());
 
             let response = ollama.generate_embeddings(request).await?;
 
@@ -409,46 +374,66 @@ impl EmbeddingService {
     }
 
     /// Get embedding dimension
-    #[allow(dead_code)]
     pub fn dimension(&self) -> usize {
         self.config.dimension
     }
 
     /// Get current statistics
-    #[allow(dead_code)]
     pub async fn get_stats(&self) -> EmbeddingStats {
         self.stats.read().await.clone()
     }
 
-    /// Check if Ollama is available
-    #[allow(dead_code)]
-    pub fn is_ollama_available(&self) -> bool {
-        #[cfg(feature = "ollama")]
-        {
-            self.ollama_client.is_some()
-        }
-        #[cfg(not(feature = "ollama"))]
-        {
-            false
-        }
+    /// Snapshot the config this service was built from. Used by
+    /// `/health`, `/config`, and `/embeddings/stats` so they all read
+    /// the same struct that `from_config` actually consumed.
+    #[allow(dead_code)] // Used by integration tests / future endpoints.
+    pub fn config(&self) -> &EmbeddingConfig {
+        &self.config
     }
 
-    /// Get backend name
-    pub fn backend_name(&self) -> &str {
+    /// Whether the configured backend is actually live (probe succeeded
+    /// at construction). Useful for `/health` to distinguish "running on
+    /// real backend" vs "fell through to hash because the upstream was down".
+    pub fn backend_live(&self) -> bool {
         #[cfg(feature = "openai")]
-        {
-            if self.openai_client.is_some() {
-                return "openai";
-            }
+        if self.openai_client.is_some() {
+            return true;
         }
         #[cfg(feature = "ollama")]
-        {
-            if self.ollama_client.is_some() {
-                return "ollama";
-            }
+        if self.ollama_client.is_some() {
+            return true;
         }
-        "hash-fallback"
+        // Hash backend is "live" by definition — it has no upstream to probe.
+        self.config.backend == "hash"
     }
+}
+
+/// Parse an Ollama endpoint string into `(host_url, port)`. Accepts:
+/// - `None` → defaults to `("http://localhost", 11434)`
+/// - `"localhost:11434"` (no scheme) → adds `http://`
+/// - `"http://host:11434"` (full URL) → splits port off
+/// - `"http://host"` (no explicit port) → defaults port to 11434
+///
+/// Lives here (not in graphrag-core) because ollama-rs takes host and
+/// port as separate args; the core `EmbeddingConfig` carries a single
+/// `api_endpoint` field to stay backend-agnostic.
+#[cfg(feature = "ollama")]
+fn parse_ollama_endpoint(endpoint: Option<&str>) -> (String, u16) {
+    let raw = endpoint.unwrap_or("http://localhost:11434");
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+
+    // Strip scheme for splitting host:port
+    let without_scheme = with_scheme.split("://").nth(1).unwrap_or(&with_scheme);
+    let (host_part, port) = match without_scheme.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(11434)),
+        None => (without_scheme.to_string(), 11434),
+    };
+    let scheme = with_scheme.split("://").next().unwrap_or("http");
+    (format!("{scheme}://{host_part}"), port)
 }
 
 // Bridge `EmbeddingService` (the server's real, multi-backend embedder)
@@ -482,9 +467,10 @@ impl graphrag_core::core::traits::AsyncEmbedder for EmbeddingService {
     }
 
     async fn is_ready(&self) -> bool {
-        // The service self-tests its backends in `new()` (probe + fallback);
-        // by the time we hand it to core it's always ready in the sense
-        // that embed() will succeed (real backend or hash fallback).
+        // The service self-tests its backends in `from_config()` (probe
+        // + fallback); by the time we hand it to core it's always ready
+        // in the sense that embed() will succeed (real backend or hash
+        // fallback).
         true
     }
 }
@@ -493,34 +479,26 @@ impl graphrag_core::core::traits::AsyncEmbedder for EmbeddingService {
 mod tests {
     use super::*;
 
+    fn hash_cfg(dim: usize) -> EmbeddingConfig {
+        EmbeddingConfig {
+            dimension: dim,
+            backend: "hash".to_string(),
+            model: None,
+            fallback_to_hash: true,
+            api_endpoint: None,
+            api_key: None,
+            cache_dir: None,
+            batch_size: 32,
+        }
+    }
+
     #[tokio::test]
     async fn test_fallback_embeddings() {
-        let config = EmbeddingConfig {
-            backend: "hash".to_string(),
-            dimension: 384,
-            ..Default::default()
-        };
-
-        let service = EmbeddingService::new(config).await.unwrap();
+        let service = EmbeddingService::from_config(&hash_cfg(384)).await.unwrap();
         let embeddings = service.generate(&["test", "hello"]).await.unwrap();
 
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), 384);
         assert_eq!(embeddings[1].len(), 384);
-    }
-
-    #[tokio::test]
-    async fn test_ollama_embeddings() {
-        let config = EmbeddingConfig::default();
-
-        if let Ok(service) = EmbeddingService::new(config).await {
-            if service.is_ollama_available() {
-                let embeddings = service.generate(&["test"]).await.unwrap();
-                assert_eq!(embeddings.len(), 1);
-                println!("Ollama embedding dimension: {}", embeddings[0].len());
-            } else {
-                println!("Ollama not available, using fallback");
-            }
-        }
     }
 }

@@ -75,6 +75,11 @@ parking_lot = { workspace = true }
 # Caching and distributed systems
 redis = { workspace = true }
 
+# Lock-free Arc swap for hot-swapping the live EmbeddingService when
+# /config POST rebuilds it. Read path is wait-free, which matters
+# because every /api/query and /api/documents path grabs the embedder.
+arc-swap = "1.7"
+
 # Other
 uuid = { workspace = true }
 chrono = { workspace = true }
