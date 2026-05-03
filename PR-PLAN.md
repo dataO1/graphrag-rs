@@ -144,6 +144,8 @@ In topological order. PR-relevance grouping in the rightmost column.
 | 31 | `91c2125` | graphrag-server: embed entity/relationship descriptions on persist (Phase H+) | 164 | **PR D** (cherry-picked onto `pr/graph-query-and-persistence` as `cd45672`) |
 | 32 | `9d1e190` | graphrag-server: add mode=local — MS GraphRAG-style entity-vector-seeded retrieval | 408 | **PR D** (cherry-picked onto `pr/graph-query-and-persistence` as `f8e3409`) |
 | 33 | `1c5b3bf` | graphrag: full LightRAG dual-level retrieval (global / hybrid / mix) | 723 | **PR E** |
+| 34 | `4e8c6ff` | graphrag: inject real embedding service into core (drop hash-fallback on hot path) | 248 | **PR F** |
+| 35 | `d74116f` | graphrag: unify embeddings around Config.embeddings (single source of truth) | 1039 | **PR F** |
 
 (Anything added after this point — append rows here when committing to `openai-compat`.)
 
@@ -432,6 +434,81 @@ new dependencies, no schema changes.
 **Audience**: reviewer who's read the LightRAG paper and wants to
 see the algorithm reproduced cleanly in Rust without inventing new
 abstractions on top.
+
+### PR F — Unify embeddings around `Config.embeddings` (single source of truth)
+**~1300 LOC across two commits.** Closes the embedding-subsystem
+duality that existed even after `4e8c6ff`'s injection landed:
+`EmbeddingService` (server, env-var-built) and `Config.embeddings`
+(graphrag-core's hash defaults) were two competing storage spots
+that the host had to keep in sync by hand. `GET /config` confidently
+reported `backend:"hash"` while the runtime was talking to OVMS.
+Three reads (/config, /api/embeddings/stats, runtime), three
+answers, no atomic backend switch.
+
+**Cherry-pick**: `4e8c6ff` + `d74116f` (both on `openai-compat`)
+onto a fresh branch `pr/embeddings-single-source` based on
+`origin/pr/lightrag-dual-retrieval`.
+
+**Title**: `Unify embeddings around Config.embeddings (single source of truth)`.
+
+**Stack dependency**: stacked on `pr/lightrag-dual-retrieval` (PR
+#12) because `d74116f`'s `main.rs` already contains the LightRAG
+mode dispatch and other PR-D/E content; cherry-picking it onto a
+shallower base would re-introduce the conflicts that took several
+rounds to resolve. Conceptual dependency is on PR #9 (the
+OpenAI-compat embedding backend that introduced `EmbeddingService`);
+the chain through #10/#11/#12 is just a base-branch artifact. The
+`openai = []` server feature flag and `reqwest` dep that PR #9
+introduces are re-added in this PR's Cargo.toml as a stacking
+forward — they drop out as a no-op once #9 lands.
+
+**What landed in `d74116f`** (the second commit, the structural
+refactor):
+
+- Single `embedder: DynEmbedder` field in graphrag-core's
+  `RetrievalSystem`, `HybridRetriever`, and `SemanticChunker` —
+  the `Option<DynEmbedder>` + `EmbeddingGenerator` dual storage
+  introduced by `4e8c6ff` is gone. New `HashEmbedder` adapter
+  (`graphrag-core/src/vector/mod.rs`) wraps the existing
+  `EmbeddingGenerator` so `backend:"hash"` flows through the same
+  trait surface as openai/ollama.
+- `EmbeddingService::from_config(&graphrag_core::config::EmbeddingConfig)`
+  is the only constructor. The local `EmbeddingConfig` struct in
+  `graphrag-server/src/embeddings.rs` is deleted. Ollama's
+  `host:port` split is parsed out of the unified `api_endpoint`.
+- `POST /config` rebuilds the `EmbeddingService`, probe-embeds,
+  and rejects 400 on dim mismatch or unreachable upstream.
+  `state.embeddings` is `Arc<ArcSwap<EmbeddingService>>` so the
+  swap is atomic and wait-free for the 16 read sites on the hot
+  path of every `/api/query` and `/api/documents`.
+- `GET /config`, `GET /embeddings/stats`, and a new
+  `GET /health.embeddings` block all read from
+  `state.config.embeddings`. They cannot disagree.
+- `/api/embeddings/stats` moved to `/embeddings/stats` (apistos
+  scope-shadow workaround, same as `/api/config` → `/config` in
+  PR A).
+- One unified post-init log line: `INFO embeddings: backend=X
+  model=Y dim=Z endpoint=...`. The two older misleading lines
+  (`Initializing embedding service with backend: ...` printed
+  before the probe; `Using hash-based fallback embeddings (no
+  Ollama)` printed unconditionally) are gone.
+
+**Story for the maintainer**: `4e8c6ff` was a hot-path correctness
+fix that only papered over the duality. `d74116f` deletes the
+duality. The diff is bigger but the user-facing surface shrinks:
+one config struct, one embedder, one log line, one place to look
+when verifying which backend is live.
+
+**Audience**: same reviewer as PR B (the OpenAI-compat embedding
+backend) — anyone who'd want to confirm that "the embedding
+backend the user POSTed to /config is actually the one serving
+embeddings" is now a single-line proof by construction.
+
+**End-to-end validation**: external e2e script reports 52 passed /
+0 failed against a live OVMS+NPU deployment, including the new
+backend-switching test (POST /config flips backend openai→hash→
+openai atomically across all three reads, and dim-mismatch POST
+returns HTTP 400 with no state change).
 
 ## NOT for upstream
 
@@ -1449,6 +1526,102 @@ MS-GraphRAG-flavored modes.
   Easy to rebase onto `upstream/main` once PR #11 lands.
 ```
 
+### PR F body (filed)
+
+**Title**: `Unify embeddings around Config.embeddings (single source of truth)`
+
+**Branch**: `pr/embeddings-single-source` (2 commits, ~1300 LOC).
+Stacked on `pr/lightrag-dual-retrieval` (PR #12). Filed as #13.
+
+- `4e8c6ff` (cherry → `51efaf3`) — graphrag: inject real embedding service into core (drop hash-fallback on hot path)
+- `d74116f` (cherry → `67f8de2`) — graphrag: unify embeddings around Config.embeddings (single source of truth)
+
+```markdown
+graphrag-core's `RetrievalSystem`, `HybridRetriever`, and
+`SemanticChunker` all embedded queries and content with
+`EmbeddingGenerator` — a 128-dim hash-based dummy designed for
+zero-dep tests, not real grounding. Hosts that have a real
+embedding service (e.g. graphrag-server's mxbai-via-OVMS / Ollama /
+OpenAI-compat backend at 1024 dimensions) had no way to inject it,
+so any retrieval path that goes through `hybrid_query` matched
+entities with toy `DefaultHasher` vectors despite the real embeddings
+being one `Arc<EmbeddingService>` away.
+
+## Goal
+
+Let the host inject its real embedding service. graphrag-core falls
+back to the existing dummy when nothing is injected, so this is a
+non-breaking change for tests and standalone callers.
+
+## Approach
+
+Reuse the existing `AsyncEmbedder` trait at
+`graphrag-core/src/core/traits.rs:144`. No new trait. Add a small
+type alias `DynEmbedder` so callers don't re-spell
+`Arc<dyn AsyncEmbedder<Error = GraphRAGError>>` everywhere.
+
+Each component (`RetrievalSystem`, `HybridRetriever`,
+`SemanticChunker`) gains:
+1. `embedding_provider: Option<DynEmbedder>` field.
+2. `pub fn set_embedding_provider(provider: DynEmbedder)`.
+3. A small helper that prefers the injected provider, falls back
+   to the existing `EmbeddingGenerator`.
+
+`GraphRAG::set_embedding_provider` propagates into
+`RetrievalSystem` on call (works whether called before or after
+`initialize()`).
+
+`HybridRetriever::search` and `SemanticChunker::chunk` become
+`async fn` (they previously called the sync hash generator). One
+test in each module rewrapped as `#[tokio::test]`.
+
+## Server-side bridge
+
+graphrag-server's `EmbeddingService` now implements `AsyncEmbedder`:
+- `embed` → `generate_single`
+- `embed_batch` → `generate`
+- `dimension` → config dimension
+- `is_ready` → `true` (service self-tests at construction)
+
+The `/api/config` handler calls
+`graphrag.set_embedding_provider(state.embeddings.clone())` once,
+right after `GraphRAG::new(config)` and before `initialize()`.
+
+## What changes behaviorally
+
+- `mode=search`, `mode=local`, `mode=hybrid`, `mode=mix` —
+  unchanged. They pre-compute query embeddings server-side and
+  pass pre-computed vectors into core; never on the dummy path.
+- `mode=ask`, `mode=explain`, `mode=reason` — these go through
+  `RetrievalSystem::hybrid_query`, which now embeds queries
+  through the injected provider. Confidence and source attribution
+  should improve from "noise" to "grounded".
+- Tests use the dummy fallback (no provider injected) —
+  semantically identical to before.
+
+## Methodology
+
+- Cherry-picked off `openai-compat`. Single commit.
+- `cargo check -p graphrag-core --features async` clean.
+- `cargo check -p graphrag-server --features qdrant` clean.
+- Release build clean (~2m24s).
+- All graphrag-core unit tests pass (391 tests, including the two
+  rewrapped async tests).
+
+## Reference
+
+Existing `AsyncEmbedder` trait at
+`graphrag-core/src/core/traits.rs:144`. Existing
+`OllamaEmbedderAdapter` at `graphrag-core/src/core/ollama_adapters.rs:39`
+already implements it with `Error = GraphRAGError`. This PR follows
+the same shape for the server-side `EmbeddingService` impl.
+
+## Stack
+
+Independent of PRs #8–#12. Touches different code paths; no
+merge-conflict risk. Can land before or after them.
+```
+
 ## PR filing log
 
 (append rows when filed/updated)
@@ -1460,3 +1633,4 @@ MS-GraphRAG-flavored modes.
 | #10 | 2026-04-30 | PR C — Agent UX + real incremental extend_graph + add_entity dedup | filed | https://github.com/automataIA/graphrag-rs/pull/10 |
 | #11 | 2026-04-30 | PR D — Graph-aware /api/query (ask/explain/reason/local) + persistence | filed | https://github.com/automataIA/graphrag-rs/pull/11 |
 | #12 | 2026-04-30 | PR E — LightRAG dual-level retrieval (global / hybrid / mix modes) | **draft** | https://github.com/automataIA/graphrag-rs/pull/12 — stacks on #11 |
+| #13 | 2026-05-03 | PR F — Unify embeddings around Config.embeddings (single source of truth) | filed | https://github.com/automataIA/graphrag-rs/pull/13 — stacks on #12 (LightRAG); conceptual dependency only on #9 |
