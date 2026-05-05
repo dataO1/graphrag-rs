@@ -2519,10 +2519,20 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
+    // Bind from env vars so deployments can route around port
+    // collisions without rebuilding. Defaults preserve the
+    // historical 0.0.0.0:8080 behavior.
+    let bind_host = std::env::var("GRAPHRAG_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let bind_port: u16 = std::env::var("GRAPHRAG_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let bind_addr = format!("{bind_host}:{bind_port}");
+
     tracing::info!("🚀 GraphRAG Server starting...");
-    tracing::info!("📡 Listening on http://0.0.0.0:8080");
-    tracing::info!("📚 Swagger UI: http://0.0.0.0:8080/swagger");
-    tracing::info!("📄 OpenAPI spec: http://0.0.0.0:8080/openapi.json");
+    tracing::info!("📡 Listening on http://{bind_addr}");
+    tracing::info!("📚 Swagger UI: http://{bind_addr}/swagger");
+    tracing::info!("📄 OpenAPI spec: http://{bind_addr}/openapi.json");
     tracing::info!(
         "🗄️  Backend: {}",
         if state.has_qdrant() {
@@ -2626,7 +2636,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/stats", web::get().to(embeddings_stats))
             )
     })
-    .bind("0.0.0.0:8080")?
+    .bind(&bind_addr)?
     .run()
     .await
 }
