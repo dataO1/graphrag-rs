@@ -49,7 +49,7 @@ use models::*;
 #[cfg(feature = "qdrant")]
 mod qdrant_store;
 #[cfg(feature = "qdrant")]
-use qdrant_store::{DocumentMetadata, QdrantStore};
+use qdrant_store::{DocumentMetadata, QdrantStore, SearchResult as QdrantSearchResult};
 
 #[cfg(feature = "auth")]
 mod auth;
@@ -356,6 +356,128 @@ impl AppState {
 }
 
 // ============================================================================
+// History-aware retrieval helper
+// ============================================================================
+
+/// Filter applied at every chunk-vector search call for `/api/query`.
+/// Constructed from the request body's `as_of` and
+/// `max_versions_per_doc` fields; defaults give the fast path
+/// (`is_current = true` qdrant payload filter, no over-fetch).
+#[derive(Debug, Clone)]
+struct VersionFilter {
+    as_of: Option<String>,
+    max_versions_per_doc: u32,
+}
+
+impl VersionFilter {
+    fn from_request(body: &QueryRequest) -> Self {
+        Self {
+            as_of: body.as_of.clone(),
+            // 0 → 1 so callers can't accidentally turn off filtering.
+            max_versions_per_doc: body.max_versions_per_doc.unwrap_or(1).max(1),
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        self.as_of.is_none() && self.max_versions_per_doc == 1
+    }
+}
+
+/// Vector search for chunks with the version filter applied.
+///
+/// Two strategies, chosen by `VersionFilter::is_default`:
+///
+/// 1. **Default path** (`as_of=None`, `max_versions_per_doc=1`):
+///    pushes a Qdrant payload filter `is_current = true` into
+///    `qdrant.search(...)`. Same cost as un-filtered search; only
+///    current-version chunks come back; top-K never contaminated by
+///    superseded versions.
+///
+/// 2. **History path** (any non-default filter): pulls back
+///    `top_k * factor` candidates without a qdrant-side payload
+///    filter, then in Rust:
+///       a. drops chunks where `valid_from < as_of` (when `as_of` is
+///          set; rfc3339 sorts lexicographically so a string compare
+///          is correct);
+///       b. groups by `user_id`, sorts each group by `version` desc,
+///          keeps the top `max_versions_per_doc`;
+///       c. re-sorts the union by similarity score and truncates to
+///          `top_k`.
+///    Over-fetch factor is `max(max_versions_per_doc, 3)`, capped
+///    at 20× to keep wall-time bounded for absurd N. Legacy points
+///    without `user_id` / `version` / `valid_from` are passed
+///    through unchanged so old data still participates.
+#[cfg(feature = "qdrant")]
+async fn version_aware_search(
+    qdrant: &QdrantStore,
+    query_embedding: Vec<f32>,
+    top_k: usize,
+    filter: &VersionFilter,
+) -> Result<Vec<QdrantSearchResult>, qdrant_store::QdrantError> {
+    use qdrant_client::qdrant::{Condition, Filter as QFilter};
+
+    if filter.is_default() {
+        let f = QFilter::must([Condition::matches("is_current", true)]);
+        return qdrant.search(query_embedding, top_k, Some(f)).await;
+    }
+
+    let over = filter.max_versions_per_doc.max(3) as usize;
+    let fetch_k = top_k
+        .saturating_mul(over)
+        .min(top_k.saturating_mul(20))
+        .max(top_k);
+
+    let raw = qdrant.search(query_embedding, fetch_k, None).await?;
+
+    // Stage 1: as_of (string compare on rfc3339).
+    let staged: Vec<QdrantSearchResult> = if let Some(threshold) = filter.as_of.as_deref() {
+        raw.into_iter()
+            .filter(|r| {
+                r.metadata
+                    .valid_from
+                    .as_deref()
+                    .map(|vf| vf >= threshold)
+                    .unwrap_or(true) // legacy point: keep
+            })
+            .collect()
+    } else {
+        raw
+    };
+
+    // Stage 2: per-user_id top-N by version desc.
+    use std::collections::HashMap;
+    let n = filter.max_versions_per_doc as usize;
+    let mut grouped: HashMap<String, Vec<QdrantSearchResult>> = HashMap::new();
+    let mut keyless: Vec<QdrantSearchResult> = Vec::new();
+    for r in staged {
+        match r.metadata.user_id.clone() {
+            Some(uid) => grouped.entry(uid).or_default().push(r),
+            None => keyless.push(r),
+        }
+    }
+    let mut out: Vec<QdrantSearchResult> = keyless;
+    for (_, mut group) in grouped {
+        group.sort_by(|a, b| {
+            b.metadata
+                .version
+                .unwrap_or(1)
+                .cmp(&a.metadata.version.unwrap_or(1))
+        });
+        group.truncate(n);
+        out.extend(group);
+    }
+
+    // Stage 3: best similarity first, truncate to top_k.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(top_k);
+    Ok(out)
+}
+
+// ============================================================================
 // API Handlers
 // ============================================================================
 
@@ -537,7 +659,8 @@ async fn query(
             },
         };
 
-        match qdrant.search(query_embedding, body.top_k, None).await {
+        let vfilter = VersionFilter::from_request(&body);
+        match version_aware_search(qdrant.as_ref(), query_embedding, body.top_k, &vfilter).await {
             Ok(search_results) => {
                 let results: Vec<QueryResult> = search_results
                     .into_iter()
@@ -648,11 +771,19 @@ async fn graph_aware_query(
 ) -> Result<Json<QueryResponse>, ApiError> {
     // Pre-compute vector hits (best-effort; failures don't block the
     // graph path because `answer` is the primary signal here).
+    let vfilter = VersionFilter::from_request(body);
     let vector_results: Vec<QueryResult> = {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &state.qdrant {
             match state.embeddings.load_full().generate_single(&body.query).await {
-                Ok(embedding) => match qdrant.search(embedding, body.top_k, None).await {
+                Ok(embedding) => match version_aware_search(
+                    qdrant.as_ref(),
+                    embedding,
+                    body.top_k,
+                    &vfilter,
+                )
+                .await
+                {
                     Ok(results) => results
                         .into_iter()
                         .map(|r| QueryResult {
@@ -944,7 +1075,14 @@ async fn graph_aware_query(
                 // Mix mode also pulls a fresh chunk-vector pass.
                 if matches!(mode, QueryMode::Mix) {
                     if let Ok(emb) = state.embeddings.load_full().generate_single(&body.query).await {
-                        if let Ok(hits) = qdrant.search(emb, body.top_k.max(5), None).await {
+                        if let Ok(hits) = version_aware_search(
+                            qdrant.as_ref(),
+                            emb,
+                            body.top_k.max(5),
+                            &vfilter,
+                        )
+                        .await
+                        {
                             // Caller-side chunk ids — Qdrant point ids
                             // for chunks ARE the document ids (one
                             // chunk per doc today; the mapping holds
@@ -1036,13 +1174,21 @@ async fn graph_aware_query(
     }
 }
 
-/// Outcome of a single text-body ingest. Distinguishes a true add
-/// from a content-hash dedup hit so the per-path response can label
-/// `ingested` vs `duplicate` without parsing message strings.
+/// Outcome of a single text-body ingest. Distinguishes a fresh add,
+/// a re-ingest that bumped the version, and a no-op dedup so the
+/// per-path response can label its `status` without parsing message
+/// strings.
 enum IngestOutcome {
-    /// New point written; carries the assigned UUID.
+    /// First-ever write for this `user_id` (or no `user_id` given,
+    /// content not seen before). Carries the assigned UUID.
     Ingested(String),
-    /// content_hash already present; carries the pre-existing UUID.
+    /// Re-ingest of an existing `user_id` whose content_hash changed.
+    /// Old chunks were marked `is_current = false`; new chunks
+    /// written at `version + 1`. Carries the new UUID.
+    Updated { id: String, version: u32 },
+    /// content_hash already present (either same `user_id` + same
+    /// content, or no `user_id` and a global hash collision). No
+    /// new write. Carries the pre-existing UUID.
     Duplicate(String),
 }
 
@@ -1068,15 +1214,67 @@ async fn ingest_one_text(
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        if let Ok(Some((existing_id, existing_md))) =
-            qdrant.find_by_content_hash(&content_hash).await
-        {
-            tracing::info!(
-                "Skipping ingest: content_hash matches existing doc '{}' ({})",
-                existing_md.title,
-                existing_id
-            );
-            return Ok(IngestOutcome::Duplicate(existing_id));
+        // Upsert-by-user_id: when the caller supplies a stable id
+        // (path-form ingest defaults this to the absolute path), we
+        // scope the dedup/upsert decision to that user_id. Without a
+        // user_id we fall back to the legacy global content_hash
+        // dedup so legacy `{title, content}` callers behave exactly
+        // as before.
+        let prior = if let Some(uid) = user_id.as_deref() {
+            qdrant
+                .find_current_by_user_id(uid)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("user_id lookup failed: {e}")))?
+        } else {
+            None
+        };
+
+        // Determine version for the new write.
+        let new_version: u32 = match &prior {
+            Some((_, md)) => match md.content_hash.as_deref() {
+                Some(h) if h == content_hash => {
+                    // Same user_id, same content — true no-op dedup.
+                    let existing_id = prior.as_ref().unwrap().0.clone();
+                    tracing::info!(
+                        user_id = %user_id.as_deref().unwrap_or(""),
+                        existing = %existing_id,
+                        "ingest: content_hash matches current version; no-op"
+                    );
+                    return Ok(IngestOutcome::Duplicate(existing_id));
+                },
+                _ => md.version.unwrap_or(1).saturating_add(1),
+            },
+            None => {
+                // No user_id-keyed prior. Fall back to the legacy
+                // global content_hash check so re-ingest of the same
+                // content via `add_document {content}` (no id) still
+                // dedupes globally.
+                if user_id.is_none() {
+                    if let Ok(Some((existing_id, _))) =
+                        qdrant.find_by_content_hash(&content_hash).await
+                    {
+                        tracing::info!(
+                            existing = %existing_id,
+                            "ingest: content_hash global match (legacy no-user_id path)"
+                        );
+                        return Ok(IngestOutcome::Duplicate(existing_id));
+                    }
+                }
+                1
+            },
+        };
+
+        // If this is a real upsert (prior with different content),
+        // mark the old chunks superseded BEFORE we write the new
+        // ones. set_payload is filter-targeted so it touches only
+        // chunks tagged with this user_id + is_current=true.
+        let is_upsert = prior.is_some();
+        if is_upsert {
+            if let Some(uid) = user_id.as_deref() {
+                qdrant.mark_user_id_superseded(uid).await.map_err(|e| {
+                    ApiError::InternalError(format!("supersede prior version failed: {e}"))
+                })?;
+            }
         }
 
         let embedding = state
@@ -1099,6 +1297,9 @@ async fn ingest_one_text(
             timestamp: timestamp.clone(),
             content_hash: Some(content_hash.clone()),
             user_id: user_id.clone(),
+            version: Some(new_version),
+            valid_from: Some(timestamp.clone()),
+            is_current: Some(true),
             custom: HashMap::new(),
         };
 
@@ -1107,7 +1308,17 @@ async fn ingest_one_text(
             .await
             .map_err(|e| ApiError::InternalError(format!("Failed to add document to Qdrant: {}", e)))?;
 
-        tracing::info!("Added document to Qdrant: {} ({})", title, id);
+        if is_upsert {
+            tracing::info!(
+                user_id = %user_id.as_deref().unwrap_or(""),
+                version = new_version,
+                id = %id,
+                "Updated document in Qdrant: {}",
+                title
+            );
+        } else {
+            tracing::info!("Added document to Qdrant: {} ({})", title, id);
+        }
 
         {
             let mut g = state.graphrag.write().await;
@@ -1127,7 +1338,11 @@ async fn ingest_one_text(
         // one permit, so a 200-file burst → many wakes → still one
         // append after the debounce window of silence.
         state.auto_append_notify.notify_one();
-        return Ok(IngestOutcome::Ingested(id));
+        if is_upsert {
+            return Ok(IngestOutcome::Updated { id, version: new_version });
+        } else {
+            return Ok(IngestOutcome::Ingested(id));
+        }
     }
 
     // Fallback: in-memory storage
@@ -1264,6 +1479,18 @@ async fn add_document(
                 success: true,
                 document_id: Some(id),
                 message: Some(format!("Document added to {} successfully", backend)),
+                backend: backend.into(),
+                results: None,
+                ingested_count: None,
+                skipped_count: None,
+            },
+            IngestOutcome::Updated { id, version } => DocumentOperationResponse {
+                success: true,
+                document_id: Some(id),
+                message: Some(format!(
+                    "Document updated (now version {}); prior version chunks marked superseded",
+                    version
+                )),
                 backend: backend.into(),
                 results: None,
                 ingested_count: None,
@@ -1425,6 +1652,16 @@ async fn add_document(
                     error: None,
                 });
             },
+            Ok(IngestOutcome::Updated { id: doc_id, version: _ }) => {
+                ingested_count += 1;
+                results.push(AddDocumentItemResult {
+                    path: abs_str,
+                    status: "updated".into(),
+                    document_id: Some(doc_id),
+                    title: Some(title_s),
+                    error: None,
+                });
+            },
             Ok(IngestOutcome::Duplicate(doc_id)) => {
                 skipped_count += 1;
                 results.push(AddDocumentItemResult {
@@ -1455,10 +1692,11 @@ async fn add_document(
     if body.path.is_some() && results.len() == 1 {
         let r = &results[0];
         let resp = DocumentOperationResponse {
-            success: matches!(r.status.as_str(), "ingested" | "duplicate"),
+            success: matches!(r.status.as_str(), "ingested" | "updated" | "duplicate"),
             document_id: r.document_id.clone(),
             message: Some(match r.status.as_str() {
                 "ingested" => format!("Document added to {} successfully", backend_label),
+                "updated" => "Document updated; prior version chunks marked superseded".into(),
                 "duplicate" => "Document already indexed (content_hash match)".into(),
                 other => r
                     .error

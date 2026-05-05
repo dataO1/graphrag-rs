@@ -21,9 +21,10 @@
 
 use qdrant_client::{
     qdrant::{
-        Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, PointStruct,
-        PointsIdsList, ScrollPointsBuilder, SearchPointsBuilder, UpsertPointsBuilder,
-        Value as QdrantValue, VectorParamsBuilder,
+        points_selector::PointsSelectorOneOf, Condition, CreateCollectionBuilder,
+        DeletePointsBuilder, Distance, Filter, PointStruct, PointsIdsList, ScrollPointsBuilder,
+        SearchPointsBuilder, SetPayloadPointsBuilder, UpsertPointsBuilder, Value as QdrantValue,
+        VectorParamsBuilder,
     },
     Qdrant,
 };
@@ -116,6 +117,27 @@ pub struct DocumentMetadata {
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Monotonic version counter per `user_id`. Bumped on every
+    /// upsert; first ingest of a given user_id gets `version = 1`.
+    /// Old payloads without this field load as `None` and the
+    /// retrieval/upsert paths treat them as the implicit current
+    /// version (== 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// RFC 3339 timestamp of when this version landed. Distinct from
+    /// `timestamp` (which is set on the original ingest and
+    /// preserved across upserts of the same user_id). Used by
+    /// `as_of` retrieval filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// True iff this is the most recent version for its `user_id`.
+    /// Default qdrant payload filter is `is_current = true`, which
+    /// keeps top-K clean of superseded versions. On upsert, the
+    /// previous current point's `is_current` flips to `false`. Old
+    /// payloads without this field load as `None`; treat as
+    /// implicitly current (so legacy ingests keep showing up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_current: Option<bool>,
     #[serde(flatten)]
     pub custom: HashMap<String, serde_json::Value>,
 }
@@ -372,6 +394,108 @@ impl QdrantStore {
             .await
             .map_err(|e| QdrantError::OperationError(e.to_string()))?;
         Ok(resp.result.into_iter().next().and_then(point_id_to_string))
+    }
+
+    /// Look up the *current* version of a doc by its caller-supplied
+    /// `user_id`. Returns the Qdrant point id and its stored
+    /// metadata. Used by the upsert path to decide whether to
+    /// supersede an existing version or write fresh.
+    ///
+    /// "Current" = `is_current = true`. Payloads written before this
+    /// field existed have `is_current = None`; we MATCH those too
+    /// (treat as implicitly current) so legacy points still
+    /// participate in upsert correctly.
+    pub async fn find_current_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, DocumentMetadata)>, QdrantError> {
+        // Two-step: first try `is_current = true`. Only if that
+        // misses do we fall back to the legacy match (no
+        // is_current field). Avoids a heavier query in the hot
+        // path while still upgrading old data lazily.
+        let primary = Filter::must([
+            Condition::matches("user_id", user_id.to_string()),
+            Condition::matches("is_current", true),
+        ]);
+        let resp = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.collection_name)
+                    .filter(primary)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .limit(1u32),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+
+        if let Some(point) = resp.result.into_iter().next() {
+            let id = match point_id_to_string(point.clone()) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let payload_value = serde_json::to_value(&point.payload)
+                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+            let metadata: DocumentMetadata = serde_json::from_value(payload_value)
+                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+            return Ok(Some((id, metadata)));
+        }
+
+        // Legacy fallback: any payload with this user_id and no
+        // `is_current` field. Treats unversioned legacy points as
+        // implicitly current. Returns the first match (legacy
+        // points were 1:1 user_id-to-point).
+        let legacy_filter = Filter::must([Condition::matches("user_id", user_id.to_string())]);
+        let resp = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.collection_name)
+                    .filter(legacy_filter)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .limit(1u32),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let Some(point) = resp.result.into_iter().next() else {
+            return Ok(None);
+        };
+        let id = match point_id_to_string(point.clone()) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let payload_value = serde_json::to_value(&point.payload)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let metadata: DocumentMetadata = serde_json::from_value(payload_value)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(Some((id, metadata)))
+    }
+
+    /// Mark every chunk under `user_id` as superseded — sets
+    /// `is_current = false` via Qdrant's filter-targeted set_payload.
+    /// Used by the upsert path: just before writing the new version,
+    /// we flip the flag on the previous current chunks so retrieval's
+    /// default `is_current = true` filter starts skipping them.
+    ///
+    /// Idempotent: calling on a user_id with no current chunks is a
+    /// no-op (Qdrant set_payload with an empty match-set returns
+    /// success without writing).
+    pub async fn mark_user_id_superseded(&self, user_id: &str) -> Result<(), QdrantError> {
+        let filter = Filter::must([
+            Condition::matches("user_id", user_id.to_string()),
+            Condition::matches("is_current", true),
+        ]);
+        let mut payload: HashMap<String, QdrantValue> = HashMap::new();
+        payload.insert("is_current".to_string(), QdrantValue::from(false));
+
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(&self.collection_name, payload)
+                    .points_selector(PointsSelectorOneOf::Filter(filter)),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(())
     }
 
     /// Look up an existing point by content hash. Returns the Qdrant

@@ -97,6 +97,23 @@ pub struct QueryRequest {
     /// See [QueryMode] for the full menu and their tradeoffs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<QueryMode>,
+
+    /// Optional history-aware filter. RFC 3339 timestamp. When set,
+    /// retrieval considers only chunks whose `valid_from >= as_of`.
+    /// Use to ask "what changed since X" — combine with
+    /// `max_versions_per_doc > 1` to compare versions across the
+    /// window. Default unset → use the per-doc current-version
+    /// filter only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+
+    /// Per source document, how many of the most recent versions to
+    /// consider during retrieval. Defaults to 1 (current version
+    /// only — top-K stays uncontaminated by superseded chunks).
+    /// Raise to 3-10 to compare recent versions of the same doc.
+    /// 0 is treated as 1 to keep the default useful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_versions_per_doc: Option<u32>,
 }
 
 fn default_top_k() -> usize {
@@ -499,9 +516,13 @@ pub struct DocumentOperationResponse {
 /// Per-path outcome for a multi-path `POST /api/documents` request
 /// (`paths` / `pathsGlob`). One entry per resolved path. Status values:
 ///
-/// * `ingested`    — embedded + stored; new document_id returned.
-/// * `duplicate`   — content_hash matched an existing point; no
-///                   re-embed; document_id is the existing one.
+/// * `ingested`    — first-ever write under this `user_id` (or a
+///                   no-`user_id` legacy ingest with new content).
+/// * `updated`     — re-ingest of a known `user_id` whose content
+///                   changed; old chunks marked superseded, new
+///                   chunks written at version+1.
+/// * `duplicate`   — content_hash matched an existing point under
+///                   the same `user_id`; no re-embed.
 /// * `unsupported` — extension not allow-listed and no preprocessor
 ///                   configured; skipped.
 /// * `rejected`    — sandbox check, size cap, or other policy denial.
