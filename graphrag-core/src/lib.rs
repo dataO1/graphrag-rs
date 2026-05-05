@@ -1522,10 +1522,12 @@ impl GraphRAG {
             self.config.ollama.temperature.unwrap_or(0.1)
         };
 
-        let extractor = LLMEntityExtractor::new(client, entity_types)
-            .with_temperature(extraction_temperature)
-            .with_max_tokens_opt(extraction_max_tokens)
-            .with_keep_alive(self.config.ollama.keep_alive.clone());
+        let extractor = std::sync::Arc::new(
+            LLMEntityExtractor::new(client, entity_types)
+                .with_temperature(extraction_temperature)
+                .with_max_tokens_opt(extraction_max_tokens)
+                .with_keep_alive(self.config.ollama.keep_alive.clone()),
+        );
 
         let pb = make_pb(
             delta_chunks.len() as u64,
@@ -1536,21 +1538,61 @@ impl GraphRAG {
         );
         pb.set_message("Extending graph (LLM single-pass)");
 
-        for (idx, chunk) in delta_chunks.iter().enumerate() {
-            pb.set_message(format!(
-                "Delta chunk {}/{} (LLM single-pass)",
-                idx + 1,
-                delta_chunks.len()
-            ));
+        // Concurrency knob. EXTRACTION_CONCURRENCY caps how many
+        // chunk extractions can be in flight against the chat backend
+        // simultaneously. Match it to llama-server's `--parallel`
+        // (or vLLM's `--max-num-seqs`); going higher than the
+        // backend's slot count just queues requests and adds latency
+        // without throughput. Default 4 — comfortable for a
+        // ctx=92K/parallel=4 llama-server slot layout (23K per slot,
+        // ample for the ~4K an extraction call needs).
+        let concurrency: usize = std::env::var("EXTRACTION_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or(4);
 
+        let total = delta_chunks.len();
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            total = total,
+            concurrency = concurrency,
+            "extend_graph: starting LLM single-pass with bounded concurrency"
+        );
+
+        // Build a stream of (idx, future-of-result) and let
+        // `buffer_unordered` keep `concurrency` futures in flight.
+        // Each future is pure read-only (extractor + chunk → result);
+        // graph mutation happens in the serial consumer below where
+        // we hold &mut self.knowledge_graph exclusively.
+        use futures::stream::{self, StreamExt};
+        let mut stream = stream::iter(delta_chunks.iter().cloned().enumerate())
+            .map(|(idx, chunk)| {
+                let extractor = extractor.clone();
+                async move {
+                    let res = extractor.extract_from_chunk(&chunk).await;
+                    (idx, chunk, res)
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        let mut completed = 0usize;
+        while let Some((idx, chunk, result)) = stream.next().await {
+            completed += 1;
             #[cfg(feature = "tracing")]
             tracing::info!(
-                "extend_graph: processing delta chunk {}/{} (LLM single-pass)",
-                idx + 1,
-                delta_chunks.len()
+                "extend_graph: completed delta chunk {}/{} (idx={}, concurrency={}, LLM single-pass)",
+                completed,
+                total,
+                idx,
+                concurrency
             );
+            pb.set_message(format!(
+                "Delta chunk {}/{} (LLM single-pass, c={})",
+                completed, total, concurrency
+            ));
 
-            match extractor.extract_from_chunk(chunk).await {
+            match result {
                 Ok((entities, relationships)) => {
                     let graph = self.knowledge_graph.as_mut().ok_or_else(|| {
                         GraphRAGError::Config {
@@ -1574,7 +1616,6 @@ impl GraphRAG {
                     let _ = e;
                 },
             }
-
             pb.inc(1);
         }
 
