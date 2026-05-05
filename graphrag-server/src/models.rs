@@ -229,32 +229,69 @@ pub struct QueryResponse {
 // Document Models
 // ============================================================================
 
-/// Add document request
+/// Add document request.
+///
+/// **Exactly one** of `content`, `path`, `paths`, or `pathsGlob` must be
+/// supplied. The shapes are exclusive — agents that pick more than one
+/// get a 400.
+///
+/// * `content` — legacy single-document body. Title is required.
+/// * `path` — server reads the file off disk under the configured
+///   `INGEST_ALLOWED_ROOTS`. Title and id default to filename / abs
+///   path respectively.
+/// * `paths` — explicit list of paths; same rules as `path`, ingested
+///   in order. Response shape is `AddDocumentsResponse` instead of
+///   `DocumentOperationResponse`.
+/// * `pathsGlob` — glob pattern (e.g. `notes/**/*.md`); expanded
+///   server-side relative to `globRoot` (or the first allowed root).
+///
+/// Non-text extensions (pdf, docx, png, mp3, …) are routed through
+/// `INGEST_PREPROCESSOR_URL` when configured, otherwise skipped with
+/// a per-item `unsupported` status. See `ingest_policy.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiComponent)]
 #[serde(rename_all = "camelCase")]
 pub struct AddDocumentRequest {
     /// Optional caller-supplied id. Stored alongside the Qdrant point
     /// so callers can later delete by this same id (instead of having
     /// to remember the UUID the server assigned). When omitted, the
-    /// server still returns a UUID.
+    /// server still returns a UUID. For path-form requests, defaults
+    /// to the canonical absolute path string.
     #[serde(default)]
     pub id: Option<String>,
 
-    /// Document title
-    #[schemars(example = "example_title")]
-    pub title: String,
+    /// Document title. Required for `content`-form requests; for
+    /// path-form requests, defaults to the file basename without
+    /// extension.
+    #[serde(default)]
+    pub title: Option<String>,
 
-    /// Document content/text
-    #[schemars(example = "example_content")]
-    pub content: String,
-}
+    /// Document content/text — legacy form. Mutually exclusive with
+    /// `path` / `paths` / `pathsGlob`.
+    #[serde(default)]
+    pub content: Option<String>,
 
-fn example_title() -> &'static str {
-    "Introduction to GraphRAG"
-}
+    /// Single absolute path to a file on the server's filesystem.
+    /// Resolved through canonicalize + sandbox check; non-text
+    /// extensions go through the preprocessor when configured.
+    #[serde(default)]
+    pub path: Option<String>,
 
-fn example_content() -> &'static str {
-    "GraphRAG is a retrieval-augmented generation system that combines knowledge graphs with large language models..."
+    /// Explicit list of absolute paths. Each entry is resolved
+    /// independently; per-entry errors land in the response without
+    /// failing siblings.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+
+    /// Glob pattern (e.g. `**/*.md`). Expanded server-side under
+    /// `globRoot` if relative, otherwise used as-is. Each expansion
+    /// goes through the same sandbox check as `path`.
+    #[serde(default)]
+    pub paths_glob: Option<String>,
+
+    /// Optional anchor for relative `pathsGlob`. When omitted, the
+    /// server uses the first entry of `INGEST_ALLOWED_ROOTS`.
+    #[serde(default)]
+    pub glob_root: Option<String>,
 }
 
 /// Document metadata (for listing)
@@ -414,23 +451,85 @@ pub struct HealthEmbeddings {
 // Note: Using specific response types (DocumentOperationResponse, BuildGraphResponse, etc.)
 // instead of generic success responses for better type safety and clearer API contracts
 
-/// Document operation success
+/// Document operation success.
+///
+/// Single-document responses (legacy `content` form, single `path`)
+/// populate `success` / `documentId` / `message` / `backend` and
+/// leave the `results` / `ingestedCount` / `skippedCount` fields
+/// unset.
+///
+/// Multi-document responses (`paths` / `pathsGlob`) populate
+/// `results` (per-path entries) plus `ingestedCount` / `skippedCount`
+/// counters and leave `documentId` / `message` unset.
+///
+/// Clients can branch on whichever set is present; both shapes
+/// always carry `success` and `backend`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiComponent)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentOperationResponse {
-    /// Operation success flag
+    /// Operation success flag. For multi-doc responses, true iff at
+    /// least one entry succeeded; check per-entry `status` fields
+    /// for the full picture.
     pub success: bool,
 
-    /// Document identifier
+    /// Document identifier (single-doc responses only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_id: Option<String>,
 
-    /// Success/info message
-    pub message: String,
+    /// Success/info message (single-doc responses only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 
-    /// Backend used
+    /// Backend used.
     pub backend: String,
+
+    /// Per-path results (multi-doc responses only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<AddDocumentItemResult>>,
+
+    /// How many entries reached `status = "ingested"` (multi-doc only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingested_count: Option<usize>,
+
+    /// How many entries were skipped/duplicate/error (multi-doc only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_count: Option<usize>,
 }
+
+/// Per-path outcome for a multi-path `POST /api/documents` request
+/// (`paths` / `pathsGlob`). One entry per resolved path. Status values:
+///
+/// * `ingested`    — embedded + stored; new document_id returned.
+/// * `duplicate`   — content_hash matched an existing point; no
+///                   re-embed; document_id is the existing one.
+/// * `unsupported` — extension not allow-listed and no preprocessor
+///                   configured; skipped.
+/// * `rejected`    — sandbox check, size cap, or other policy denial.
+/// * `error`       — read / embed / store failure; see `error` field.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiComponent)]
+#[serde(rename_all = "camelCase")]
+pub struct AddDocumentItemResult {
+    /// Caller-supplied path string (or glob match) that produced
+    /// this entry. Useful when the input was a glob.
+    pub path: String,
+
+    /// Status enum (see struct docs).
+    pub status: String,
+
+    /// Document UUID assigned by the server (or pre-existing on
+    /// `duplicate`). `None` for skipped/rejected/error entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
+
+    /// Resolved title (defaults to file basename without extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    /// Free-form reason. Populated for unsupported/rejected/error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 
 /// Graph build response
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiComponent)]

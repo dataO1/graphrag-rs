@@ -4052,6 +4052,7 @@ dependencies = [
  "bincode",
  "chrono",
  "futures",
+ "glob",
  "graphrag-core",
  "jsonwebtoken",
  "lancedb",

@@ -83,3 +83,9 @@ arc-swap = "1.7"
 # Other
 uuid = { workspace = true }
 chrono = { workspace = true }
+
+# Path-based ingestion (POST /api/documents with `path`/`paths`/`paths_glob`).
+# `glob` expands user-supplied patterns server-side; the result is always
+# re-canonicalized and re-checked against `INGEST_ALLOWED_ROOTS` before
+# any byte is read, so glob expansion can never cross the sandbox.
+glob = "0.3"

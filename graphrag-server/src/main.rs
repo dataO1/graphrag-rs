@@ -69,6 +69,9 @@ use config_handler::ConfigManager;
 
 mod config_endpoints;
 
+mod ingest_policy;
+use ingest_policy::{IngestPolicy, ResolvedPath};
+
 #[cfg(feature = "qdrant")]
 mod graph_persistence;
 
@@ -98,6 +101,13 @@ struct AppState {
 
     // Configuration manager for JSON config
     config_manager: Arc<ConfigManager>,
+
+    /// Path-based ingestion policy (sandbox roots, size caps, ext
+    /// allow-list, optional preprocessor URL). Read once at boot from
+    /// env vars; see `ingest_policy::IngestPolicy::from_env`. Cheap
+    /// to clone (Arc'd). Empty `allowed_roots` ⇒ path-form `POST
+    /// /api/documents` is rejected with 403.
+    ingest_policy: Arc<IngestPolicy>,
 
     // Authentication state (optional)
     #[cfg(feature = "auth")]
@@ -222,6 +232,7 @@ impl AppState {
 
         let config = Arc::new(RwLock::new(config));
         let embedding_dim = embeddings.load().dimension();
+        let ingest_policy = IngestPolicy::from_env();
 
         #[cfg(feature = "qdrant")]
         {
@@ -258,6 +269,7 @@ impl AppState {
                         config,
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
+                        ingest_policy: ingest_policy.clone(),
                         #[cfg(feature = "auth")]
                         auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                             |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -280,6 +292,7 @@ impl AppState {
                         config,
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
+                        ingest_policy: ingest_policy.clone(),
                         #[cfg(feature = "auth")]
                         auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                             |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -302,6 +315,7 @@ impl AppState {
                 config,
                 graphrag: Arc::new(RwLock::new(None)),
                 config_manager: Arc::new(ConfigManager::new()),
+                ingest_policy: ingest_policy.clone(),
                 #[cfg(feature = "auth")]
                 auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                     |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -1009,39 +1023,29 @@ async fn graph_aware_query(
     }
 }
 
-/// Add a document to the knowledge graph
-#[api_operation(
-    tag = "documents",
-    summary = "Add a new document",
-    description = "Add a new document to the knowledge graph. The document will be embedded and indexed for search.",
-    error_code = 400,
-    error_code = 500
-)]
-async fn add_document(
-    state: Data<AppState>,
-    body: Json<AddDocumentRequest>,
-) -> Result<Json<DocumentOperationResponse>, ApiError> {
-    // Validate input
-    if let Err(e) = validate_title(&body.title) {
-        tracing::warn!(title = %body.title, error = %e.error, "Invalid title");
-        return Err(ApiError::BadRequest(e.error));
-    }
+/// Outcome of a single text-body ingest. Distinguishes a true add
+/// from a content-hash dedup hit so the per-path response can label
+/// `ingested` vs `duplicate` without parsing message strings.
+enum IngestOutcome {
+    /// New point written; carries the assigned UUID.
+    Ingested(String),
+    /// content_hash already present; carries the pre-existing UUID.
+    Duplicate(String),
+}
 
-    if let Err(e) = validate_content(&body.content) {
-        tracing::warn!(content_len = body.content.len(), error = %e.error, "Invalid content");
-        return Err(ApiError::BadRequest(e.error));
-    }
-
-    // Sanitize inputs
-    let title = sanitize_string(&body.title);
-    let content = sanitize_string(&body.content);
-    let user_id = body.id.clone();
-
+/// Ingest one fully-prepared text body. Centralizes the embed →
+/// dedup-check → qdrant-write → graphrag-feed pipeline that used to
+/// live inline in `add_document`. Both legacy `content` requests and
+/// path-form requests funnel through here so dedup, embedding, and
+/// graphrag mirroring stay identical.
+async fn ingest_one_text(
+    state: &AppState,
+    title: String,
+    content: String,
+    user_id: Option<String>,
+) -> Result<IngestOutcome, ApiError> {
     let id = uuid::Uuid::new_v4().to_string();
     let timestamp = chrono::Utc::now().to_rfc3339();
-    // SHA-256 of the sanitized content; drives ingest-time dedup so the
-    // same source ingested twice doesn't end up as two Qdrant points
-    // (which is what was producing the duplicate query results).
     let content_hash = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -1051,9 +1055,6 @@ async fn add_document(
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        // Dedup check first — if a point with the same content_hash
-        // already exists, return its id without re-embedding. Save NPU
-        // time and avoid duplicate vectors in the index.
         if let Ok(Some((existing_id, existing_md))) =
             qdrant.find_by_content_hash(&content_hash).await
         {
@@ -1062,25 +1063,18 @@ async fn add_document(
                 existing_md.title,
                 existing_id
             );
-            return Ok(Json(DocumentOperationResponse {
-                success: true,
-                document_id: Some(existing_id),
-                message: "Document already indexed (content_hash match)".to_string(),
-                backend: "qdrant".to_string(),
-            }));
+            return Ok(IngestOutcome::Duplicate(existing_id));
         }
 
-        // Generate real embeddings
-        let embedding = match state.embeddings.load_full().generate_single(&content).await {
-            Ok(emb) => emb,
-            Err(e) => {
+        let embedding = state
+            .embeddings
+            .load_full()
+            .generate_single(&content)
+            .await
+            .map_err(|e| {
                 tracing::error!("Failed to generate document embedding: {}", e);
-                return Err(ApiError::InternalError(format!(
-                    "Failed to generate embedding: {}",
-                    e
-                )));
-            },
-        };
+                ApiError::InternalError(format!("Failed to generate embedding: {}", e))
+            })?;
 
         let metadata = DocumentMetadata {
             id: id.clone(),
@@ -1095,65 +1089,383 @@ async fn add_document(
             custom: HashMap::new(),
         };
 
-        match qdrant.add_document(&id, embedding, metadata).await {
-            Ok(_) => {
-                tracing::info!("Added document to Qdrant: {} ({})", title, id);
+        qdrant
+            .add_document(&id, embedding, metadata)
+            .await
+            .map_err(|e| ApiError::InternalError(format!("Failed to add document to Qdrant: {}", e)))?;
 
-                // Also feed the doc into the live GraphRAG instance so its
-                // chunker/graph see the content. Without this, /api/graph/build
-                // runs over zero chunks (qdrant stores docs for vector search;
-                // GraphRAG keeps its own knowledge_graph/chunks for LLM-based
-                // entity extraction). Failure is logged but does not poison
-                // the qdrant write — qdrant is the source of truth.
-                {
-                    let mut g = state.graphrag.write().await;
-                    if let Some(ref mut graphrag) = *g {
-                        if let Err(e) = graphrag.add_document_from_text(&content) {
-                            tracing::warn!(
-                                error = %e,
-                                "GraphRAG ingest failed; /api/graph/build will skip this doc"
-                            );
-                        } else {
-                            *state.graph_built.write().await = false;
-                        }
-                    }
+        tracing::info!("Added document to Qdrant: {} ({})", title, id);
+
+        {
+            let mut g = state.graphrag.write().await;
+            if let Some(ref mut graphrag) = *g {
+                if let Err(e) = graphrag.add_document_from_text(&content) {
+                    tracing::warn!(
+                        error = %e,
+                        "GraphRAG ingest failed; /api/graph/build will skip this doc"
+                    );
+                } else {
+                    *state.graph_built.write().await = false;
                 }
-
-                return Ok(Json(DocumentOperationResponse {
-                    success: true,
-                    document_id: Some(id),
-                    message: "Document added to Qdrant successfully".to_string(),
-                    backend: "qdrant".to_string(),
-                }));
-            },
-            Err(e) => {
-                return Err(ApiError::InternalError(format!(
-                    "Failed to add document to Qdrant: {}",
-                    e
-                )));
-            },
+            }
         }
+
+        return Ok(IngestOutcome::Ingested(id));
     }
 
     // Fallback: in-memory storage
     let document = Document {
         id: id.clone(),
-        title,
-        content,
+        title: title.clone(),
+        content: content.clone(),
         added_at: timestamp,
     };
 
-    state.documents.write().await.push(document.clone());
+    state.documents.write().await.push(document);
     *state.graph_built.write().await = false;
 
-    tracing::info!("Added document to memory: {} ({})", document.title, id);
+    tracing::info!("Added document to memory: {} ({})", title, id);
+    Ok(IngestOutcome::Ingested(id))
+}
 
-    Ok(Json(DocumentOperationResponse {
-        success: true,
-        document_id: Some(id),
-        message: "Document added to memory successfully".to_string(),
-        backend: "memory".to_string(),
-    }))
+/// POST a non-text file path to the configured preprocessor service
+/// and parse `{ "markdown": "...", "title"?: "..." }` from the
+/// response. Used only when the file extension is not in the
+/// allow-list AND `INGEST_PREPROCESSOR_URL` is set.
+///
+/// The preprocessor is expected to read the file itself (it sits on
+/// the same machine) and return clean markdown — see
+/// `graphrag-rs-nix/TODO.md` § "Multimodal preprocessor" for the full
+/// contract and the planned Nemotron-Omni implementation.
+async fn call_preprocessor(
+    url: &str,
+    absolute: &std::path::Path,
+) -> Result<(Option<String>, String), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("preprocessor client build failed: {e}"))?;
+
+    let req_body = serde_json::json!({
+        "path": absolute.to_string_lossy(),
+    });
+
+    let resp = client
+        .post(url)
+        .json(&req_body)
+        .send()
+        .await
+        .map_err(|e| format!("preprocessor request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("preprocessor returned {status}: {body}"));
+    }
+
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("preprocessor returned non-JSON: {e}"))?;
+
+    let markdown = parsed
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "preprocessor response missing `markdown` field".to_string())?
+        .to_string();
+    let title = parsed
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok((title, markdown))
+}
+
+/// Add document(s) to the knowledge graph.
+///
+/// Body is polymorphic — exactly one of `content`, `path`, `paths`,
+/// or `pathsGlob` must be set:
+///
+/// * `content` (legacy) — inline body; requires `title`. Returns
+///   `DocumentOperationResponse`.
+/// * `path` — server reads one file off disk under
+///   `INGEST_ALLOWED_ROOTS`. Returns `DocumentOperationResponse`.
+/// * `paths` / `pathsGlob` — multi-file ingest; non-text files route
+///   through `INGEST_PREPROCESSOR_URL` when set, otherwise skipped.
+///   Returns `AddDocumentsResponse` (per-path results array).
+#[api_operation(
+    tag = "documents",
+    summary = "Add a new document or batch of documents",
+    description = "Ingest one document (legacy `content`/`title`), one file off disk (`path`), an explicit list of files (`paths`), or a glob expansion (`pathsGlob`). Path-form requests are sandboxed by INGEST_ALLOWED_ROOTS; non-text files route through INGEST_PREPROCESSOR_URL when set.",
+    error_code = 400,
+    error_code = 500
+)]
+async fn add_document(
+    state: Data<AppState>,
+    body: Json<AddDocumentRequest>,
+) -> Result<Json<DocumentOperationResponse>, ApiError> {
+    // Variant arbitration. Exactly one body flavor must be set; both
+    // zero and >1 are user errors.
+    let n_set = (body.content.is_some() as u8)
+        + (body.path.is_some() as u8)
+        + (body.paths.is_some() as u8)
+        + (body.paths_glob.is_some() as u8);
+    if n_set == 0 {
+        return Err(ApiError::BadRequest(
+            "POST /api/documents requires one of: content, path, paths, pathsGlob".into(),
+        ));
+    }
+    if n_set > 1 {
+        return Err(ApiError::BadRequest(
+            "POST /api/documents accepts only one of: content, path, paths, pathsGlob".into(),
+        ));
+    }
+
+    // ---- Branch A: legacy content form ----
+    if let Some(content) = body.content.as_ref() {
+        let title = body.title.clone().ok_or_else(|| {
+            ApiError::BadRequest("`title` is required when ingesting via `content`".into())
+        })?;
+        if let Err(e) = validate_title(&title) {
+            tracing::warn!(title = %title, error = %e.error, "Invalid title");
+            return Err(ApiError::BadRequest(e.error));
+        }
+        if let Err(e) = validate_content(content) {
+            tracing::warn!(content_len = content.len(), error = %e.error, "Invalid content");
+            return Err(ApiError::BadRequest(e.error));
+        }
+        let outcome = ingest_one_text(
+            &state,
+            sanitize_string(&title),
+            sanitize_string(content),
+            body.id.clone(),
+        )
+        .await?;
+        let backend = if state.has_qdrant() { "qdrant" } else { "memory" };
+        let resp = match outcome {
+            IngestOutcome::Ingested(id) => DocumentOperationResponse {
+                success: true,
+                document_id: Some(id),
+                message: Some(format!("Document added to {} successfully", backend)),
+                backend: backend.into(),
+                results: None,
+                ingested_count: None,
+                skipped_count: None,
+            },
+            IngestOutcome::Duplicate(id) => DocumentOperationResponse {
+                success: true,
+                document_id: Some(id),
+                message: Some("Document already indexed (content_hash match)".into()),
+                backend: backend.into(),
+                results: None,
+                ingested_count: None,
+                skipped_count: None,
+            },
+        };
+        return Ok(Json(resp));
+    }
+
+    // ---- Path-form requests — require policy enabled ----
+    if !state.ingest_policy.enabled() {
+        return Err(ApiError::BadRequest(
+            "path-based ingestion disabled (no INGEST_ALLOWED_ROOTS configured)".into(),
+        ));
+    }
+
+    // Build the list of caller-input strings to resolve.
+    let inputs: Vec<String> = if let Some(p) = body.path.as_ref() {
+        vec![p.clone()]
+    } else if let Some(ps) = body.paths.as_ref() {
+        ps.clone()
+    } else if let Some(pat) = body.paths_glob.as_ref() {
+        match state
+            .ingest_policy
+            .expand_glob(pat, body.glob_root.as_deref())
+        {
+            Ok(v) => v,
+            Err(e) => return Err(ApiError::BadRequest(e)),
+        }
+    } else {
+        unreachable!("variant arbitration above")
+    };
+
+    let mut results: Vec<AddDocumentItemResult> = Vec::with_capacity(inputs.len());
+    let mut ingested_count: usize = 0;
+    let mut skipped_count: usize = 0;
+    let backend_label = if state.has_qdrant() { "qdrant" } else { "memory" };
+
+    for input in inputs {
+        let resolved = state.ingest_policy.resolve(&input);
+
+        // Fetch text content (either by reading the file, or by
+        // calling the preprocessor). Per-item failures are recorded
+        // and we move on; one bad path doesn't abort the batch.
+        let (absolute, title_default, fetched): (
+            std::path::PathBuf,
+            String,
+            Result<String, String>,
+        ) = match resolved {
+            ResolvedPath::Text { absolute } => {
+                let title_default = absolute
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                let read = tokio::fs::read_to_string(&absolute)
+                    .await
+                    .map_err(|e| format!("read failed: {e}"));
+                (absolute, title_default, read)
+            },
+            ResolvedPath::Preprocess { absolute, preprocessor_url } => {
+                let title_default = absolute
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                let pre = call_preprocessor(&preprocessor_url, &absolute).await;
+                match pre {
+                    Ok((preprocessor_title, markdown)) => {
+                        let td = preprocessor_title.unwrap_or(title_default);
+                        (absolute, td, Ok(markdown))
+                    },
+                    Err(e) => (absolute, title_default, Err(e)),
+                }
+            },
+            ResolvedPath::Unsupported { absolute, extension } => {
+                results.push(AddDocumentItemResult {
+                    path: absolute.to_string_lossy().into_owned(),
+                    status: "unsupported".into(),
+                    document_id: None,
+                    title: None,
+                    error: Some(format!(
+                        ".{extension} is not in INGEST_ALLOWED_EXTENSIONS and no INGEST_PREPROCESSOR_URL is configured"
+                    )),
+                });
+                skipped_count += 1;
+                continue;
+            },
+            ResolvedPath::Rejected { input, reason } => {
+                results.push(AddDocumentItemResult {
+                    path: input,
+                    status: "rejected".into(),
+                    document_id: None,
+                    title: None,
+                    error: Some(reason),
+                });
+                skipped_count += 1;
+                continue;
+            },
+        };
+
+        let abs_str = absolute.to_string_lossy().into_owned();
+        let raw = match fetched {
+            Ok(t) => t,
+            Err(e) => {
+                results.push(AddDocumentItemResult {
+                    path: abs_str,
+                    status: "error".into(),
+                    document_id: None,
+                    title: Some(title_default),
+                    error: Some(e),
+                });
+                skipped_count += 1;
+                continue;
+            },
+        };
+
+        let title_s = sanitize_string(&title_default);
+        let content_s = sanitize_string(&raw);
+        if let Err(e) = validate_content(&content_s) {
+            results.push(AddDocumentItemResult {
+                path: abs_str,
+                status: "rejected".into(),
+                document_id: None,
+                title: Some(title_s),
+                error: Some(e.error),
+            });
+            skipped_count += 1;
+            continue;
+        }
+
+        // For multi-path requests, the optional caller `id` is
+        // ambiguous (only one slot, many docs). Use the canonical
+        // path string instead so each doc has a stable id; for
+        // single `path` form, fall back to the caller id when given.
+        let user_id = if body.path.is_some() {
+            body.id.clone().or_else(|| Some(abs_str.clone()))
+        } else {
+            Some(abs_str.clone())
+        };
+
+        match ingest_one_text(&state, title_s.clone(), content_s, user_id).await {
+            Ok(IngestOutcome::Ingested(doc_id)) => {
+                ingested_count += 1;
+                results.push(AddDocumentItemResult {
+                    path: abs_str,
+                    status: "ingested".into(),
+                    document_id: Some(doc_id),
+                    title: Some(title_s),
+                    error: None,
+                });
+            },
+            Ok(IngestOutcome::Duplicate(doc_id)) => {
+                skipped_count += 1;
+                results.push(AddDocumentItemResult {
+                    path: abs_str,
+                    status: "duplicate".into(),
+                    document_id: Some(doc_id),
+                    title: Some(title_s),
+                    error: None,
+                });
+            },
+            Err(e) => {
+                skipped_count += 1;
+                results.push(AddDocumentItemResult {
+                    path: abs_str,
+                    status: "error".into(),
+                    document_id: None,
+                    title: Some(title_s),
+                    error: Some(e.to_string()),
+                });
+            },
+        }
+    }
+
+    // Single-path convenience: when caller asked for one `path`
+    // (not `paths`/`pathsGlob`), return the legacy single-doc
+    // response shape so simple clients don't have to dig into
+    // `results[0]`. Multi-path requests always return the array form.
+    if body.path.is_some() && results.len() == 1 {
+        let r = &results[0];
+        let resp = DocumentOperationResponse {
+            success: matches!(r.status.as_str(), "ingested" | "duplicate"),
+            document_id: r.document_id.clone(),
+            message: Some(match r.status.as_str() {
+                "ingested" => format!("Document added to {} successfully", backend_label),
+                "duplicate" => "Document already indexed (content_hash match)".into(),
+                other => r
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("ingest status: {other}")),
+            }),
+            backend: backend_label.into(),
+            results: None,
+            ingested_count: None,
+            skipped_count: None,
+        };
+        return Ok(Json(resp));
+    }
+
+    let any_success = ingested_count > 0;
+    let resp = DocumentOperationResponse {
+        success: any_success,
+        document_id: None,
+        message: None,
+        backend: backend_label.into(),
+        results: Some(results),
+        ingested_count: Some(ingested_count),
+        skipped_count: Some(skipped_count),
+    };
+    Ok(Json(resp))
 }
 
 /// List all documents
@@ -1300,8 +1612,11 @@ async fn delete_document(
                 return Ok(Json(DocumentOperationResponse {
                     success: true,
                     document_id: Some(resolved.clone()),
-                    message: format!("Document {} deleted from Qdrant", resolved),
+                    message: Some(format!("Document {} deleted from Qdrant", resolved)),
                     backend: "qdrant".to_string(),
+                    results: None,
+                    ingested_count: None,
+                    skipped_count: None,
                 }));
             },
             Err(e) => {
@@ -1331,8 +1646,11 @@ async fn delete_document(
     Ok(Json(DocumentOperationResponse {
         success: true,
         document_id: Some(supplied.clone()),
-        message: format!("Document {} deleted from memory", supplied),
+        message: Some(format!("Document {} deleted from memory", supplied)),
         backend: "memory".to_string(),
+        results: None,
+        ingested_count: None,
+        skipped_count: None,
     }))
 }
 
