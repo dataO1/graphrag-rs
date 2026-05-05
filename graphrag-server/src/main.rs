@@ -109,6 +109,15 @@ struct AppState {
     /// /api/documents` is rejected with 403.
     ingest_policy: Arc<IngestPolicy>,
 
+    /// Coalescing signal for the in-server auto-append loop. Every
+    /// successful new ingest calls `notify_one()`; the background task
+    /// debounces by `APPEND_DEBOUNCE_SECS` of silence and then runs
+    /// the same codepath `/api/graph/append` does. Replaces the
+    /// previous home-manager 30-min cron — bursts collapse into one
+    /// append, single-doc ingests become graph-queryable in
+    /// `debounce_secs` rather than up to 30 min.
+    auto_append_notify: Arc<tokio::sync::Notify>,
+
     // Authentication state (optional)
     #[cfg(feature = "auth")]
     auth: Arc<AuthState>,
@@ -233,6 +242,7 @@ impl AppState {
         let config = Arc::new(RwLock::new(config));
         let embedding_dim = embeddings.load().dimension();
         let ingest_policy = IngestPolicy::from_env();
+        let auto_append_notify = Arc::new(tokio::sync::Notify::new());
 
         #[cfg(feature = "qdrant")]
         {
@@ -270,6 +280,7 @@ impl AppState {
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
+                        auto_append_notify: auto_append_notify.clone(),
                         #[cfg(feature = "auth")]
                         auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                             |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -293,6 +304,7 @@ impl AppState {
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
+                        auto_append_notify: auto_append_notify.clone(),
                         #[cfg(feature = "auth")]
                         auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                             |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -316,6 +328,7 @@ impl AppState {
                 graphrag: Arc::new(RwLock::new(None)),
                 config_manager: Arc::new(ConfigManager::new()),
                 ingest_policy: ingest_policy.clone(),
+                auto_append_notify: auto_append_notify.clone(),
                 #[cfg(feature = "auth")]
                 auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
                     |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
@@ -1110,6 +1123,10 @@ async fn ingest_one_text(
             }
         }
 
+        // Wake the auto-append coalescer. notify_one stores at most
+        // one permit, so a 200-file burst → many wakes → still one
+        // append after the debounce window of silence.
+        state.auto_append_notify.notify_one();
         return Ok(IngestOutcome::Ingested(id));
     }
 
@@ -1125,6 +1142,7 @@ async fn ingest_one_text(
     *state.graph_built.write().await = false;
 
     tracing::info!("Added document to memory: {} ({})", title, id);
+    state.auto_append_notify.notify_one();
     Ok(IngestOutcome::Ingested(id))
 }
 
@@ -1844,6 +1862,60 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
     error_code = 500
 )]
 async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, ApiError> {
+    do_append_graph(&state).await.map(Json)
+}
+
+/// In-server append coalescer. Waits on `state.auto_append_notify`,
+/// then sleeps `debounce` seconds, restarting the sleep on every new
+/// notification. When the window holds quiet, calls `do_append_graph`
+/// in-process. Replaces the previous home-manager 30-min cron timer.
+///
+/// Single-flight: while an append is running, additional ingests
+/// fire `notify_one()`, which stores a single permit. Once the
+/// append finishes, the next loop iteration picks up that permit
+/// immediately and starts a fresh debounce window.
+///
+/// Errors are logged, not propagated — a transient chat-backend
+/// outage shouldn't crash the server, and the next ingest will wake
+/// us to retry.
+async fn auto_append_loop(state: AppState, debounce: std::time::Duration) {
+    tracing::info!(
+        debounce_secs = debounce.as_secs(),
+        "auto-append loop running (in-server coalescer; replaces 30-min cron)"
+    );
+    loop {
+        // Wait for the first ingest signal of this round.
+        state.auto_append_notify.notified().await;
+
+        // Drain: extend the deadline as long as new signals keep
+        // arriving inside the window. The loop only breaks when
+        // `debounce` seconds have passed without a new notification —
+        // i.e. the user has stopped typing.
+        loop {
+            match tokio::time::timeout(debounce, state.auto_append_notify.notified()).await {
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        match do_append_graph(&state).await {
+            Ok(resp) => tracing::info!("auto-append: {}", resp.message),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "auto-append failed; will retry on next ingest"
+            ),
+        }
+    }
+}
+
+/// Inner extend-graph routine, shared by `POST /api/graph/append` and
+/// the in-server `auto_append_loop` coalescer. Same observable
+/// behavior as the HTTP handler — fast-paths on no-delta, persists
+/// to Qdrant on success, updates `state.graph_built` /
+/// `state.last_built_at` / `state.processed_chunk_count`. Returns
+/// `BuildGraphResponse` so the HTTP route can serialize it directly
+/// and the coalescer can log a structured summary.
+async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiError> {
     let start = std::time::Instant::now();
 
     let mut graphrag_guard = state.graphrag.write().await;
@@ -1862,7 +1934,7 @@ async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>,
             // graph is unchanged.
             if summary.chunks_processed == 0 {
                 let processing_time = start.elapsed().as_millis() as u64;
-                return Ok(Json(BuildGraphResponse {
+                return Ok(BuildGraphResponse {
                     success: true,
                     document_count: 0,
                     processing_time_ms: processing_time,
@@ -1871,7 +1943,7 @@ async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>,
                         graphrag.processed_chunk_count()
                     ),
                     backend: "graphrag-pipeline".to_string(),
-                }));
+                });
             }
 
             // Persist the extended graph to Qdrant. Best-effort.
@@ -1911,7 +1983,7 @@ async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>,
                 summary.total_relationships,
             );
 
-            Ok(Json(BuildGraphResponse {
+            Ok(BuildGraphResponse {
                 success: true,
                 document_count: summary.chunks_processed,
                 processing_time_ms: processing_time,
@@ -1925,7 +1997,7 @@ async fn append_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>,
                     summary.total_relationships,
                 ),
                 backend: "graphrag-pipeline".to_string(),
-            }))
+            })
         },
         Err(e) => Err(ApiError::InternalError(format!(
             "Append failed: {}",
@@ -2122,6 +2194,28 @@ async fn main() -> std::io::Result<()> {
     // Create application state (connects to Qdrant if available)
     let state = AppState::new().await;
     let state_data = Data::new(state.clone());
+
+    // In-server auto-append coalescer. Reads the debounce window
+    // from APPEND_DEBOUNCE_SECS (default 60); 0 disables the loop
+    // entirely (operators can fall back to manual / cron-driven
+    // POST /api/graph/append). Spawned regardless of the chat-
+    // backend wiring — it's a pull-driven loop that only acts when
+    // an ingest fires a notification, so a misconfigured graphrag
+    // instance just sits idle here.
+    let debounce_secs: u64 = std::env::var("APPEND_DEBOUNCE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    if debounce_secs > 0 {
+        tokio::spawn(auto_append_loop(
+            state.clone(),
+            std::time::Duration::from_secs(debounce_secs),
+        ));
+    } else {
+        tracing::info!(
+            "auto-append loop disabled (APPEND_DEBOUNCE_SECS=0); ingests will only enter the entity graph via manual POST /api/graph/append"
+        );
+    }
 
     // Configure OpenAPI specification
     let spec = Spec {
