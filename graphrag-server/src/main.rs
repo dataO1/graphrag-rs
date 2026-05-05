@@ -1895,6 +1895,22 @@ async fn delete_document(
             }
         }
 
+        // Treat anything not a UUID as "not found" rather than
+        // forwarding to qdrant where it would error with
+        // `Unable to parse UUID`. The watcher fires DELETEs on every
+        // REMOVE event, including paths that were never ingested
+        // (e.g. .git/index in a watched repo, files filtered out by
+        // `allowedExtensions`); without this guard, those crash the
+        // request with 500 and produce noisy logs. 404 is the right
+        // shape: the doc isn't there, ack it and move on.
+        if uuid::Uuid::parse_str(&supplied).is_err() {
+            tracing::info!("Delete: id '{}' not found (no user_id match, not a UUID)", supplied);
+            return Err(ApiError::NotFound(format!(
+                "Document with id '{}' not found",
+                supplied
+            )));
+        }
+
         match qdrant.delete_document(&supplied).await {
             Ok(_) => {
                 tracing::info!("Deleted document from Qdrant: {}", supplied);
