@@ -1847,28 +1847,61 @@ async fn delete_document(
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        // Two-step lookup: try the supplied id as a user-supplied id
-        // first (the kind callers actually remember), fall back to
-        // treating it as the Qdrant point UUID. This is the fix for
-        // "delete by user-id returns 500" — the Qdrant point id is a
-        // UUID assigned at ingest, but callers think in terms of the
-        // id they handed us.
-        let resolved = match qdrant.find_id_by_user_id(&supplied).await {
-            Ok(Some(uuid)) => uuid,
-            _ => supplied.clone(),
-        };
+        // Two strategies:
+        //  1. If the supplied id matches any payload's `user_id` we
+        //     `delete_by_user_id` — purges every chunk under that id
+        //     (current AND superseded historical versions). This is
+        //     what the watcher's REMOVE handler relies on; without
+        //     it, only the most-recent point would be removed and
+        //     old superseded chunks would keep their `user_id` tag,
+        //     so a future re-create of the same path would think
+        //     it's an upsert against ghost history.
+        //  2. Otherwise treat the supplied string as a raw Qdrant
+        //     point UUID and delete just that one point. Back-compat
+        //     for callers that delete by the auto-assigned UUID.
+        let user_id_match = qdrant
+            .find_id_by_user_id(&supplied)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
 
-        match qdrant.delete_document(&resolved).await {
+        if user_id_match {
+            match qdrant.delete_by_user_id(&supplied).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Deleted document by user_id from Qdrant: {}",
+                        supplied
+                    );
+                    return Ok(Json(DocumentOperationResponse {
+                        success: true,
+                        document_id: Some(supplied.clone()),
+                        message: Some(format!(
+                            "Deleted all chunks under user_id '{}' (current + superseded)",
+                            supplied
+                        )),
+                        backend: "qdrant".to_string(),
+                        results: None,
+                        ingested_count: None,
+                        skipped_count: None,
+                    }));
+                },
+                Err(e) => {
+                    return Err(ApiError::InternalError(format!(
+                        "Failed to delete by user_id: {}",
+                        e
+                    )));
+                },
+            }
+        }
+
+        match qdrant.delete_document(&supplied).await {
             Ok(_) => {
-                tracing::info!(
-                    "Deleted document from Qdrant: supplied={} resolved={}",
-                    supplied,
-                    resolved
-                );
+                tracing::info!("Deleted document from Qdrant: {}", supplied);
                 return Ok(Json(DocumentOperationResponse {
                     success: true,
-                    document_id: Some(resolved.clone()),
-                    message: Some(format!("Document {} deleted from Qdrant", resolved)),
+                    document_id: Some(supplied.clone()),
+                    message: Some(format!("Document {} deleted from Qdrant", supplied)),
                     backend: "qdrant".to_string(),
                     results: None,
                     ingested_count: None,

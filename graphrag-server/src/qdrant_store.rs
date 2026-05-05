@@ -373,6 +373,25 @@ impl QdrantStore {
         Ok(())
     }
 
+    /// Delete every chunk under a `user_id` — including superseded
+    /// historical versions. Used by `DELETE /api/documents/<path>`
+    /// when the caller-supplied id is recognized as a user_id, so a
+    /// hard delete genuinely removes the doc and all its history
+    /// (the watcher's REMOVE handler relies on this — without it,
+    /// only the most-recent point gets removed and old superseded
+    /// chunks linger in qdrant under that user_id).
+    pub async fn delete_by_user_id(&self, user_id: &str) -> Result<(), QdrantError> {
+        let filter = Filter::must([Condition::matches("user_id", user_id.to_string())]);
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.collection_name)
+                    .points(PointsSelectorOneOf::Filter(filter)),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Look up a Qdrant point id by the caller-supplied user_id. Returns
     /// the first match (user_id is treated as unique-per-document). Used
     /// by `delete_document` so callers can refer to documents by the id
