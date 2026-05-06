@@ -181,6 +181,25 @@ struct AppState {
 /// - `OPENAI_API_KEY`    → `embeddings.api_key`
 /// - `OLLAMA_URL`+`OLLAMA_PORT` → `embeddings.api_endpoint` (joined "host:port")
 /// - `OLLAMA_EMBEDDING_MODEL` → `embeddings.model` (when backend=ollama)
+/// Truncate a string at a Unicode character boundary near `target_bytes`.
+/// `&s[..target_bytes]` panics when the byte falls inside a multi-byte
+/// UTF-8 sequence (e.g. emoji like ✅, 🗂️). This walks `chars()` and
+/// includes whole characters until the byte budget is exceeded, then
+/// stops on the previous boundary.
+fn truncate_excerpt(s: &str, target_bytes: usize) -> String {
+    if s.len() <= target_bytes {
+        return s.to_string();
+    }
+    let mut end = 0usize;
+    for (i, _) in s.char_indices() {
+        if i > target_bytes {
+            break;
+        }
+        end = i;
+    }
+    format!("{}...", &s[..end])
+}
+
 fn overlay_embedding_env_vars(emb: &mut graphrag_core::config::EmbeddingConfig) {
     if let Ok(b) = std::env::var("EMBEDDING_BACKEND") {
         emb.backend = b;
@@ -763,11 +782,7 @@ async fn query(
                         document_id: r.id,
                         title: r.metadata.title,
                         similarity: r.score,
-                        excerpt: if r.metadata.text.len() > 200 {
-                            format!("{}...", &r.metadata.text[..200])
-                        } else {
-                            r.metadata.text
-                        },
+                        excerpt: truncate_excerpt(&r.metadata.text, 200),
                         source: r.metadata.source,
                         line_start: r.metadata.line_start,
                         line_end: r.metadata.line_end,
@@ -835,11 +850,7 @@ async fn query(
                     0.1
                 };
 
-            let excerpt = if doc.content.len() > 200 {
-                format!("{}...", &doc.content[..200])
-            } else {
-                doc.content.clone()
-            };
+            let excerpt = truncate_excerpt(&doc.content, 200);
 
             QueryResult {
                 document_id: doc.id.clone(),
@@ -908,11 +919,7 @@ async fn graph_aware_query(
                             document_id: r.id,
                             title: r.metadata.title,
                             similarity: r.score,
-                            excerpt: if r.metadata.text.len() > 200 {
-                                format!("{}...", &r.metadata.text[..200])
-                            } else {
-                                r.metadata.text
-                            },
+                            excerpt: truncate_excerpt(&r.metadata.text, 200),
                             source: r.metadata.source,
                             line_start: r.metadata.line_start,
                             line_end: r.metadata.line_end,
