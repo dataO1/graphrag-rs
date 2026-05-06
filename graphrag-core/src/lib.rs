@@ -1813,7 +1813,7 @@ impl GraphRAG {
                 sources.push(retrieval::SourceReference {
                     id: cid.0.clone(),
                     source_type: retrieval::SourceType::TextChunk,
-                    excerpt: content.chars().take(160).collect(),
+                    excerpt: content.chars().take(800).collect(),
                     relevance_score: confidence,
                 });
             }
@@ -2067,7 +2067,7 @@ impl GraphRAG {
                 sources.push(retrieval::SourceReference {
                     id: cid.0.clone(),
                     source_type: retrieval::SourceType::TextChunk,
-                    excerpt: content.chars().take(160).collect(),
+                    excerpt: content.chars().take(800).collect(),
                     relevance_score: confidence,
                 });
             }

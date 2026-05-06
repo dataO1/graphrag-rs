@@ -811,7 +811,7 @@ async fn query(
                         document_id: r.id,
                         title: r.metadata.title,
                         similarity: r.score,
-                        excerpt: truncate_excerpt(&r.metadata.text, 200),
+                        excerpt: truncate_excerpt(&r.metadata.text, 800),
                         source: r.metadata.source,
                         line_start: r.metadata.line_start,
                         line_end: r.metadata.line_end,
@@ -879,7 +879,7 @@ async fn query(
                     0.1
                 };
 
-            let excerpt = truncate_excerpt(&doc.content, 200);
+            let excerpt = truncate_excerpt(&doc.content, 800);
 
             QueryResult {
                 document_id: doc.id.clone(),
@@ -948,7 +948,7 @@ async fn graph_aware_query(
                             document_id: r.id,
                             title: r.metadata.title,
                             similarity: r.score,
-                            excerpt: truncate_excerpt(&r.metadata.text, 200),
+                            excerpt: truncate_excerpt(&r.metadata.text, 800),
                             source: r.metadata.source,
                             line_start: r.metadata.line_start,
                             line_end: r.metadata.line_end,
@@ -2809,7 +2809,15 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     // instead of loading all in RAM up front (the old "load 4448 ×
     // chunk_text into Vec<(String,String)>" path was a bare-RAM
     // hazard on large vaults with monster docs).
-    const APPEND_BATCH_SIZE: usize = 16;
+    //
+    // Sized to match graphrag-core's `EXTRACTION_CONCURRENCY` (=64 in
+    // production). Smaller batches cap in-flight LLM calls below the
+    // configured concurrency: extend_graph spawns up to N parallel
+    // LLM extractions per call, but if the batch only has 16 chunks
+    // the stream completes in 1 round of 16 (vLLM running ~16 reqs)
+    // instead of 1 round of 64 — wasting 75% of the slot budget.
+    // Memory: 64 × ~10KB chunk text ≈ 640KB, still bounded.
+    const APPEND_BATCH_SIZE: usize = 64;
 
     let mut master_guard = state.graphrag_writer.lock().await;
     let Some(master) = master_guard.as_mut() else {
