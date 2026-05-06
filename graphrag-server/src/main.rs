@@ -105,20 +105,25 @@ struct AppState {
 
     /// Full GraphRAG pipeline (when configured via JSON).
     ///
-    /// Layer 4: ArcSwap for wait-free reads on the recall path.
-    /// Recall does `state.graphrag.load_full()` — atomic pointer load,
-    /// no blocking. Writers (extend_graph batches, /config init,
-    /// /api/graph/build) serialize via `graphrag_writer` mutex; they
-    /// take the current snapshot, copy-on-write mutate via
-    /// `Arc::make_mut`, atomically publish via `store`. Readers and
-    /// writers never contend.
+    /// Layer 4 (revised): readers see a wait-free snapshot via
+    /// `ArcSwapOption`; writers hold the master in `graphrag_writer`
+    /// (a real `Mutex<GraphRAG>`), mutate in place across many
+    /// batches, and publish the snapshot **once at the end of the
+    /// /append cycle**. Earlier per-batch publish-via-Arc::make_mut
+    /// caused pathological allocator churn (cloning a 50MB+ KG every
+    /// batch × 696 batches in the cold-start migration → 76GB RSS,
+    /// OOM-killed). One publish per /append eliminates the churn;
+    /// recall sees the prior snapshot during the cycle (correct,
+    /// just slightly stale) and never blocks.
     graphrag: Arc<arc_swap::ArcSwapOption<GraphRAG>>,
 
-    /// Layer 4: writer-vs-writer mutex for `graphrag`. Readers never
-    /// touch this. Concurrent extend_graph batches / /config rebuilds
-    /// serialize on this mutex so the COW snapshot they each take
-    /// reflects the prior writer's mutations.
-    graphrag_writer: Arc<tokio::sync::Mutex<()>>,
+    /// Layer 4 (revised): writer-owned mutable master. Held only by
+    /// writers; readers never touch this. Writers acquire, mutate
+    /// via `extend_graph` etc. across the full /append run, then
+    /// publish the result via `state.graphrag.store(Arc::new(g.clone()))`
+    /// when done — one clone per /append, regardless of batch count.
+    /// Initialized empty; `/config` populates it.
+    graphrag_writer: Arc<tokio::sync::Mutex<Option<GraphRAG>>>,
 
     // Configuration manager for JSON config
     config_manager: Arc<ConfigManager>,
@@ -407,7 +412,7 @@ impl AppState {
                         embeddings,
                         config,
                         graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
-                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
+                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -435,7 +440,7 @@ impl AppState {
                         embeddings,
                         config,
                         graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
-                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
+                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -463,7 +468,7 @@ impl AppState {
                 embeddings,
                 config,
                 graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
-                graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
+                graphrag_writer: Arc::new(tokio::sync::Mutex::new(None)),
                 config_manager: Arc::new(ConfigManager::new()),
                 ingest_policy: ingest_policy.clone(),
                 auto_append_notify: auto_append_notify.clone(),
@@ -2536,84 +2541,78 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
         .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
         .collect();
 
-    // Layer 4: serialize writers, but never block readers. Take the
-    // current snapshot, COW-clone via Arc::make_mut, mutate, atomically
-    // publish.
-    let _writer = state.graphrag_writer.lock().await;
-    let current = state.graphrag.load_full();
-    let Some(current_arc) = current else {
+    // Layer 4 (revised): mutate the writer-owned master in place, then
+    // publish the snapshot ONCE at the end. No per-batch cloning.
+    let mut master_guard = state.graphrag_writer.lock().await;
+    let Some(master) = master_guard.as_mut() else {
         return Err(ApiError::BadRequest(
             "GraphRAG not initialized. Call POST /config first.".to_string(),
         ));
     };
-    let mut new_graphrag_arc: Arc<GraphRAG> = current_arc;
-    {
-        let graphrag = Arc::make_mut(&mut new_graphrag_arc);
-        if let Err(e) = graphrag.clear_graph() {
-            tracing::warn!(error = %e, "clear_graph failed before rebuild");
-        }
-        match graphrag.extend_graph(&chunks_for_extract).await {
-            Ok(summary) => {
-                let entities = summary.total_entities;
-                let relationships = summary.total_relationships;
-
-                #[cfg(feature = "qdrant")]
-                if let Some(qdrant) = state.qdrant.as_ref() {
-                    match graph_persistence::persist_in_memory_graph(
-                        graphrag,
-                        qdrant,
-                        state.embeddings.load_full().as_ref(),
-                    )
-                    .await
-                    {
-                        Ok((e, r)) => tracing::info!(
-                            "💾 Persisted graph to Qdrant: {} entities, {} relationships",
-                            e, r
-                        ),
-                        Err(err) => tracing::warn!(
-                            error = %err,
-                            "graph persistence failed; in-memory build is still good but won't survive restart"
-                        ),
-                    }
-                    let now_ts = chrono::Utc::now().timestamp();
-                    if let Err(e) = qdrant.mark_chunks_extracted(&chunk_ids, now_ts).await {
-                        tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks may re-extract on next append");
-                    }
-                }
-
-                // Publish the rebuilt graph atomically.
-                state.graphrag.store(Some(new_graphrag_arc));
-                drop(_writer);
-
-                let processing_time = start.elapsed().as_millis() as u64;
-                *state.graph_built.write().await = true;
-                *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-                state
-                    .processed_chunk_count
-                    .store(chunk_ids.len(), std::sync::atomic::Ordering::SeqCst);
-
-                tracing::info!(
-                    "Rebuilt knowledge graph from {} chunks in {}ms ({} entities, {} relationships)",
-                    chunk_ids.len(), processing_time, entities, relationships
-                );
-
-                return Ok(Json(BuildGraphResponse {
-                    success: true,
-                    document_count: chunk_ids.len(),
-                    processing_time_ms: processing_time,
-                    message: format!(
-                        "Knowledge graph built: {} entities, {} relationships",
-                        entities, relationships
-                    ),
-                    backend: "graphrag-pipeline".to_string(),
-                }));
-            },
-            Err(e) => {
-                tracing::warn!("GraphRAG pipeline build failed, trying fallback: {}", e);
-            },
-        }
+    if let Err(e) = master.clear_graph() {
+        tracing::warn!(error = %e, "clear_graph failed before rebuild");
     }
-    drop(_writer);
+    match master.extend_graph(&chunks_for_extract).await {
+        Ok(summary) => {
+            let entities = summary.total_entities;
+            let relationships = summary.total_relationships;
+
+            #[cfg(feature = "qdrant")]
+            if let Some(qdrant) = state.qdrant.as_ref() {
+                match graph_persistence::persist_in_memory_graph(
+                    master,
+                    qdrant,
+                    state.embeddings.load_full().as_ref(),
+                )
+                .await
+                {
+                    Ok((e, r)) => tracing::info!(
+                        "💾 Persisted graph to Qdrant: {} entities, {} relationships",
+                        e, r
+                    ),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "graph persistence failed; in-memory build is still good but won't survive restart"
+                    ),
+                }
+                let now_ts = chrono::Utc::now().timestamp();
+                if let Err(e) = qdrant.mark_chunks_extracted(&chunk_ids, now_ts).await {
+                    tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks may re-extract on next append");
+                }
+            }
+
+            // Publish the rebuilt graph (one clone for the snapshot).
+            state.graphrag.store(Some(Arc::new(master.clone())));
+            drop(master_guard);
+
+            let processing_time = start.elapsed().as_millis() as u64;
+            *state.graph_built.write().await = true;
+            *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
+            state
+                .processed_chunk_count
+                .store(chunk_ids.len(), std::sync::atomic::Ordering::SeqCst);
+
+            tracing::info!(
+                "Rebuilt knowledge graph from {} chunks in {}ms ({} entities, {} relationships)",
+                chunk_ids.len(), processing_time, entities, relationships
+            );
+
+            return Ok(Json(BuildGraphResponse {
+                success: true,
+                document_count: chunk_ids.len(),
+                processing_time_ms: processing_time,
+                message: format!(
+                    "Knowledge graph built: {} entities, {} relationships",
+                    entities, relationships
+                ),
+                backend: "graphrag-pipeline".to_string(),
+            }));
+        },
+        Err(e) => {
+            tracing::warn!("GraphRAG pipeline build failed, trying fallback: {}", e);
+        },
+    }
+    drop(master_guard);
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
@@ -2804,97 +2803,74 @@ async fn stale_context_cleanup_loop(state: AppState, interval: std::time::Durati
 async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiError> {
     let start = std::time::Instant::now();
 
-    // Phase 6: source-of-truth dedup signal is `entities_extracted_at`
-    // in qdrant payload. Query qdrant for chunks lacking that marker.
-    #[cfg(feature = "qdrant")]
-    let unextracted: Vec<(String, String)> = match state.qdrant.as_ref() {
-        Some(qdrant) => qdrant
-            .list_unextracted_chunks(1_000_000)
-            .await
-            .map_err(|e| ApiError::InternalError(format!("list unextracted chunks failed: {}", e)))?,
-        None => Vec::new(),
-    };
-    #[cfg(not(feature = "qdrant"))]
-    let unextracted: Vec<(String, String)> = Vec::new();
-
-    if unextracted.is_empty() {
-        let processing_time = start.elapsed().as_millis() as u64;
-        return Ok(BuildGraphResponse {
-            success: true,
-            document_count: 0,
-            processing_time_ms: processing_time,
-            message: "No new chunks since last build. Nothing to append.".to_string(),
-            backend: "graphrag-pipeline".to_string(),
-        });
-    }
-
-    // Layer 4 (write-lock yielding): chunk the work into small batches
-    // so the GraphRAG write-lock isn't held for the entire LLM run.
-    // extend_graph internally uses EXTRACTION_CONCURRENCY=N parallel
-    // LLM calls; sizing each batch == that concurrency means each
-    // batch is one round of LLM calls (~5-15s), then the lock
-    // releases and queued recalls (read-lock) get a window before
-    // the next batch grabs the write-lock again. Without this, a
-    // cold-start migration that re-extracts thousands of chunks
-    // blocks recall for hours.
+    // Layer 4 (revised): mutate the writer-owned master in place across
+    // all batches; publish a snapshot ONCE at the end. Stream
+    // unextracted chunks from qdrant in pages of APPEND_BATCH_SIZE
+    // instead of loading all in RAM up front (the old "load 4448 ×
+    // chunk_text into Vec<(String,String)>" path was a bare-RAM
+    // hazard on large vaults with monster docs).
     const APPEND_BATCH_SIZE: usize = 16;
 
-    let total_chunks = unextracted.len();
+    let mut master_guard = state.graphrag_writer.lock().await;
+    let Some(master) = master_guard.as_mut() else {
+        return Err(ApiError::BadRequest(
+            "GraphRAG not initialized. Call POST /config first.".to_string(),
+        ));
+    };
+
     let mut total_chunks_processed = 0usize;
     let mut total_new_entities = 0usize;
     let mut total_new_relationships = 0usize;
     let mut total_mentions_merged = 0usize;
     let mut last_total_entities = 0usize;
     let mut last_total_relationships = 0usize;
+    let mut batch_idx = 0usize;
 
-    tracing::info!(
-        "do_append_graph: {} chunks to extract, processing in batches of {} (Layer 4: writers serialize via mutex; recall reads are wait-free)",
-        total_chunks,
-        APPEND_BATCH_SIZE,
-    );
+    loop {
+        // Page through unextracted chunks one batch at a time. Each
+        // call to list_unextracted_chunks returns up to BATCH_SIZE
+        // chunks where entities_extracted_at IS NULL. We mark the
+        // batch as extracted at the end of each iteration, so the
+        // NEXT page automatically excludes them — no offset bookkeeping.
+        #[cfg(feature = "qdrant")]
+        let batch: Vec<(String, String)> = match state.qdrant.as_ref() {
+            Some(qdrant) => qdrant
+                .list_unextracted_chunks(APPEND_BATCH_SIZE as u32)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("list unextracted chunks failed: {}", e)))?,
+            None => Vec::new(),
+        };
+        #[cfg(not(feature = "qdrant"))]
+        let batch: Vec<(String, String)> = Vec::new();
 
-    // Layer 4: serialize against other writers; recall path never sees
-    // this. Writers acquire here, COW-clone the current snapshot,
-    // mutate a private copy, atomically publish.
-    let _writer = state.graphrag_writer.lock().await;
+        if batch.is_empty() {
+            break;
+        }
 
-    for (batch_idx, batch) in unextracted.chunks(APPEND_BATCH_SIZE).enumerate() {
+        if batch_idx == 0 {
+            tracing::info!(
+                "do_append_graph: starting (Layer 4 revised: writer-mutex master, snapshot publish at end; streaming qdrant pages of {})",
+                APPEND_BATCH_SIZE,
+            );
+        }
+
         let batch_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
         let batch_chunks: Vec<(graphrag_core::core::ChunkId, String)> = batch
-            .iter()
-            .map(|(id, text)| (graphrag_core::core::ChunkId::new(id.clone()), text.clone()))
+            .into_iter()
+            .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
             .collect();
 
-        // COW snapshot: take the current Arc<GraphRAG>, deep-clone via
-        // make_mut (cheap because prior batch published atomically and
-        // any reader holding the prior snapshot doesn't block us).
-        let current = state.graphrag.load_full();
-        let Some(current_arc) = current else {
-            return Err(ApiError::BadRequest(
-                "GraphRAG not initialized. Call POST /config first.".to_string(),
-            ));
-        };
-        let mut new_graphrag_arc: Arc<GraphRAG> = current_arc;
-        let (batch_summary, snapshot) = {
-            let graphrag = Arc::make_mut(&mut new_graphrag_arc);
-            let s = graphrag.extend_graph(&batch_chunks).await.map_err(|e| {
-                ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
-            })?;
-            #[cfg(feature = "qdrant")]
-            let snapshot = graph_persistence::snapshot_touched(
-                graphrag,
-                &s.touched_entity_ids,
-                &s.touched_relationship_keys,
-            );
-            #[cfg(not(feature = "qdrant"))]
-            let snapshot = ();
-            (s, snapshot)
-        };
+        // Mutate the master in place. No clone, no Arc::make_mut.
+        let batch_summary = master.extend_graph(&batch_chunks).await.map_err(|e| {
+            ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
+        })?;
 
-        // Atomically publish this batch's mutated snapshot. From this
-        // point new recalls see the +N entities; in-flight recalls
-        // finish on the prior snapshot (correct, just slightly stale).
-        state.graphrag.store(Some(new_graphrag_arc));
+        #[cfg(feature = "qdrant")]
+        let snapshot = graph_persistence::snapshot_touched(
+            master,
+            &batch_summary.touched_entity_ids,
+            &batch_summary.touched_relationship_keys,
+        );
 
         total_chunks_processed += batch_summary.chunks_processed;
         total_new_entities += batch_summary.new_entities;
@@ -2904,8 +2880,8 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         last_total_relationships = batch_summary.total_relationships;
 
         // Persist this batch's delta to qdrant + mark chunks extracted.
-        // Best-effort — extraction is idempotent; next /append cycle
-        // re-does this batch if the marker isn't set.
+        // Best-effort — extraction is idempotent; if mark fails the
+        // chunks re-extract next /append cycle.
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = state.qdrant.as_ref() {
             let entity_count = snapshot.entities.len();
@@ -2918,7 +2894,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
             .await
             {
                 Ok((e, r)) => tracing::info!(
-                    "💾 Persisted delta to Qdrant: {} entities, {} relationships (batch {}; lock-free)",
+                    "💾 Persisted delta to Qdrant: {} entities, {} relationships (batch {})",
                     e, r, batch_idx
                 ),
                 Err(err) => tracing::warn!(
@@ -2938,9 +2914,27 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
                 );
             }
         }
+
+        let _ = batch_ids; // marked extracted in qdrant; no further use
+        batch_idx += 1;
     }
 
-    drop(_writer);
+    if batch_idx == 0 {
+        let processing_time = start.elapsed().as_millis() as u64;
+        return Ok(BuildGraphResponse {
+            success: true,
+            document_count: 0,
+            processing_time_ms: processing_time,
+            message: "No new chunks since last build. Nothing to append.".to_string(),
+            backend: "graphrag-pipeline".to_string(),
+        });
+    }
+
+    // Publish the updated graph snapshot ONCE at the end (one clone,
+    // not per-batch). Recall that started before this point sees the
+    // prior snapshot; recall after sees the freshly published one.
+    state.graphrag.store(Some(Arc::new(master.clone())));
+    drop(master_guard);
 
     let processing_time = start.elapsed().as_millis() as u64;
 
@@ -2954,7 +2948,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     tracing::info!(
         "extend_graph: {} chunks across {} batches, +{} entities, +{} rels, {} mentions merged ({}ms; graph: {} entities, {} rels)",
         total_chunks_processed,
-        (total_chunks + APPEND_BATCH_SIZE - 1) / APPEND_BATCH_SIZE,
+        batch_idx,
         total_new_entities,
         total_new_relationships,
         total_mentions_merged,

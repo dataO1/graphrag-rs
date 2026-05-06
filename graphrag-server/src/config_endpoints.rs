@@ -235,19 +235,14 @@ pub async fn set_config(
         }
     }
 
-    // Phase 6 end state: graphrag-core's KnowledgeGraph holds only the
-    // entity + relationship petgraph (~50 KB). All chunk content +
-    // metadata + the entities-extracted timestamp live in Qdrant.
-    // /api/graph/append queries Qdrant for chunks lacking the
-    // timestamp, runs LLM extraction, and updates the timestamp.
-    //
-    // Layer 4: atomically publish the new graphrag snapshot. Any
-    // in-flight recall on the prior snapshot finishes on it; new
-    // recalls pick up the fresh one. Serialize against concurrent
-    // writers via the writer mutex.
-    let _w = state.graphrag_writer.lock().await;
-    state.graphrag.store(Some(std::sync::Arc::new(graphrag)));
-    drop(_w);
+    // Layer 4 (revised): publish the new graphrag to BOTH the
+    // writer-owned master AND the reader snapshot. /api/graph/append
+    // mutates the master in place and re-publishes the snapshot once
+    // at the end of its cycle.
+    let mut master = state.graphrag_writer.lock().await;
+    state.graphrag.store(Some(std::sync::Arc::new(graphrag.clone())));
+    *master = Some(graphrag);
+    drop(master);
 
     tracing::info!("✅ GraphRAG initialized successfully with custom configuration");
 
