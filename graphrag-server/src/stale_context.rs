@@ -250,12 +250,11 @@ async fn run_sse_pump(
         return Ok(());
     }
 
-    // 1. Resolve the session's lease set once. The SSE filter is
-    //    static for the duration of this stream; if the agent
-    //    leases new chunks, the next recall server-side adds them
-    //    to the lease table and the events emit will broadcast to
-    //    THIS session's subscriber automatically (the lease list is
-    //    re-read in the live loop too — see the `live_check`).
+    // 1. Resolve the session's lease set ONCE for the initial
+    //    history replay. The live loop below re-reads on every event
+    //    so mid-stream leases (the typical case: client opens stream
+    //    on session start, then recall populates the lease) become
+    //    visible immediately rather than after some refresh tick.
     let lease_block_ids = store.session_block_ids(session_id.clone()).await?;
 
     // 2. Replay history (id > last_event_id, capped).
@@ -281,24 +280,31 @@ async fn run_sse_pump(
         }
     }
 
-    // 3. Live tail. Re-read the session lease set every Nth event
-    //    so newly-leased blocks (added by other recall calls during
-    //    the SSE session) get included without forcing a reconnect.
-    let mut tick: u64 = 0;
-    let mut current_leases: std::collections::HashSet<String> =
-        lease_block_ids.into_iter().collect();
+    // 3. Live tail. Re-read the session lease set on EVERY event so
+    //    new leases (added by recall calls AFTER the stream opened)
+    //    are picked up immediately rather than after a refresh
+    //    interval. The lease query is one indexed SQLite lookup
+    //    against a small per-session table — typically <100µs and
+    //    well below the cost of a typical event payload's JSON
+    //    serialization. v1 used a tick%32 backstop which was useless
+    //    in practice: most sessions never generate 32 events between
+    //    a recall and its corresponding edit, so the lease cache
+    //    effectively never refreshed and mid-stream leases never
+    //    saw events.
     loop {
         match bus_rx.recv().await {
             Ok(ev) => {
                 if ev.id <= cursor {
                     continue;
                 }
-                tick += 1;
-                if tick % 32 == 0 {
-                    if let Ok(ids) = store.session_block_ids(session_id.clone()).await {
-                        current_leases = ids.into_iter().collect();
-                    }
-                }
+                let current_leases: std::collections::HashSet<String> =
+                    match store.session_block_ids(session_id.clone()).await {
+                        Ok(ids) => ids.into_iter().collect(),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "lease lookup failed; skipping event");
+                            continue;
+                        },
+                    };
                 if !current_leases.contains(&ev.block_id) {
                     continue;
                 }
