@@ -673,6 +673,11 @@ async fn query(
                         } else {
                             r.metadata.text
                         },
+                        source: r.metadata.source,
+                        line_start: r.metadata.line_start,
+                        line_end: r.metadata.line_end,
+                        heading_path: r.metadata.heading_path,
+                        block_id: r.metadata.block_id,
                     })
                     .collect();
 
@@ -735,6 +740,11 @@ async fn query(
                 title: doc.title.clone(),
                 similarity,
                 excerpt,
+                source: None,
+                line_start: None,
+                line_end: None,
+                heading_path: Vec::new(),
+                block_id: None,
             }
         })
         .filter(|r| r.similarity > 0.5)
@@ -795,6 +805,11 @@ async fn graph_aware_query(
                             } else {
                                 r.metadata.text
                             },
+                            source: r.metadata.source,
+                            line_start: r.metadata.line_start,
+                            line_end: r.metadata.line_end,
+                            heading_path: r.metadata.heading_path,
+                            block_id: r.metadata.block_id,
                         })
                         .collect(),
                     Err(_) => Vec::new(),
@@ -1192,6 +1207,165 @@ enum IngestOutcome {
     Duplicate(String),
 }
 
+/// Cheap URI-shape check for the `source` field. Accepts anything
+/// matching `<scheme>:<rest>` where scheme is alpha+alnum+-./. and
+/// rest is non-empty. Deliberately permissive — we want
+/// file://, https://, obsidian://, arxiv:, doi:, urn:, custom: all
+/// to pass. Reject only blatant garbage (no colon, empty rest).
+fn is_uri_like(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else {
+        return false;
+    };
+    if scheme.is_empty() || rest.is_empty() {
+        return false;
+    }
+    scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+#[derive(Debug)]
+struct BlockIngestOutcome {
+    user_id: String,
+    added: usize,
+    superseded: usize,
+}
+
+/// Block-aware ingest. The caller (typically the Obsidian plugin)
+/// owns the diff state and sends only the blocks that actually
+/// changed plus a list of `removed_block_ids`. We:
+///   1. mark old (user_id, block_id) tuples superseded for both
+///      removed and changed blocks (one server-side flip per id);
+///   2. embed each changed block — the embedded text gets a
+///      contextual prefix `[title > h1 > h2]` prepended at embed
+///      time only (the stored text stays clean, so recall excerpts
+///      don't show the prefix);
+///   3. insert one Qdrant point per block with full chunk metadata
+///      including `block_id`, `block_hash`, `heading_path`, line
+///      range, and `source`;
+///   4. mirror the FULL doc content into the graphrag pipeline so
+///      entity extraction still has whole-doc context (block-level
+///      extraction would lose cross-section coreferences).
+async fn ingest_blocks(
+    state: &AppState,
+    title: String,
+    full_content: String,
+    source: String,
+    user_id: String,
+    blocks: Vec<crate::models::BlockInput>,
+    removed_block_ids: Vec<String>,
+    _file_hash: Option<String>,
+) -> Result<BlockIngestOutcome, ApiError> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let mut superseded: usize = 0;
+    let mut added: usize = 0;
+
+    #[cfg(feature = "qdrant")]
+    if let Some(qdrant) = &state.qdrant {
+        // Step 1: supersede removed blocks.
+        for bid in &removed_block_ids {
+            qdrant
+                .mark_block_superseded(&user_id, bid)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("supersede removed block {bid} failed: {e}")))?;
+            superseded += 1;
+        }
+
+        // Step 2 + 3: for each changed block, supersede prior version,
+        // then embed + insert. Sequential to keep the embedding service
+        // honest (we don't want to spam concurrent embed requests for
+        // a 200-block document during a bulk reindex; the user's 24 GB
+        // VRAM laptop is the bottleneck here).
+        for block in blocks {
+            qdrant
+                .mark_block_superseded(&user_id, &block.id)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("supersede prior block {} failed: {e}", block.id)))?;
+
+            // Contextual prefix at embed time only.
+            let prefix = build_context_prefix(&title, &block.heading_path);
+            let embed_text = if prefix.is_empty() {
+                block.content.clone()
+            } else {
+                format!("{prefix}\n\n{}", block.content)
+            };
+            let embedding = state
+                .embeddings
+                .load_full()
+                .generate_single(&embed_text)
+                .await
+                .map_err(|e| {
+                    ApiError::InternalError(format!("embed block {} failed: {e}", block.id))
+                })?;
+
+            let chunk_uuid = uuid::Uuid::new_v4().to_string();
+            let metadata = qdrant_store::DocumentMetadata {
+                id: chunk_uuid.clone(),
+                title: title.clone(),
+                text: block.content.clone(),
+                chunk_index: 0,
+                entities: Vec::new(),
+                relationships: Vec::new(),
+                timestamp: timestamp.clone(),
+                content_hash: Some(block.hash.clone()),
+                user_id: Some(user_id.clone()),
+                version: Some(1),
+                valid_from: Some(timestamp.clone()),
+                is_current: Some(true),
+                source: Some(source.clone()),
+                block_id: Some(block.id.clone()),
+                block_hash: Some(block.hash.clone()),
+                heading_path: block.heading_path.clone(),
+                line_start: block.line_start,
+                line_end: block.line_end,
+                custom: HashMap::new(),
+            };
+            qdrant
+                .add_document(&chunk_uuid, embedding, metadata)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("insert block {} failed: {e}", block.id)))?;
+            added += 1;
+        }
+
+        // Step 4: pipeline feed (whole-doc text). Keep entity extraction
+        // doc-level so cross-section relations stay visible.
+        {
+            let mut g = state.graphrag.write().await;
+            if let Some(ref mut graphrag) = *g {
+                if let Err(e) = graphrag.add_document_from_text(&full_content) {
+                    tracing::warn!(error = %e, source = %source, "graphrag pipeline feed failed");
+                } else {
+                    *state.graph_built.write().await = false;
+                }
+            }
+        }
+        state.auto_append_notify.notify_one();
+
+        return Ok(BlockIngestOutcome { user_id, added, superseded });
+    }
+
+    // Memory fallback: just push the whole content.
+    let document = Document {
+        id: user_id.clone(),
+        title,
+        content: full_content,
+        added_at: timestamp,
+    };
+    state.documents.write().await.push(document);
+    *state.graph_built.write().await = false;
+    state.auto_append_notify.notify_one();
+    Ok(BlockIngestOutcome { user_id, added: 1, superseded: 0 })
+}
+
+/// Build the embedding-time contextual prefix. Format:
+///   `[Title > Section > Subsection]`
+/// Empty when both title and heading_path are empty.
+fn build_context_prefix(title: &str, heading_path: &[String]) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !title.is_empty() { parts.push(title); }
+    for h in heading_path { if !h.is_empty() { parts.push(h); } }
+    if parts.is_empty() { return String::new(); }
+    format!("[{}]", parts.join(" > "))
+}
+
 /// Ingest one fully-prepared text body. Centralizes the embed →
 /// dedup-check → qdrant-write → graphrag-feed pipeline that used to
 /// live inline in `add_document`. Both legacy `content` requests and
@@ -1287,6 +1461,13 @@ async fn ingest_one_text(
                 ApiError::InternalError(format!("Failed to generate embedding: {}", e))
             })?;
 
+        // Auto-derive source for path-form (user_id is the absolute
+        // path string in that case) so every persisted point now
+        // carries provenance — needed for the recall response to
+        // include `source` uniformly.
+        let derived_source = user_id.as_deref().and_then(|u| {
+            if u.starts_with('/') { Some(format!("file://{u}")) } else { None }
+        });
         let metadata = DocumentMetadata {
             id: id.clone(),
             title: title.clone(),
@@ -1297,6 +1478,12 @@ async fn ingest_one_text(
             timestamp: timestamp.clone(),
             content_hash: Some(content_hash.clone()),
             user_id: user_id.clone(),
+            source: derived_source,
+            block_id: None,
+            block_hash: None,
+            heading_path: Vec::new(),
+            line_start: None,
+            line_end: None,
             version: Some(new_version),
             valid_from: Some(timestamp.clone()),
             is_current: Some(true),
@@ -1453,7 +1640,7 @@ async fn add_document(
         ));
     }
 
-    // ---- Branch A: legacy content form ----
+    // ---- Branch A: content form (legacy whole-doc OR block-aware) ----
     if let Some(content) = body.content.as_ref() {
         let title = body.title.clone().ok_or_else(|| {
             ApiError::BadRequest("`title` is required when ingesting via `content`".into())
@@ -1466,6 +1653,52 @@ async fn add_document(
             tracing::warn!(content_len = content.len(), error = %e.error, "Invalid content");
             return Err(ApiError::BadRequest(e.error));
         }
+        // Phase B: `source` is required for `content`-form ingest. URI
+        // form is up to the caller (https://, file://, obsidian://, etc.)
+        // — we just check it parses as `<scheme>:<rest>` so provenance
+        // is structured.
+        let source = body.source.clone().ok_or_else(|| {
+            ApiError::BadRequest(
+                "`source` is required for content-form ingest (URI for provenance, e.g. https://… or obsidian://vault/…)".into(),
+            )
+        })?;
+        if !is_uri_like(&source) {
+            return Err(ApiError::BadRequest(format!(
+                "`source` must be URI-shaped (got {:?})",
+                source
+            )));
+        }
+
+        // Block-aware path: when `blocks` is set, do surgical chunk
+        // ingest in qdrant (one point per block) plus full-content
+        // pipeline feed for entity extraction.
+        if let Some(blocks) = body.blocks.clone() {
+            let outcome = ingest_blocks(
+                &state,
+                sanitize_string(&title),
+                sanitize_string(content),
+                source.clone(),
+                body.id.clone().unwrap_or_else(|| source.clone()),
+                blocks,
+                body.removed_block_ids.clone().unwrap_or_default(),
+                body.file_hash.clone(),
+            )
+            .await?;
+            let backend = if state.has_qdrant() { "qdrant" } else { "memory" };
+            return Ok(Json(DocumentOperationResponse {
+                success: true,
+                document_id: Some(outcome.user_id),
+                message: Some(format!(
+                    "block-aware ingest: {} chunk(s) added, {} superseded",
+                    outcome.added, outcome.superseded
+                )),
+                backend: backend.into(),
+                results: None,
+                ingested_count: Some(outcome.added),
+                skipped_count: None,
+            }));
+        }
+
         let outcome = ingest_one_text(
             &state,
             sanitize_string(&title),
@@ -2205,92 +2438,114 @@ async fn auto_append_loop(state: AppState, debounce: std::time::Duration) {
 async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiError> {
     let start = std::time::Instant::now();
 
-    let mut graphrag_guard = state.graphrag.write().await;
-    let Some(graphrag) = graphrag_guard.as_mut() else {
-        return Err(ApiError::BadRequest(
-            "GraphRAG not initialized. Call POST /config first.".to_string(),
-        ));
-    };
-
-    match graphrag.extend_graph().await {
-        Ok(summary) => {
-            // No-op fast path: nothing was ingested since last build.
-            // Cron-callers fire this regardless of whether anything's
-            // changed; surface that as a clear message rather than a
-            // misleading "appended 0 chunks". Skip persistence — the
-            // graph is unchanged.
-            if summary.chunks_processed == 0 {
-                let processing_time = start.elapsed().as_millis() as u64;
-                return Ok(BuildGraphResponse {
-                    success: true,
-                    document_count: 0,
-                    processing_time_ms: processing_time,
-                    message: format!(
-                        "No new chunks since last build ({} processed). Nothing to append.",
-                        graphrag.processed_chunk_count()
-                    ),
-                    backend: "graphrag-pipeline".to_string(),
-                });
-            }
-
-            // Persist the extended graph to Qdrant. Best-effort.
-            #[cfg(feature = "qdrant")]
-            if let Some(qdrant) = state.qdrant.as_ref() {
-                match graph_persistence::persist_in_memory_graph(graphrag, qdrant, state.embeddings.load_full().as_ref()).await {
-                    Ok((e, r)) => tracing::info!(
-                        "💾 Persisted graph to Qdrant: {} entities, {} relationships",
-                        e, r
-                    ),
-                    Err(err) => tracing::warn!(
-                        error = %err,
-                        "graph persistence failed; in-memory append is still good but won't survive restart"
-                    ),
-                }
-            }
-
+    // Phase 1 (under-lock): run extend_graph (which mutates the
+    // in-memory graph), then snapshot the touched delta into owned
+    // data so we can release the lock before paying for the embed +
+    // qdrant write. Mirrors LightRAG's approach where embedding is
+    // never done while holding any storage lock.
+    let (summary, snapshot, processed_chunks_after) = {
+        let mut graphrag_guard = state.graphrag.write().await;
+        let Some(graphrag) = graphrag_guard.as_mut() else {
+            return Err(ApiError::BadRequest(
+                "GraphRAG not initialized. Call POST /config first.".to_string(),
+            ));
+        };
+        let summary = graphrag.extend_graph().await.map_err(|e| {
+            ApiError::InternalError(format!("Append failed: {}", e))
+        })?;
+        // Empty-delta fast path stays under-lock: no snapshot needed.
+        if summary.chunks_processed == 0 {
             let processing_time = start.elapsed().as_millis() as u64;
-
-            *state.graph_built.write().await = true;
-            *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-            // Mirror processed_chunks count into AppState for /health
-            // and /embeddings/stats consumers.
-            state.processed_chunk_count.store(
-                graphrag.processed_chunk_count(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
-
-            tracing::info!(
-                "extend_graph: {} delta chunks, +{} entities, +{} rels, {} mentions merged ({}ms; graph: {} entities, {} rels)",
-                summary.chunks_processed,
-                summary.new_entities,
-                summary.new_relationships,
-                summary.mentions_merged,
-                processing_time,
-                summary.total_entities,
-                summary.total_relationships,
-            );
-
-            Ok(BuildGraphResponse {
+            return Ok(BuildGraphResponse {
                 success: true,
-                document_count: summary.chunks_processed,
+                document_count: 0,
                 processing_time_ms: processing_time,
                 message: format!(
-                    "Appended {} new chunks: +{} entities, +{} relationships, {} mentions merged ({} entities, {} relationships total)",
-                    summary.chunks_processed,
-                    summary.new_entities,
-                    summary.new_relationships,
-                    summary.mentions_merged,
-                    summary.total_entities,
-                    summary.total_relationships,
+                    "No new chunks since last build ({} processed). Nothing to append.",
+                    graphrag.processed_chunk_count()
                 ),
                 backend: "graphrag-pipeline".to_string(),
-            })
-        },
-        Err(e) => Err(ApiError::InternalError(format!(
-            "Append failed: {}",
-            e
-        ))),
+            });
+        }
+        #[cfg(feature = "qdrant")]
+        let snapshot = graph_persistence::snapshot_touched(
+            graphrag,
+            &summary.touched_entity_ids,
+            &summary.touched_relationship_keys,
+        );
+        #[cfg(not(feature = "qdrant"))]
+        let snapshot = ();
+        let processed_chunks_after = graphrag.processed_chunk_count();
+        (summary, snapshot, processed_chunks_after)
+    }; // ← lock released here
+
+    // Phase 2 (LOCK-FREE): embed + qdrant write of the touched delta.
+    // Recall paths can take the GraphRAG write-lock during this window
+    // without blocking on us. Best-effort: persist failure logs and
+    // continues — the in-memory graph is still good for the rest of
+    // the session.
+    #[cfg(feature = "qdrant")]
+    if let Some(qdrant) = state.qdrant.as_ref() {
+        let entity_count = snapshot.entities.len();
+        let rel_count = snapshot.relationships.len();
+        match graph_persistence::persist_touched_snapshot(
+            snapshot,
+            qdrant,
+            state.embeddings.load_full().as_ref(),
+        )
+        .await
+        {
+            Ok((e, r)) => tracing::info!(
+                "💾 Persisted delta to Qdrant: {} entities, {} relationships (touched only; graph unchanged in size)",
+                e, r
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                touched_entities = entity_count,
+                touched_relationships = rel_count,
+                "graph persistence failed; in-memory append is still good but won't survive restart"
+            ),
+        }
     }
+
+    let processing_time = start.elapsed().as_millis() as u64;
+
+    *state.graph_built.write().await = true;
+    *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
+    // Mirror processed_chunks count into AppState for /health
+    // and /embeddings/stats consumers.
+    state
+        .processed_chunk_count
+        .store(processed_chunks_after, std::sync::atomic::Ordering::SeqCst);
+
+    tracing::info!(
+        "extend_graph: {} delta chunks, +{} entities, +{} rels, {} mentions merged, {} touched-entities, {} touched-rels ({}ms; graph: {} entities, {} rels)",
+        summary.chunks_processed,
+        summary.new_entities,
+        summary.new_relationships,
+        summary.mentions_merged,
+        summary.touched_entity_ids.len(),
+        summary.touched_relationship_keys.len(),
+        processing_time,
+        summary.total_entities,
+        summary.total_relationships,
+    );
+
+    Ok(BuildGraphResponse {
+        success: true,
+        document_count: summary.chunks_processed,
+        processing_time_ms: processing_time,
+        message: format!(
+            "Appended {} new chunks: +{} entities, +{} relationships, {} mentions merged ({} entities, {} relationships total)",
+            summary.chunks_processed,
+            summary.new_entities,
+            summary.new_relationships,
+            summary.mentions_merged,
+            summary.total_entities,
+            summary.total_relationships,
+        ),
+        backend: "graphrag-pipeline".to_string(),
+    })
 }
 
 /// Get graph statistics

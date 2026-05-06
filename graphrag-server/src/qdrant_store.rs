@@ -138,6 +138,47 @@ pub struct DocumentMetadata {
     /// implicitly current (so legacy ingests keep showing up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_current: Option<bool>,
+
+    // ── Block-level / source provenance fields (Phase B) ──
+    //
+    // These travel with chunks emitted by block-aware ingest. Older
+    // payloads without them load as None and the legacy doc-level
+    // path keeps working unchanged.
+
+    /// Source URI for provenance. `file://...` for path-based ingest,
+    /// `obsidian://vault/<vault>/<path>` from the Obsidian gateway,
+    /// `https://...` / `arxiv:...` for inline ingest with caller-
+    /// supplied source. Required for `content`-form ingest now;
+    /// optional on read for back-compat with pre-source payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// Stable id within the source doc. For Obsidian-originated
+    /// content this is `<heading-path>::<index>` or `^block-id`.
+    /// Used to scope the (user_id, block_id) supersede tuple so a
+    /// single-paragraph edit only invalidates one chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+
+    /// sha256 of the block's normalized content. Used by the plugin
+    /// (not the server) for diff; persisted so the server can
+    /// optionally diff later for non-plugin clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
+
+    /// Heading hierarchy ancestors, root → leaf. Joined into the
+    /// embedding's contextual prefix at chunk-pack time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heading_path: Vec<String>,
+
+    /// 1-indexed inclusive line range in the source file as ingested.
+    /// Snapshot at ingest time — may drift if the file changed since.
+    /// Agent should treat as a navigation hint, not a stable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+
     #[serde(flatten)]
     pub custom: HashMap<String, serde_json::Value>,
 }
@@ -496,6 +537,33 @@ impl QdrantStore {
     /// we flip the flag on the previous current chunks so retrieval's
     /// default `is_current = true` filter starts skipping them.
     ///
+    /// Mark a SPECIFIC (user_id, block_id) tuple as superseded. Used
+    /// by block-aware ingest: when a single block changes, only
+    /// chunks tagged with that block_id flip to is_current=false,
+    /// preserving sibling blocks of the same doc as current. The
+    /// `removed_block_ids` path uses this with each removed id.
+    pub async fn mark_block_superseded(
+        &self,
+        user_id: &str,
+        block_id: &str,
+    ) -> Result<(), QdrantError> {
+        let filter = Filter::must([
+            Condition::matches("user_id", user_id.to_string()),
+            Condition::matches("block_id", block_id.to_string()),
+            Condition::matches("is_current", true),
+        ]);
+        let mut payload: HashMap<String, QdrantValue> = HashMap::new();
+        payload.insert("is_current".to_string(), QdrantValue::from(false));
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(&self.collection_name, payload)
+                    .points_selector(PointsSelectorOneOf::Filter(filter)),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Idempotent: calling on a user_id with no current chunks is a
     /// no-op (Qdrant set_payload with an empty match-set returns
     /// success without writing).
@@ -922,6 +990,87 @@ impl QdrantStore {
         dimension: u64,
     ) -> Result<(usize, usize), QdrantError> {
         self.clear_graph_collections(dimension).await?;
+
+        if !entity_payloads.is_empty() {
+            let points: Vec<PointStruct> = entity_payloads
+                .iter()
+                .map(|(e, embedding)| {
+                    let pid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, e.id.as_bytes())
+                        .to_string();
+                    let payload_value = serde_json::to_value(e).unwrap_or(serde_json::json!({}));
+                    let payload_map: HashMap<String, QdrantValue> = payload_value
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| (k, QdrantValue::from(v)))
+                        .collect();
+                    PointStruct::new(pid, embedding.clone(), payload_map)
+                })
+                .collect();
+            self.client
+                .upsert_points(UpsertPointsBuilder::new(self.entities_collection(), points))
+                .await
+                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        }
+
+        if !relationship_payloads.is_empty() {
+            let points: Vec<PointStruct> = relationship_payloads
+                .iter()
+                .map(|(r, embedding)| {
+                    let stable = format!("{}|{}|{}", r.source, r.relation_type, r.target);
+                    let pid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, stable.as_bytes())
+                        .to_string();
+                    let payload_value = serde_json::to_value(r).unwrap_or(serde_json::json!({}));
+                    let payload_map: HashMap<String, QdrantValue> = payload_value
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| (k, QdrantValue::from(v)))
+                        .collect();
+                    PointStruct::new(pid, embedding.clone(), payload_map)
+                })
+                .collect();
+            self.client
+                .upsert_points(UpsertPointsBuilder::new(
+                    self.relationships_collection(),
+                    points,
+                ))
+                .await
+                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        }
+
+        Ok((entity_payloads.len(), relationship_payloads.len()))
+    }
+
+    /// Incremental upsert into the entities + relationships sidecar
+    /// collections. Mirrors `persist_graph` but **without** clearing
+    /// the collection first — only the supplied (entity, embedding) /
+    /// (relationship, embedding) tuples are written, with the same
+    /// deterministic UUID5 ids used by `persist_graph` so they overwrite
+    /// the prior versions in place.
+    ///
+    /// Used by the LightRAG-parity append path: extend_graph emits the
+    /// touched-only delta, the persistence layer embeds + upserts only
+    /// those rows. A 1-chunk append touching 12 entities writes 12
+    /// points instead of re-embedding all 1985.
+    ///
+    /// Idempotent: calling with empty payloads is a no-op (returns
+    /// (0,0)), so this is safe to invoke unconditionally from the
+    /// append handler.
+    pub async fn persist_graph_delta(
+        &self,
+        entity_payloads: Vec<(PersistedEntity, Vec<f32>)>,
+        relationship_payloads: Vec<(PersistedRelationship, Vec<f32>)>,
+        dimension: u64,
+    ) -> Result<(usize, usize), QdrantError> {
+        // Make sure the sidecar collections exist at the right
+        // dimension. ensure_graph_collections is a no-op if they
+        // already exist; first-call-after-server-restart creates
+        // them at the supplied dim. Re-using the same helper as
+        // persist_graph for one source of truth.
+        self.ensure_graph_collections(dimension).await?;
 
         if !entity_payloads.is_empty() {
             let points: Vec<PointStruct> = entity_payloads

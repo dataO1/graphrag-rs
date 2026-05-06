@@ -144,6 +144,32 @@ pub struct QueryResult {
 
     /// Text excerpt from the document
     pub excerpt: String,
+
+    // ── Phase B: provenance + position fields ──
+    /// Source URI the chunk was ingested from. `file://...` or
+    /// `obsidian://vault/<vault>/<note>` etc. Lets the agent open
+    /// the original.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// 1-indexed inclusive `[lineStart, lineEnd]` in the source file.
+    /// Snapshot at ingest time — may have drifted if the file changed
+    /// since. Use as a navigation hint, not a stable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
+
+    /// Heading hierarchy ancestors, root → leaf. Empty for blocks
+    /// outside any heading (or pre-block-form ingests).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub heading_path: Vec<String>,
+
+    /// Stable block id within the source doc (heading-path::idx or
+    /// `^block-id`). Lets the agent supersede / forget at block
+    /// granularity if it ever needs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
 }
 
 fn example_similarity() -> f32 {
@@ -309,6 +335,57 @@ pub struct AddDocumentRequest {
     /// server uses the first entry of `INGEST_ALLOWED_ROOTS`.
     #[serde(default)]
     pub glob_root: Option<String>,
+
+    // ── Phase B: source + block-aware ingest ──
+
+    /// Source URI for provenance. REQUIRED for `content`-form ingest.
+    /// For `path`/`paths`/`pathsGlob` form, the server auto-derives
+    /// `file://<absolute-path>` per file. The Obsidian gateway sets
+    /// `obsidian://vault/<vault>/<note-path>` to pin doc identity.
+    #[serde(default)]
+    pub source: Option<String>,
+
+    /// Block-aware ingest: incoming changed blocks. When this list
+    /// is present and non-empty, the server treats the request as a
+    /// surgical update — it supersedes only the chunks whose
+    /// (user_id, block_id) tuples match `blocks[].id` (or appear in
+    /// `removedBlockIds`), and embeds new chunks one-per-block with
+    /// the supplied line range and heading path. When omitted, the
+    /// server falls back to legacy whole-doc embedding (one point
+    /// for the entire content).
+    #[serde(default)]
+    pub blocks: Option<Vec<BlockInput>>,
+
+    /// Block ids that the caller (the plugin) tracked previously
+    /// but are no longer present in the file. These get superseded
+    /// without a replacement chunk.
+    #[serde(default)]
+    pub removed_block_ids: Option<Vec<String>>,
+
+    /// sha256 of the full file content as the plugin saw it. Stored
+    /// alongside doc-level metadata for cheap "did the file actually
+    /// change at all" checks on subsequent ingests.
+    #[serde(default)]
+    pub file_hash: Option<String>,
+}
+
+/// One block payload entry from the plugin. The plugin computes
+/// `id` (heading-path::idx or `^block-id`), the sha256 `hash`, and
+/// the 1-indexed `lineStart`/`lineEnd` from the source file. Heading
+/// path is the chain of ATX-header titles from root to the block's
+/// containing section.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiComponent)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockInput {
+    pub id: String,
+    pub content: String,
+    pub hash: String,
+    #[serde(default)]
+    pub line_start: Option<u32>,
+    #[serde(default)]
+    pub line_end: Option<u32>,
+    #[serde(default)]
+    pub heading_path: Vec<String>,
 }
 
 /// Document metadata (for listing)

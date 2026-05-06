@@ -312,11 +312,41 @@ pub struct GraphRAG {
 /// Internal accumulator for `extend_graph`'s per-chunk pass. Tracks
 /// what changed so the public `ExtendSummary` can report deltas
 /// rather than raw graph totals.
+///
+/// `touched_entities` / `touched_relationships` collect the
+/// invalidation set for the persistence layer: every entity id that
+/// was newly inserted OR had its mentions extended in this pass, and
+/// every (source, relation_type, target) tuple newly added. The
+/// persistence layer then embeds + upserts ONLY these (LightRAG
+/// `merge_nodes_and_edges` parity), instead of walking all
+/// 1985 entities in the graph each cycle.
+///
+/// `LinkedHashSet`-style behavior is achieved via Vec + a parallel
+/// HashSet for dedup: insertion order preserved so the persist
+/// progress bar makes sense, dedup is O(1).
 #[derive(Default)]
 struct ExtractMetrics {
     new_entities: usize,
     new_relationships: usize,
     mentions_merged: usize,
+    touched_entity_ids: Vec<String>,
+    touched_entity_seen: std::collections::HashSet<String>,
+    touched_relationship_keys: Vec<(String, String, String)>,
+    touched_relationship_seen: std::collections::HashSet<(String, String, String)>,
+}
+
+impl ExtractMetrics {
+    fn touch_entity(&mut self, id: &str) {
+        if self.touched_entity_seen.insert(id.to_string()) {
+            self.touched_entity_ids.push(id.to_string());
+        }
+    }
+    fn touch_relationship(&mut self, source: &str, relation_type: &str, target: &str) {
+        let key = (source.to_string(), relation_type.to_string(), target.to_string());
+        if self.touched_relationship_seen.insert(key.clone()) {
+            self.touched_relationship_keys.push(key);
+        }
+    }
 }
 
 /// LightRAG-style dual-level query keywords.
@@ -389,6 +419,17 @@ pub struct ExtendSummary {
     /// Graph totals after the extend pass.
     pub total_entities: usize,
     pub total_relationships: usize,
+    /// Entity ids touched by this pass — both genuinely new and
+    /// existing-but-re-mentioned. Persistence layer uses this to
+    /// embed + upsert ONLY these (not the whole graph), mirroring
+    /// LightRAG's `merge_nodes_and_edges` scope. Stored as the
+    /// underlying string id so callers don't need to re-import
+    /// `EntityId`. Order: insertion (de-duped).
+    pub touched_entity_ids: Vec<String>,
+    /// Relationship keys touched by this pass: `(source_id,
+    /// relation_type, target_id)`. Used to embed + upsert only the
+    /// affected rows in the relationships sidecar.
+    pub touched_relationship_keys: Vec<(String, String, String)>,
 }
 
 impl GraphRAG {
@@ -1365,6 +1406,8 @@ impl GraphRAG {
                 mentions_merged: 0,
                 total_entities: total_entities_before,
                 total_relationships: total_relationships_before,
+                touched_entity_ids: Vec::new(),
+                touched_relationship_keys: Vec::new(),
             });
         }
 
@@ -1439,6 +1482,8 @@ impl GraphRAG {
             mentions_merged: metrics.mentions_merged,
             total_entities,
             total_relationships,
+            touched_entity_ids: metrics.touched_entity_ids,
+            touched_relationship_keys: metrics.touched_relationship_keys,
         })
     }
 
@@ -2037,11 +2082,21 @@ impl GraphRAG {
         } else {
             0
         };
+        let id_str = id.0.clone();
         graph.add_entity(new_entity)?;
         if was_existing {
             metrics.mentions_merged += mentions_to_merge;
+            // Existing-but-re-mentioned entity: still touched; persist
+            // layer needs to refresh its embedding + mentions payload.
+            // Skip the touch when zero new mentions actually merged
+            // (re-extraction over the same chunk would otherwise mark
+            // every existing entity touched on every pass).
+            if mentions_to_merge > 0 {
+                metrics.touch_entity(&id_str);
+            }
         } else {
             metrics.new_entities += 1;
+            metrics.touch_entity(&id_str);
         }
         Ok(())
     }
@@ -2063,8 +2118,12 @@ impl GraphRAG {
                 && r.target == relationship.target
                 && r.relation_type == relationship.relation_type
         });
+        let src = relationship.source.0.clone();
+        let tgt = relationship.target.0.clone();
+        let rel_type = relationship.relation_type.clone();
         if graph.add_relationship(relationship).is_ok() && !was_existing {
             metrics.new_relationships += 1;
+            metrics.touch_relationship(&src, &rel_type, &tgt);
         }
         // add_relationship error (missing endpoint) is intentionally
         // ignored — see method docs.

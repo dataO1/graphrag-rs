@@ -186,6 +186,183 @@ pub async fn persist_in_memory_graph(
         .await
 }
 
+/// Snapshot of the touched entities + relationships pulled from the
+/// in-memory graph under-lock. Owned data so the caller can drop the
+/// `RwLock` *before* embedding + persisting, leaving recall
+/// uncontended. Mirrors LightRAG `merge_nodes_and_edges`'s practice
+/// of only operating on the new chunk_results set.
+#[cfg(feature = "qdrant")]
+pub struct TouchedSnapshot {
+    /// (Entity, embedding-text). Embedding-text is the same
+    /// `"name (entity_type)"` string as the full-graph persist path,
+    /// pre-computed under-lock so we don't need to peek at the entity
+    /// again outside the lock.
+    pub entities: Vec<(graphrag_core::core::Entity, String)>,
+    /// (Relationship, embedding-text). Embedding-text is
+    /// `"src_name relation_type tgt_name"` resolved under-lock against
+    /// the live entity table — names are picked up at snapshot time so
+    /// later concurrent appends can't change them out from under us.
+    pub relationships: Vec<(graphrag_core::core::Relationship, String)>,
+}
+
+/// Snapshot the touched entities + relationships from the in-memory
+/// graph. Call this WHILE holding the GraphRAG write-lock (since
+/// extend_graph just released its mutating hold but the graph itself
+/// is still under guard); then drop the lock, then call
+/// `persist_touched_snapshot` on the returned data.
+#[cfg(feature = "qdrant")]
+pub fn snapshot_touched(
+    graphrag: &graphrag_core::GraphRAG,
+    touched_entity_ids: &[String],
+    touched_relationship_keys: &[(String, String, String)],
+) -> TouchedSnapshot {
+    use graphrag_core::core::EntityId;
+    let Some(kg) = graphrag.knowledge_graph() else {
+        return TouchedSnapshot {
+            entities: Vec::new(),
+            relationships: Vec::new(),
+        };
+    };
+
+    let entities: Vec<(graphrag_core::core::Entity, String)> = touched_entity_ids
+        .iter()
+        .filter_map(|id_str| {
+            let eid = EntityId(id_str.clone());
+            kg.get_entity(&eid).map(|e| {
+                let text = format!("{} ({})", e.name, e.entity_type);
+                (e.clone(), text)
+            })
+        })
+        .collect();
+
+    let relationships: Vec<(graphrag_core::core::Relationship, String)> = touched_relationship_keys
+        .iter()
+        .filter_map(|(src, rel_type, tgt)| {
+            let src_eid = EntityId(src.clone());
+            let tgt_eid = EntityId(tgt.clone());
+            // Find the actual relationship instance in the graph
+            // (we have its key, not the full record).
+            let rel = kg
+                .relationships()
+                .find(|r| r.source == src_eid && r.target == tgt_eid && r.relation_type == *rel_type)
+                .cloned()?;
+            let src_name = kg
+                .get_entity(&src_eid)
+                .map(|e| e.name.as_str())
+                .unwrap_or("?");
+            let tgt_name = kg
+                .get_entity(&tgt_eid)
+                .map(|e| e.name.as_str())
+                .unwrap_or("?");
+            let text = format!("{} {} {}", src_name, rel_type, tgt_name);
+            Some((rel, text))
+        })
+        .collect();
+
+    TouchedSnapshot { entities, relationships }
+}
+
+/// Embed + persist the touched delta. Lock-free — no reference to
+/// `GraphRAG` is needed; the snapshot is owned data. Call this AFTER
+/// dropping the GraphRAG write-lock so concurrent recall isn't
+/// blocked during embedding (which can take minutes for hundreds of
+/// items via OVMS).
+///
+/// Returns `(entities_persisted, relationships_persisted)`. Empty
+/// snapshot is a no-op (returns (0,0)).
+#[cfg(feature = "qdrant")]
+pub async fn persist_touched_snapshot(
+    snapshot: TouchedSnapshot,
+    qdrant: &QdrantStore,
+    embeddings: &crate::embeddings::EmbeddingService,
+) -> Result<(usize, usize), QdrantError> {
+    let dim = embeddings.dimension() as u64;
+
+    // ---- Entities: re-use cached embedding when present, embed only the rest ----
+    let (texts_to_embed, indices_to_embed): (Vec<String>, Vec<usize>) = snapshot
+        .entities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (e, t))| {
+            if e.embedding.is_some() {
+                None
+            } else {
+                Some((t.clone(), i))
+            }
+        })
+        .unzip();
+
+    let mut entity_embeddings: Vec<Option<Vec<f32>>> =
+        snapshot.entities.iter().map(|(e, _)| e.embedding.clone()).collect();
+
+    if !texts_to_embed.is_empty() {
+        let refs: Vec<&str> = texts_to_embed.iter().map(String::as_str).collect();
+        let computed = embeddings
+            .generate(&refs)
+            .await
+            .map_err(|e| QdrantError::OperationError(format!("delta entity embed failed: {}", e)))?;
+        for (i, vec) in indices_to_embed.iter().zip(computed) {
+            entity_embeddings[*i] = Some(vec);
+        }
+    }
+
+    let entity_payloads_with_vec: Vec<(PersistedEntity, Vec<f32>)> = snapshot
+        .entities
+        .iter()
+        .zip(entity_embeddings.iter())
+        .map(|((e, _), emb)| {
+            let vec = emb.clone().unwrap_or_else(|| vec![0.0_f32; dim as usize]);
+            (entity_to_persisted(e), vec)
+        })
+        .collect();
+
+    // ---- Relationships: relationships don't carry cached embeddings today,
+    //      so always batch-embed all of them. The set is small (the touched
+    //      delta), so this stays cheap. ----
+    let (rel_texts_to_embed, rel_indices_to_embed): (Vec<String>, Vec<usize>) = snapshot
+        .relationships
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (r, t))| {
+            if r.embedding.is_some() {
+                None
+            } else {
+                Some((t.clone(), i))
+            }
+        })
+        .unzip();
+
+    let mut rel_embeddings: Vec<Option<Vec<f32>>> = snapshot
+        .relationships
+        .iter()
+        .map(|(r, _)| r.embedding.clone())
+        .collect();
+
+    if !rel_texts_to_embed.is_empty() {
+        let refs: Vec<&str> = rel_texts_to_embed.iter().map(String::as_str).collect();
+        let computed = embeddings.generate(&refs).await.map_err(|e| {
+            QdrantError::OperationError(format!("delta relationship embed failed: {}", e))
+        })?;
+        for (i, vec) in rel_indices_to_embed.iter().zip(computed) {
+            rel_embeddings[*i] = Some(vec);
+        }
+    }
+
+    let rel_payloads_with_vec: Vec<(PersistedRelationship, Vec<f32>)> = snapshot
+        .relationships
+        .iter()
+        .zip(rel_embeddings.iter())
+        .map(|((r, _), emb)| {
+            let vec = emb.clone().unwrap_or_else(|| vec![0.0_f32; dim as usize]);
+            (relationship_to_persisted(r), vec)
+        })
+        .collect();
+
+    qdrant
+        .persist_graph_delta(entity_payloads_with_vec, rel_payloads_with_vec, dim)
+        .await
+}
+
 /// Hydrate the in-memory KnowledgeGraph from Qdrant's persisted entities
 /// + relationships. Order matters: entities go in first so each
 /// relationship's `add_relationship` call finds its source/target.
