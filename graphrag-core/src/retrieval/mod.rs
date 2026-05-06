@@ -677,7 +677,7 @@ impl RetrievalSystem {
 
     /// Advanced hybrid query with strategy selection and hierarchical integration
     pub async fn hybrid_query(
-        &mut self,
+        &self,
         query: &str,
         graph: &KnowledgeGraph,
     ) -> Result<Vec<SearchResult>> {
@@ -687,7 +687,7 @@ impl RetrievalSystem {
 
     /// Hybrid query with access to document trees for hierarchical retrieval
     pub async fn hybrid_query_with_trees(
-        &mut self,
+        &self,
         query: &str,
         graph: &KnowledgeGraph,
         document_trees: &HashMap<crate::core::DocumentId, DocumentTree>,
@@ -717,7 +717,7 @@ impl RetrievalSystem {
 
     /// Query the system using hybrid retrieval (vector + graph) - legacy method
     pub async fn legacy_hybrid_query(
-        &mut self,
+        &self,
         query: &str,
         graph: &KnowledgeGraph,
     ) -> Result<Vec<SearchResult>> {
@@ -847,7 +847,7 @@ impl RetrievalSystem {
     /// Parallel batch query processing with optimized workload distribution
     /// Batch process multiple queries efficiently
     pub async fn batch_query(
-        &mut self,
+        &self,
         queries: &[&str],
         graph: &KnowledgeGraph,
     ) -> Result<Vec<Vec<SearchResult>>> {
@@ -994,7 +994,7 @@ impl RetrievalSystem {
 
     /// Execute adaptive retrieval based on query analysis
     pub async fn execute_adaptive_retrieval(
-        &mut self,
+        &self,
         query: &str,
         query_embedding: &[f32],
         graph: &KnowledgeGraph,

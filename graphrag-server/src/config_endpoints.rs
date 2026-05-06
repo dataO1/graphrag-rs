@@ -306,6 +306,23 @@ pub async fn set_config(
         }
     }
 
+    // Layer 3 invariant: warm chunk + entity embeddings on the
+    // in-memory graph BEFORE the recall path can see this graphrag
+    // instance. Recall takes a read-lock and refuses to embed
+    // lazily; the work has to be done while we still own the
+    // mutable handle here. Best-effort — a transient embedding
+    // failure logs and continues; missing embeddings just degrade
+    // recall quality (entity vector search returns fewer hits)
+    // without breaking it.
+    if let Err(e) = graphrag.warm_up_embeddings().await {
+        tracing::warn!(
+            error = %e,
+            "warm_up_embeddings during hydrate failed; recall quality may be degraded until next build_graph"
+        );
+    } else {
+        tracing::info!("🔥 Embedding warm-up complete — recall ready");
+    }
+
     // Store the initialized GraphRAG
     *state.graphrag.write().await = Some(graphrag);
 

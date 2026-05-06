@@ -2203,16 +2203,26 @@ impl GraphRAG {
 
     /// Query the system associated with reasoning (Query Decomposition)
     /// This splits the query into sub-queries, gathers context for all of them, and synthesizes an answer.
+    ///
+    /// `&self` to allow concurrent recalls behind a `RwLock::read()`.
+    /// Caller must have run `warm_up_embeddings()` after the most
+    /// recent `build_graph`/`extend_graph`; recall does not mutate.
     #[cfg(feature = "async")]
-    pub async fn ask_with_reasoning(&mut self, query: &str) -> Result<String> {
+    pub async fn ask_with_reasoning(&self, query: &str) -> Result<String> {
         // If planner is not available, fallback to standard ask
         if self.query_planner.is_none() {
             return self.ask(query).await;
         }
 
-        self.ensure_initialized()?;
+        if !self.is_initialized() {
+            return Err(GraphRAGError::Config {
+                message: "GraphRAG not initialized; call build_graph first".into(),
+            });
+        }
         if self.has_documents() && !self.has_graph() {
-            self.build_graph().await?;
+            return Err(GraphRAGError::Config {
+                message: "Graph not built yet; call build_graph or extend_graph before recall".into(),
+            });
         }
 
         let planner = self.query_planner.as_ref().unwrap();
@@ -2323,13 +2333,24 @@ impl GraphRAG {
         Ok(formatted.join("\n"))
     }
 
-    /// Query the system for relevant information
+    /// Query the system for relevant information.
+    ///
+    /// `&self` so multiple recalls can run concurrently behind a
+    /// `RwLock::read()`. Embeddings are NOT populated lazily here —
+    /// caller must invoke `warm_up_embeddings()` after every graph-
+    /// mutating operation (build_graph / extend_graph / hydrate).
+    /// Returns Config error if the graph isn't ready.
     #[cfg(feature = "async")]
-    pub async fn ask(&mut self, query: &str) -> Result<String> {
-        self.ensure_initialized()?;
-
+    pub async fn ask(&self, query: &str) -> Result<String> {
+        if !self.is_initialized() {
+            return Err(GraphRAGError::Config {
+                message: "GraphRAG not initialized; call build_graph first".into(),
+            });
+        }
         if self.has_documents() && !self.has_graph() {
-            self.build_graph().await?;
+            return Err(GraphRAGError::Config {
+                message: "Graph not built yet; call build_graph or extend_graph before recall".into(),
+            });
         }
 
         // Get full search results with metadata
@@ -2394,11 +2415,16 @@ impl GraphRAG {
     /// # }
     /// ```
     #[cfg(feature = "async")]
-    pub async fn ask_explained(&mut self, query: &str) -> Result<retrieval::ExplainedAnswer> {
-        self.ensure_initialized()?;
-
+    pub async fn ask_explained(&self, query: &str) -> Result<retrieval::ExplainedAnswer> {
+        if !self.is_initialized() {
+            return Err(GraphRAGError::Config {
+                message: "GraphRAG not initialized; call build_graph first".into(),
+            });
+        }
         if self.has_documents() && !self.has_graph() {
-            self.build_graph().await?;
+            return Err(GraphRAGError::Config {
+                message: "Graph not built yet; call build_graph or extend_graph before recall".into(),
+            });
         }
 
         // Get search results
@@ -3119,30 +3145,57 @@ impl GraphRAG {
         Ok(result_strings)
     }
 
-    /// Internal query method that returns full SearchResult objects
+    /// Internal query method that returns full SearchResult objects.
+    ///
+    /// Recall is **read-only**: chunk and entity embeddings must be
+    /// populated on the in-memory graph BEFORE this is called. The
+    /// caller is responsible for invoking `warm_up_embeddings()` once
+    /// after `build_graph` / `extend_graph` (or after hydrating the
+    /// in-memory graph from external persistence). This lets recalls
+    /// run concurrently behind a `RwLock::read()` instead of
+    /// serializing through `&mut self`.
     async fn query_internal_with_results(
-        &mut self,
+        &self,
         query: &str,
     ) -> Result<Vec<retrieval::SearchResult>> {
         let retrieval = self
             .retrieval_system
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| GraphRAGError::Config {
                 message: "Retrieval system not initialized".to_string(),
             })?;
 
         let graph = self
             .knowledge_graph
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| GraphRAGError::Config {
                 message: "Knowledge graph not initialized".to_string(),
             })?;
 
-        // Add embeddings to graph if not already present
-        retrieval.add_embeddings_to_graph(graph).await?;
-
-        // Use hybrid query for real semantic search
         retrieval.hybrid_query(query, graph).await
+    }
+
+    /// Populate chunk and entity embeddings on the in-memory graph.
+    /// Idempotent — items that already have an embedding are skipped.
+    /// Call once after `build_graph`, `extend_graph`, or any external
+    /// hydrate that adds chunks/entities without embeddings. Required
+    /// before recall can run, because recall takes `&self` and won't
+    /// mutate the graph.
+    #[cfg(feature = "async")]
+    pub async fn warm_up_embeddings(&mut self) -> Result<()> {
+        let retrieval = self
+            .retrieval_system
+            .as_mut()
+            .ok_or_else(|| GraphRAGError::Config {
+                message: "Retrieval system not initialized".to_string(),
+            })?;
+        let graph = self
+            .knowledge_graph
+            .as_mut()
+            .ok_or_else(|| GraphRAGError::Config {
+                message: "Knowledge graph not initialized".to_string(),
+            })?;
+        retrieval.add_embeddings_to_graph(graph).await
     }
 
     /// Generate semantic answer from SearchResult objects

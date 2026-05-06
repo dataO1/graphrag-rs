@@ -120,6 +120,20 @@ struct AppState {
     /// `debounce_secs` rather than up to 30 min.
     auto_append_notify: Arc<tokio::sync::Notify>,
 
+    /// Layer 3 — bounds the number of recalls in flight at once.
+    /// Sized from `RECALL_MAX_CONCURRENT` env (default 1). The
+    /// recall path acquires a permit and holds it for the duration
+    /// of the LLM round-trip; once released, the next queued recall
+    /// proceeds. With the read-lock + permit model in place,
+    /// throughput is bounded by the chat backend's concurrent-slot
+    /// count rather than by lock serialization.
+    ///
+    /// Why a separate semaphore vs just a tokio RwLock with N
+    /// readers? RwLock allows unlimited concurrent readers; we
+    /// explicitly want a backpressure cap so a fast client doesn't
+    /// queue 1,000 hybrid recalls and starve the chat backend.
+    recall_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Stale-context infrastructure (see graphrag-rs-nix/todo.md
     /// "Stale-context awareness for shared knowledge graph"):
     ///   - SQLite-backed event log + per-session lease table
@@ -260,6 +274,22 @@ impl AppState {
         let ingest_policy = IngestPolicy::from_env();
         let auto_append_notify = Arc::new(tokio::sync::Notify::new());
 
+        // Layer 3 recall concurrency. Default 1 (preserves pre-Layer-3
+        // behaviour: one recall in flight at a time). Operators bump
+        // this to match their chat backend's concurrent-slot count
+        // (e.g. vLLM `--max-num-seqs`, llama-server `--parallel`).
+        // Setting > 0 is required; 0 is rejected to avoid deadlocks.
+        let recall_max_concurrent: usize = std::env::var("RECALL_MAX_CONCURRENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or(1);
+        tracing::info!(
+            "🔒 recall concurrency budget: {}",
+            recall_max_concurrent
+        );
+        let recall_semaphore = Arc::new(tokio::sync::Semaphore::new(recall_max_concurrent));
+
         // Stale-context infrastructure: SQLite-backed event log +
         // tokio broadcast bus. Best-effort — if the SQLite file
         // can't be opened, the server still boots; the SSE/recall
@@ -351,6 +381,7 @@ impl AppState {
                         query_count: Arc::new(RwLock::new(0)),
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
+                        recall_semaphore: recall_semaphore.clone(),
                     }
                 },
                 Err(e) => {
@@ -377,6 +408,7 @@ impl AppState {
                         query_count: Arc::new(RwLock::new(0)),
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
+                        recall_semaphore: recall_semaphore.clone(),
                     }
                 },
             }
@@ -403,6 +435,7 @@ impl AppState {
                 query_count: Arc::new(RwLock::new(0)),
                 events_store: events_store.clone(),
                 event_bus: event_bus.clone(),
+                recall_semaphore: recall_semaphore.clone(),
             }
         }
     }
@@ -915,8 +948,20 @@ async fn graph_aware_query(
     // off the critical path (cheap SQLite write).
     record_session_leases(state, body.session_id.as_deref(), &vector_results).await;
 
-    let mut graphrag_guard = state.graphrag.write().await;
-    let graphrag = graphrag_guard.as_mut().ok_or_else(|| {
+    // Layer 3: recall is read-only on the in-memory graph. Concurrent
+    // recalls share the read-lock; only `extend_graph` / `build_graph`
+    // contend on the write-lock. Throughput is then bounded by the
+    // semaphore (= chat-backend's concurrent slot count) rather than
+    // by lock serialization.
+    let _recall_permit = state
+        .recall_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::InternalError(format!("recall semaphore closed: {e}")))?;
+
+    let graphrag_guard = state.graphrag.read().await;
+    let graphrag = graphrag_guard.as_ref().ok_or_else(|| {
         ApiError::BadRequest(
             "Mode requires a configured chat backend. POST /config with \
              openai.enabled=true or ollama.enabled=true first."
@@ -1470,7 +1515,10 @@ async fn ingest_blocks(
         }
 
         // Step 4: pipeline feed (whole-doc text). Keep entity extraction
-        // doc-level so cross-section relations stay visible.
+        // doc-level so cross-section relations stay visible. Warm
+        // chunk embeddings on the in-memory KG before releasing the
+        // write-lock — Layer 3 invariant: recall is read-only and
+        // refuses to embed lazily.
         {
             let mut g = state.graphrag.write().await;
             if let Some(ref mut graphrag) = *g {
@@ -1478,6 +1526,9 @@ async fn ingest_blocks(
                     tracing::warn!(error = %e, source = %source, "graphrag pipeline feed failed");
                 } else {
                     *state.graph_built.write().await = false;
+                    if let Err(e) = graphrag.warm_up_embeddings().await {
+                        tracing::warn!(error = %e, "warm_up_embeddings after ingest failed");
+                    }
                 }
             }
         }
@@ -1804,6 +1855,11 @@ async fn ingest_one_text(
                     );
                 } else {
                     *state.graph_built.write().await = false;
+                    // Layer 3: warm chunk embeddings before releasing
+                    // the write-lock so recall (read-only) sees them.
+                    if let Err(e) = graphrag.warm_up_embeddings().await {
+                        tracing::warn!(error = %e, "warm_up_embeddings after ingest failed");
+                    }
                 }
             }
         }
@@ -2507,6 +2563,14 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
             // Use actual pipeline to build graph
             match graphrag.build_graph().await {
                 Ok(_) => {
+                    // Layer 3 invariant: chunks/entities must have
+                    // embeddings on the in-memory graph BEFORE recall
+                    // can run. build_graph adds extracted entities
+                    // without embeddings; warm them now while we
+                    // still hold the write-lock.
+                    if let Err(e) = graphrag.warm_up_embeddings().await {
+                        tracing::warn!(error = %e, "warm_up_embeddings after build_graph failed");
+                    }
                     let (entities, relationships, chunk_count) = graphrag
                         .knowledge_graph()
                         .map(|kg| (
@@ -2771,6 +2835,16 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         let summary = graphrag.extend_graph().await.map_err(|e| {
             ApiError::InternalError(format!("Append failed: {}", e))
         })?;
+        // Layer 3 invariant: chunks/entities added by extend_graph
+        // must have embeddings populated on the in-memory graph
+        // BEFORE we drop the write-lock — recall path is read-only
+        // and will refuse to embed lazily. Skip when nothing
+        // happened.
+        if summary.chunks_processed > 0 || !summary.touched_entity_ids.is_empty() {
+            if let Err(e) = graphrag.warm_up_embeddings().await {
+                tracing::warn!(error = %e, "warm_up_embeddings after extend_graph failed");
+            }
+        }
         // Empty-delta fast path stays under-lock: no snapshot needed.
         if summary.chunks_processed == 0 {
             let processing_time = start.elapsed().as_millis() as u64;
