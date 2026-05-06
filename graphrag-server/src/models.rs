@@ -114,6 +114,17 @@ pub struct QueryRequest {
     /// 0 is treated as 1 to keep the default useful.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_versions_per_doc: Option<u32>,
+
+    /// Optional client-supplied session id (UUID-shaped string). When
+    /// set, the server adds each hit's (block_id, etag) to that
+    /// session's lease table — enabling the SSE event stream at
+    /// `GET /api/events/stream?session_id=…` to filter to the
+    /// blocks this session has actually retrieved. Stable across
+    /// CLI restarts (clients persist it in their session file).
+    /// Stale-context infrastructure must be enabled server-side
+    /// (otherwise this field is silently ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -170,6 +181,13 @@ pub struct QueryResult {
     /// granularity if it ever needs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_id: Option<String>,
+
+    /// Content-fingerprint version handle (= `block_hash`). Cheap
+    /// "is what I'm holding still current?" check via
+    /// `POST /api/recall/revalidate`. Same value that goes on the
+    /// SSE stream as the `oldEtag`/`newEtag` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
 }
 
 fn example_similarity() -> f32 {

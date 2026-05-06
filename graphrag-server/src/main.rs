@@ -70,6 +70,8 @@ use config_handler::ConfigManager;
 mod config_endpoints;
 
 mod ingest_policy;
+mod events_store;
+mod stale_context;
 use ingest_policy::{IngestPolicy, ResolvedPath};
 
 #[cfg(feature = "qdrant")]
@@ -117,6 +119,20 @@ struct AppState {
     /// append, single-doc ingests become graph-queryable in
     /// `debounce_secs` rather than up to 30 min.
     auto_append_notify: Arc<tokio::sync::Notify>,
+
+    /// Stale-context infrastructure (see graphrag-rs-nix/todo.md
+    /// "Stale-context awareness for shared knowledge graph"):
+    ///   - SQLite-backed event log + per-session lease table
+    ///   - Live tokio broadcast bus for SSE fan-out
+    /// Optional so deployments that don't enable the feature
+    /// (or fail to open the SQLite file) still boot — the recall +
+    /// ingest paths fall back to no-op when this is None.
+    events_store: Option<Arc<events_store::EventsStore>>,
+    /// Live event bus for SSE clients. Capacity 2048 — at 2 KB/event
+    /// that's ~4 MB worst-case in memory, comfortably bounded for
+    /// peak ingest bursts. Slow consumers see RecvError::Lagged and
+    /// reconnect with Last-Event-ID for clean recovery.
+    event_bus: Option<Arc<tokio::sync::broadcast::Sender<events_store::EventBody>>>,
 
     // Authentication state (optional)
     #[cfg(feature = "auth")]
@@ -244,6 +260,49 @@ impl AppState {
         let ingest_policy = IngestPolicy::from_env();
         let auto_append_notify = Arc::new(tokio::sync::Notify::new());
 
+        // Stale-context infrastructure: SQLite-backed event log +
+        // tokio broadcast bus. Best-effort — if the SQLite file
+        // can't be opened, the server still boots; the SSE/recall
+        // paths just no-op the event-emit side. STATE_DIR defaults
+        // to ${XDG_STATE_HOME:-$HOME/.local/state}/graphrag-rs (set
+        // by the home-manager module's StateDirectory).
+        let stale_context_enabled = std::env::var("STALE_CONTEXT_ENABLE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let (events_store, event_bus) = if stale_context_enabled {
+            let state_dir = std::env::var("STATE_DIR").ok().unwrap_or_else(|| {
+                let base = std::env::var("XDG_STATE_HOME").ok().unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                    format!("{home}/.local/state")
+                });
+                format!("{base}/graphrag-rs")
+            });
+            let db_path = format!("{state_dir}/state.sqlite");
+            match events_store::EventsStore::open(
+                &db_path,
+                events_store::Settings::from_env(),
+            )
+            .await
+            {
+                Ok(store) => {
+                    tracing::info!("📒 Stale-context events store opened at {}", db_path);
+                    let (tx, _rx) = tokio::sync::broadcast::channel::<events_store::EventBody>(2048);
+                    (Some(Arc::new(store)), Some(Arc::new(tx)))
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %db_path,
+                        "⚠️  Could not open events store; stale-context features disabled"
+                    );
+                    (None, None)
+                },
+            }
+        } else {
+            tracing::info!("📒 Stale-context events store disabled (STALE_CONTEXT_ENABLE=0)");
+            (None, None)
+        };
+
         #[cfg(feature = "qdrant")]
         {
             // Try to connect to Qdrant
@@ -290,6 +349,8 @@ impl AppState {
                         last_built_at: Arc::new(RwLock::new(None)),
                         processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         query_count: Arc::new(RwLock::new(0)),
+                        events_store: events_store.clone(),
+                        event_bus: event_bus.clone(),
                     }
                 },
                 Err(e) => {
@@ -314,6 +375,8 @@ impl AppState {
                         last_built_at: Arc::new(RwLock::new(None)),
                         processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         query_count: Arc::new(RwLock::new(0)),
+                        events_store: events_store.clone(),
+                        event_bus: event_bus.clone(),
                     }
                 },
             }
@@ -338,6 +401,8 @@ impl AppState {
                 last_built_at: Arc::new(RwLock::new(None)),
                 processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 query_count: Arc::new(RwLock::new(0)),
+                events_store: events_store.clone(),
+                event_bus: event_bus.clone(),
             }
         }
     }
@@ -677,9 +742,15 @@ async fn query(
                         line_start: r.metadata.line_start,
                         line_end: r.metadata.line_end,
                         heading_path: r.metadata.heading_path,
+                        etag: r.metadata.block_hash.clone(),
                         block_id: r.metadata.block_id,
                     })
                     .collect();
+
+                // Stale-context: record this session's lease entries
+                // (block_id + etag) so the SSE stream and lease/check
+                // can scope events to "blocks A actually retrieved".
+                record_session_leases(&state, body.session_id.as_deref(), &results).await;
 
                 let processing_time = start.elapsed().as_millis() as u64;
 
@@ -745,6 +816,7 @@ async fn query(
                 line_end: None,
                 heading_path: Vec::new(),
                 block_id: None,
+                etag: None,
             }
         })
         .filter(|r| r.similarity > 0.5)
@@ -809,6 +881,7 @@ async fn graph_aware_query(
                             line_start: r.metadata.line_start,
                             line_end: r.metadata.line_end,
                             heading_path: r.metadata.heading_path,
+                            etag: r.metadata.block_hash.clone(),
                             block_id: r.metadata.block_id,
                         })
                         .collect(),
@@ -824,6 +897,12 @@ async fn graph_aware_query(
             Vec::new()
         }
     };
+
+    // Stale-context: lease the vector hits for this session so the
+    // SSE stream can scope events. graphrag_aware_query may take
+    // longer than the search-only path, but the lease write is
+    // off the critical path (cheap SQLite write).
+    record_session_leases(state, body.session_id.as_deref(), &vector_results).await;
 
     let mut graphrag_guard = state.graphrag.write().await;
     let graphrag = graphrag_guard.as_mut().ok_or_else(|| {
@@ -1260,13 +1339,35 @@ async fn ingest_blocks(
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        // Step 1: supersede removed blocks.
+        // Step 1: supersede removed blocks. For each removed block,
+        // read the prior content first so the stale-context event
+        // can carry the deleted text for the agent to reason about
+        // ("the paragraph you cited has been removed").
         for bid in &removed_block_ids {
+            let prior = qdrant
+                .find_current_block(&user_id, bid)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("read prior {bid} failed: {e}")))?;
             qdrant
                 .mark_block_superseded(&user_id, bid)
                 .await
                 .map_err(|e| ApiError::InternalError(format!("supersede removed block {bid} failed: {e}")))?;
             superseded += 1;
+            if let Some(prior_md) = prior {
+                emit_stale_context_event(
+                    state,
+                    &timestamp,
+                    bid,
+                    &source,
+                    &user_id,
+                    events_store::ChangeType::Removed,
+                    prior_md.block_hash.as_deref(),
+                    None,
+                    Some(prior_md.text.as_str()),
+                    None,
+                )
+                .await;
+            }
         }
 
         // Step 2 + 3: for each changed block, supersede prior version,
@@ -1275,6 +1376,12 @@ async fn ingest_blocks(
         // a 200-block document during a bulk reindex; the user's 24 GB
         // VRAM laptop is the bottleneck here).
         for block in blocks {
+            // Read prior content (if any) before flipping is_current
+            // so we can emit a delta-bearing event.
+            let prior = qdrant
+                .find_current_block(&user_id, &block.id)
+                .await
+                .map_err(|e| ApiError::InternalError(format!("read prior {} failed: {e}", block.id)))?;
             qdrant
                 .mark_block_superseded(&user_id, &block.id)
                 .await
@@ -1323,6 +1430,32 @@ async fn ingest_blocks(
                 .await
                 .map_err(|e| ApiError::InternalError(format!("insert block {} failed: {e}", block.id)))?;
             added += 1;
+
+            // Emit stale-context event AFTER the new chunk lands so
+            // any client receiving the SSE notification can read the
+            // new content. Best-effort — failure here logs but does
+            // not abort the ingest.
+            let (change_type, old_etag, old_text) = match prior {
+                Some(p) => (
+                    events_store::ChangeType::Updated,
+                    p.block_hash,
+                    Some(p.text),
+                ),
+                None => (events_store::ChangeType::Added, None, None),
+            };
+            emit_stale_context_event(
+                state,
+                &timestamp,
+                &block.id,
+                &source,
+                &user_id,
+                change_type,
+                old_etag.as_deref(),
+                Some(block.hash.as_str()),
+                old_text.as_deref(),
+                Some(block.content.as_str()),
+            )
+            .await;
         }
 
         // Step 4: pipeline feed (whole-doc text). Keep entity extraction
@@ -1353,6 +1486,138 @@ async fn ingest_blocks(
     *state.graph_built.write().await = false;
     state.auto_append_notify.notify_one();
     Ok(BlockIngestOutcome { user_id, added: 1, superseded: 0 })
+}
+
+/// Record a session's lease entries on the server. Called after each
+/// recall when the client supplied a `session_id`; populates the
+/// SQLite lease table with `(block_id, etag, retrieved_at)` per hit.
+/// FIFO eviction past `maxLeasesPerSession` happens inside
+/// `EventsStore::add_leases`. Best-effort — failures log at warn,
+/// don't break the recall response.
+async fn record_session_leases(
+    state: &AppState,
+    session_id: Option<&str>,
+    results: &[crate::models::QueryResult],
+) {
+    let Some(session_id) = session_id else { return };
+    let Some(store) = state.events_store.as_ref() else { return };
+    let now = chrono::Utc::now().to_rfc3339();
+    let entries: Vec<events_store::LeaseEntry> = results
+        .iter()
+        .filter_map(|r| {
+            let block_id = r.block_id.as_ref()?.clone();
+            let etag = r.etag.as_ref()?.clone();
+            Some(events_store::LeaseEntry {
+                block_id,
+                etag,
+                retrieved_at: now.clone(),
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    if let Err(e) = store.add_leases(session_id.to_string(), entries).await {
+        tracing::warn!(error = %e, %session_id, "stale-context: lease write failed");
+    }
+}
+
+/// Persist + broadcast a stale-context event. No-op when the events
+/// store / broadcast bus aren't initialized (deployment without the
+/// stale-context layer enabled). All failures are logged at warn —
+/// never propagated — because event emit is best-effort and must
+/// not break ingest.
+#[allow(clippy::too_many_arguments)]
+async fn emit_stale_context_event(
+    state: &AppState,
+    ts: &str,
+    block_id: &str,
+    source: &str,
+    user_id: &str,
+    change_type: events_store::ChangeType,
+    old_etag: Option<&str>,
+    new_etag: Option<&str>,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+) {
+    let Some(store) = state.events_store.as_ref() else { return };
+    let bus = state.event_bus.clone();
+
+    // Cap excerpts; compute a unified diff for "updated" events so
+    // the agent can see exactly what changed inline.
+    let max_chars = store.settings().delta_excerpt_chars;
+    let trim = |s: &str| -> String {
+        if s.chars().count() <= max_chars {
+            s.to_string()
+        } else {
+            let mut acc = String::with_capacity(max_chars + 1);
+            for (i, c) in s.chars().enumerate() {
+                if i >= max_chars { break; }
+                acc.push(c);
+            }
+            acc.push('…');
+            acc
+        }
+    };
+    let old_excerpt = old_text.map(trim);
+    let new_excerpt = new_text.map(trim);
+    let unified_diff = match (old_text, new_text) {
+        (Some(o), Some(n)) => {
+            // similar's TextDiff handles multi-line input; small-block
+            // size means line-level granularity is plenty.
+            Some(
+                similar::TextDiff::from_lines(o, n)
+                    .unified_diff()
+                    .header("old", "new")
+                    .to_string(),
+            )
+        },
+        _ => None,
+    };
+    let delta = if old_excerpt.is_some() || new_excerpt.is_some() || unified_diff.is_some() {
+        Some(events_store::Delta {
+            old_excerpt,
+            new_excerpt,
+            unified_diff,
+        })
+    } else {
+        None
+    };
+
+    let pending = events_store::PendingEvent {
+        ts: ts.to_string(),
+        block_id: block_id.to_string(),
+        source: source.to_string(),
+        user_id: Some(user_id.to_string()),
+        change_type: change_type.clone(),
+        old_etag: old_etag.map(str::to_string),
+        new_etag: new_etag.map(str::to_string),
+        delta: delta.clone(),
+    };
+
+    let id = match store.append_event(pending).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, block_id, "stale-context: append_event failed");
+            return;
+        },
+    };
+    if let Some(bus) = bus {
+        let body = events_store::EventBody {
+            id,
+            ts: ts.to_string(),
+            block_id: block_id.to_string(),
+            source: source.to_string(),
+            user_id: Some(user_id.to_string()),
+            change_type,
+            old_etag: old_etag.map(str::to_string),
+            new_etag: new_etag.map(str::to_string),
+            delta,
+        };
+        // .send() returns Err only when there are zero subscribers —
+        // expected and harmless. Drop silently.
+        let _ = bus.send(body);
+    }
 }
 
 /// Build the embedding-time contextual prefix. Format:
@@ -2428,6 +2693,37 @@ async fn auto_append_loop(state: AppState, debounce: std::time::Duration) {
     }
 }
 
+/// Periodic cleanup of the stale-context state: drop events past
+/// the event retention window, sessions past the TTL, truncate the
+/// SQLite WAL so disk usage shrinks. Runs every `interval` for the
+/// lifetime of the process.
+async fn stale_context_cleanup_loop(state: AppState, interval: std::time::Duration) {
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "stale-context cleanup loop running"
+    );
+    let mut ticker = tokio::time::interval(interval);
+    // First tick fires immediately; skip it so we don't run on boot
+    // (the DB is fresh; nothing to clean) and instead run after the
+    // configured interval.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(store) = state.events_store.as_ref() else { return };
+        match store.cleanup().await {
+            Ok(report) => tracing::info!(
+                events_dropped = report.events_dropped,
+                leases_dropped = report.leases_dropped,
+                sessions_dropped = report.sessions_dropped,
+                events_remaining = report.events_remaining,
+                sessions_remaining = report.sessions_remaining,
+                "🧹 stale-context cleanup: pruned old events + sessions"
+            ),
+            Err(e) => tracing::warn!(error = %e, "stale-context cleanup failed; will retry"),
+        }
+    }
+}
+
 /// Inner extend-graph routine, shared by `POST /api/graph/append` and
 /// the in-server `auto_append_loop` coalescer. Same observable
 /// behavior as the HTTP handler — fast-paths on no-delta, persists
@@ -2759,6 +3055,29 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
+    // Stale-context cleanup loop. Runs every
+    // `STALE_CONTEXT_CLEANUP_INTERVAL_HOURS` (default 6) when the
+    // events store is enabled. No-op otherwise. Drops events older
+    // than `eventRetentionDays`, sessions older than
+    // `sessionTtlDays`, then truncates the WAL so disk usage
+    // actually shrinks.
+    if state.events_store.is_some() {
+        let cleanup_interval_hours: u64 = std::env::var("STALE_CONTEXT_CLEANUP_INTERVAL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        if cleanup_interval_hours > 0 {
+            tokio::spawn(stale_context_cleanup_loop(
+                state.clone(),
+                std::time::Duration::from_secs(cleanup_interval_hours * 3600),
+            ));
+        } else {
+            tracing::info!(
+                "stale-context cleanup loop disabled (STALE_CONTEXT_CLEANUP_INTERVAL_HOURS=0)"
+            );
+        }
+    }
+
     // Configure OpenAPI specification
     let spec = Spec {
         info: Info {
@@ -2905,6 +3224,26 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("/embeddings")
                     .route("/stats", web::get().to(embeddings_stats))
+            )
+            // Stale-context endpoints. Mounted at TOP-LEVEL (not
+            // under `/api`) for two compounding reasons: (1) apistos's
+            // `/api` scope is registered before `.build()` and would
+            // shadow any sub-route on plain actix scopes; (2) the SSE
+            // responder doesn't implement apistos's `PathItemDefinition`,
+            // so it can't go inside the typed scope. Same pattern as
+            // /config and /embeddings above.
+            .service(
+                web::scope("/recall")
+                    .route("/revalidate", web::post().to(stale_context::recall_revalidate))
+            )
+            .service(
+                web::scope("/lease")
+                    .route("/check", web::get().to(stale_context::lease_check))
+                    .route("/{session_id}", web::delete().to(stale_context::drop_session))
+            )
+            .service(
+                web::scope("/events")
+                    .route("/stream", web::get().to(stale_context::events_stream))
             )
     })
     .bind(&bind_addr)?

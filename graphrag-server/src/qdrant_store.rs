@@ -537,6 +537,78 @@ impl QdrantStore {
     /// we flip the flag on the previous current chunks so retrieval's
     /// default `is_current = true` filter starts skipping them.
     ///
+    /// Look up the current chunk for a (user_id, block_id) tuple.
+    /// Returns the stored DocumentMetadata if a live (is_current=true)
+    /// chunk exists, otherwise None. Used by the stale-context event
+    /// emit path so we can compute a delta between the prior
+    /// content and the incoming block before flipping is_current.
+    pub async fn find_current_block(
+        &self,
+        user_id: &str,
+        block_id: &str,
+    ) -> Result<Option<DocumentMetadata>, QdrantError> {
+        let filter = Filter::must([
+            Condition::matches("user_id", user_id.to_string()),
+            Condition::matches("block_id", block_id.to_string()),
+            Condition::matches("is_current", true),
+        ]);
+        let resp = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.collection_name)
+                    .filter(filter)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .limit(1u32),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let Some(point) = resp.result.into_iter().next() else {
+            return Ok(None);
+        };
+        let payload_value = serde_json::to_value(&point.payload)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let metadata: DocumentMetadata = serde_json::from_value(payload_value)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(Some(metadata))
+    }
+
+    /// Look up the current chunk for a block_id WITHOUT user_id
+    /// scoping. Used by the revalidate endpoint, which receives a
+    /// list of (block_id, etag) pairs without user_id (the agent
+    /// holds opaque tags from prior recalls; user_id would force
+    /// every client to track per-doc identity). Block ids are
+    /// already namespaced under their source's heading-path so
+    /// global uniqueness is OK in practice.
+    pub async fn find_current_block_global(
+        &self,
+        block_id: &str,
+    ) -> Result<Option<DocumentMetadata>, QdrantError> {
+        let filter = Filter::must([
+            Condition::matches("block_id", block_id.to_string()),
+            Condition::matches("is_current", true),
+        ]);
+        let resp = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.collection_name)
+                    .filter(filter)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .limit(1u32),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let Some(point) = resp.result.into_iter().next() else {
+            return Ok(None);
+        };
+        let payload_value = serde_json::to_value(&point.payload)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        let metadata: DocumentMetadata = serde_json::from_value(payload_value)
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(Some(metadata))
+    }
+
     /// Mark a SPECIFIC (user_id, block_id) tuple as superseded. Used
     /// by block-aware ingest: when a single block changes, only
     /// chunks tagged with that block_id flip to is_current=false,

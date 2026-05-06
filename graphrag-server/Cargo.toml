@@ -89,3 +89,23 @@ chrono = { workspace = true }
 # re-canonicalized and re-checked against `INGEST_ALLOWED_ROOTS` before
 # any byte is read, so glob expansion can never cross the sandbox.
 glob = "0.3"
+
+# Stale-context infrastructure (events sidecar + lease table + SSE).
+# tokio-rusqlite pins the rusqlite Connection to a dedicated worker
+# thread and exposes a `conn.call(|c| { ... })` async API — better fit
+# than sqlx for our shape (single-process, single-file, ~100MB cap,
+# embedded). Bundles SQLite via the `bundled` feature so we don't
+# need the system libsqlite3.
+tokio-rusqlite = { version = "0.6", features = ["bundled"] }
+# rusqlite is pulled in transitively by tokio-rusqlite; declare it
+# directly so we can name `rusqlite::Error`, `rusqlite::params_from_iter`,
+# etc. directly. `bundled` feature must match tokio-rusqlite's so we
+# only build SQLite once.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# SSE responder for actix-web 4. By Rob Ede (actix-web maintainer);
+# stable enough for production use, though pin the version because
+# 0.x breaking changes are possible per the crate README.
+actix-web-lab = "0.26"
+# Unified-diff generation for event-log delta payloads. Server-side
+# computes the diff at emit time, persists it; clients render it.
+similar = "2.7"
