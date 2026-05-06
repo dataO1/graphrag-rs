@@ -2205,8 +2205,6 @@ impl GraphRAG {
     /// This splits the query into sub-queries, gathers context for all of them, and synthesizes an answer.
     ///
     /// `&self` to allow concurrent recalls behind a `RwLock::read()`.
-    /// Caller must have run `warm_up_embeddings()` after the most
-    /// recent `build_graph`/`extend_graph`; recall does not mutate.
     #[cfg(feature = "async")]
     pub async fn ask_with_reasoning(&self, query: &str) -> Result<String> {
         // If planner is not available, fallback to standard ask
@@ -2336,10 +2334,7 @@ impl GraphRAG {
     /// Query the system for relevant information.
     ///
     /// `&self` so multiple recalls can run concurrently behind a
-    /// `RwLock::read()`. Embeddings are NOT populated lazily here —
-    /// caller must invoke `warm_up_embeddings()` after every graph-
-    /// mutating operation (build_graph / extend_graph / hydrate).
-    /// Returns Config error if the graph isn't ready.
+    /// `RwLock::read()`. Returns Config error if the graph isn't ready.
     #[cfg(feature = "async")]
     pub async fn ask(&self, query: &str) -> Result<String> {
         if !self.is_initialized() {
@@ -3115,28 +3110,23 @@ impl GraphRAG {
     }
 
     /// Internal query method (public for CLI access to raw results)
-    pub async fn query_internal(&mut self, query: &str) -> Result<Vec<String>> {
+    pub async fn query_internal(&self, query: &str) -> Result<Vec<String>> {
         let retrieval = self
             .retrieval_system
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| GraphRAGError::Config {
                 message: "Retrieval system not initialized".to_string(),
             })?;
 
         let graph = self
             .knowledge_graph
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| GraphRAGError::Config {
                 message: "Knowledge graph not initialized".to_string(),
             })?;
 
-        // Add embeddings to graph if not already present
-        retrieval.add_embeddings_to_graph(graph).await?;
-
-        // Use hybrid query for real semantic search
         let search_results = retrieval.hybrid_query(query, graph).await?;
 
-        // Convert search results to strings
         let result_strings: Vec<String> = search_results
             .into_iter()
             .map(|r| format!("{} (score: {:.2})", r.content, r.score))
@@ -3145,15 +3135,6 @@ impl GraphRAG {
         Ok(result_strings)
     }
 
-    /// Internal query method that returns full SearchResult objects.
-    ///
-    /// Recall is **read-only**: chunk and entity embeddings must be
-    /// populated on the in-memory graph BEFORE this is called. The
-    /// caller is responsible for invoking `warm_up_embeddings()` once
-    /// after `build_graph` / `extend_graph` (or after hydrating the
-    /// in-memory graph from external persistence). This lets recalls
-    /// run concurrently behind a `RwLock::read()` instead of
-    /// serializing through `&mut self`.
     async fn query_internal_with_results(
         &self,
         query: &str,
@@ -3173,29 +3154,6 @@ impl GraphRAG {
             })?;
 
         retrieval.hybrid_query(query, graph).await
-    }
-
-    /// Populate chunk and entity embeddings on the in-memory graph.
-    /// Idempotent — items that already have an embedding are skipped.
-    /// Call once after `build_graph`, `extend_graph`, or any external
-    /// hydrate that adds chunks/entities without embeddings. Required
-    /// before recall can run, because recall takes `&self` and won't
-    /// mutate the graph.
-    #[cfg(feature = "async")]
-    pub async fn warm_up_embeddings(&mut self) -> Result<()> {
-        let retrieval = self
-            .retrieval_system
-            .as_mut()
-            .ok_or_else(|| GraphRAGError::Config {
-                message: "Retrieval system not initialized".to_string(),
-            })?;
-        let graph = self
-            .knowledge_graph
-            .as_mut()
-            .ok_or_else(|| GraphRAGError::Config {
-                message: "Knowledge graph not initialized".to_string(),
-            })?;
-        retrieval.add_embeddings_to_graph(graph).await
     }
 
     /// Generate semantic answer from SearchResult objects

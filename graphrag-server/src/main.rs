@@ -1515,10 +1515,7 @@ async fn ingest_blocks(
         }
 
         // Step 4: pipeline feed (whole-doc text). Keep entity extraction
-        // doc-level so cross-section relations stay visible. Warm
-        // chunk embeddings on the in-memory KG before releasing the
-        // write-lock — Layer 3 invariant: recall is read-only and
-        // refuses to embed lazily.
+        // doc-level so cross-section relations stay visible.
         {
             let mut g = state.graphrag.write().await;
             if let Some(ref mut graphrag) = *g {
@@ -1526,9 +1523,6 @@ async fn ingest_blocks(
                     tracing::warn!(error = %e, source = %source, "graphrag pipeline feed failed");
                 } else {
                     *state.graph_built.write().await = false;
-                    if let Err(e) = graphrag.warm_up_embeddings().await {
-                        tracing::warn!(error = %e, "warm_up_embeddings after ingest failed");
-                    }
                 }
             }
         }
@@ -1855,11 +1849,6 @@ async fn ingest_one_text(
                     );
                 } else {
                     *state.graph_built.write().await = false;
-                    // Layer 3: warm chunk embeddings before releasing
-                    // the write-lock so recall (read-only) sees them.
-                    if let Err(e) = graphrag.warm_up_embeddings().await {
-                        tracing::warn!(error = %e, "warm_up_embeddings after ingest failed");
-                    }
                 }
             }
         }
@@ -2563,14 +2552,6 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
             // Use actual pipeline to build graph
             match graphrag.build_graph().await {
                 Ok(_) => {
-                    // Layer 3 invariant: chunks/entities must have
-                    // embeddings on the in-memory graph BEFORE recall
-                    // can run. build_graph adds extracted entities
-                    // without embeddings; warm them now while we
-                    // still hold the write-lock.
-                    if let Err(e) = graphrag.warm_up_embeddings().await {
-                        tracing::warn!(error = %e, "warm_up_embeddings after build_graph failed");
-                    }
                     let (entities, relationships, chunk_count) = graphrag
                         .knowledge_graph()
                         .map(|kg| (
@@ -2835,16 +2816,6 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         let summary = graphrag.extend_graph().await.map_err(|e| {
             ApiError::InternalError(format!("Append failed: {}", e))
         })?;
-        // Layer 3 invariant: chunks/entities added by extend_graph
-        // must have embeddings populated on the in-memory graph
-        // BEFORE we drop the write-lock — recall path is read-only
-        // and will refuse to embed lazily. Skip when nothing
-        // happened.
-        if summary.chunks_processed > 0 || !summary.touched_entity_ids.is_empty() {
-            if let Err(e) = graphrag.warm_up_embeddings().await {
-                tracing::warn!(error = %e, "warm_up_embeddings after extend_graph failed");
-            }
-        }
         // Empty-delta fast path stays under-lock: no snapshot needed.
         if summary.chunks_processed == 0 {
             let processing_time = start.elapsed().as_millis() as u64;
