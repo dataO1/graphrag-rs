@@ -306,24 +306,26 @@ pub async fn set_config(
         }
     }
 
-    // Layer 3 invariant: warm chunk + entity embeddings on the
-    // in-memory graph BEFORE the recall path can see this graphrag
-    // instance. Recall takes a read-lock and refuses to embed
-    // lazily; the work has to be done while we still own the
-    // mutable handle here. Best-effort — a transient embedding
-    // failure logs and continues; missing embeddings just degrade
-    // recall quality (entity vector search returns fewer hits)
-    // without breaking it.
-    if let Err(e) = graphrag.warm_up_embeddings().await {
-        tracing::warn!(
-            error = %e,
-            "warm_up_embeddings during hydrate failed; recall quality may be degraded until next build_graph"
-        );
-    } else {
-        tracing::info!("🔥 Embedding warm-up complete — recall ready");
-    }
-
-    // Store the initialized GraphRAG
+    // Store the initialized GraphRAG. We deliberately do NOT call
+    // graphrag.warm_up_embeddings() here: hydrate adds character-window
+    // chunks via add_document_from_text, and on a corpus of 4k+ docs /
+    // 90k+ chunks the synchronous embed-all loop blew through systemd's
+    // ExecStartPost timeout (3+ min) and put the unit in a restart loop.
+    //
+    // The hot recall paths used by the MCP (hybrid / global / mix via
+    // graph_aware_query → ask_with_dual_seeds) traverse the in-memory
+    // graph from caller-supplied seeds (qdrant entity/relation vector
+    // search results) and DO NOT use the in-memory chunk/entity
+    // embeddings. So they work immediately post-hydrate without the
+    // warm-up.
+    //
+    // Modes that DO depend on in-memory embeddings — graphrag-core's
+    // standalone ask/ask_explained/ask_with_reasoning, exposed as
+    // QueryMode::Ask/Explain/Reason — degrade silently here (vector
+    // search inside hybrid_query returns no hits until embeddings
+    // populate). Warm-up still runs eagerly on every build_graph /
+    // extend_graph / ingest path (small delta, fast) so those modes
+    // recover after the next mutation.
     *state.graphrag.write().await = Some(graphrag);
 
     tracing::info!("✅ GraphRAG initialized successfully with custom configuration");
