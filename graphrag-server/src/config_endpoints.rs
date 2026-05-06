@@ -25,7 +25,7 @@ pub async fn get_config(state: Data<AppState>) -> Result<Json<serde_json::Value>
             Ok(Json(json!({
                 "success": true,
                 "config": config,
-                "graphrag_initialized": state.graphrag.read().await.is_some()
+                "graphrag_initialized": state.graphrag.load().is_some()
             })))
         },
         Err(e) => Err(ApiError::InternalError(e)),
@@ -151,7 +151,7 @@ pub async fn set_config(
     // Update the live config snapshot. AFTER the embedder swap so any
     // reader that wins the race sees old-config + old-embedder or
     // new-config + new-embedder, never new-config + old-embedder.
-    *state.config.write().await = config.clone();
+    state.config.store(std::sync::Arc::new(config.clone()));
 
     // Re-print the unified backend log line so users see the swap.
     crate::log_unified_embedding_line(&config.embeddings, new_embeddings.backend_live());
@@ -240,7 +240,14 @@ pub async fn set_config(
     // metadata + the entities-extracted timestamp live in Qdrant.
     // /api/graph/append queries Qdrant for chunks lacking the
     // timestamp, runs LLM extraction, and updates the timestamp.
-    *state.graphrag.write().await = Some(graphrag);
+    //
+    // Layer 4: atomically publish the new graphrag snapshot. Any
+    // in-flight recall on the prior snapshot finishes on it; new
+    // recalls pick up the fresh one. Serialize against concurrent
+    // writers via the writer mutex.
+    let _w = state.graphrag_writer.lock().await;
+    state.graphrag.store(Some(std::sync::Arc::new(graphrag)));
+    drop(_w);
 
     tracing::info!("✅ GraphRAG initialized successfully with custom configuration");
 

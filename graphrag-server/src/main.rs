@@ -96,10 +96,29 @@ struct AppState {
     /// `retrieval`, etc. — read by `/health`, `/config`, and
     /// `/embeddings/stats`; written by `POST /config`. Bootstrapped
     /// from `Config::default()` overlaid with env vars.
-    config: Arc<RwLock<graphrag_core::Config>>,
+    /// Layer 4: ArcSwap for the live config snapshot. Read on every
+    /// recall (chat backend lookup, retrieval params); written on
+    /// `POST /config`. Atomic-pointer swap on update; readers never
+    /// block. Pairs with the same pattern on `embeddings` and
+    /// `graphrag`.
+    config: Arc<arc_swap::ArcSwap<graphrag_core::Config>>,
 
-    // Full GraphRAG pipeline (when configured via JSON)
-    graphrag: Arc<RwLock<Option<GraphRAG>>>,
+    /// Full GraphRAG pipeline (when configured via JSON).
+    ///
+    /// Layer 4: ArcSwap for wait-free reads on the recall path.
+    /// Recall does `state.graphrag.load_full()` — atomic pointer load,
+    /// no blocking. Writers (extend_graph batches, /config init,
+    /// /api/graph/build) serialize via `graphrag_writer` mutex; they
+    /// take the current snapshot, copy-on-write mutate via
+    /// `Arc::make_mut`, atomically publish via `store`. Readers and
+    /// writers never contend.
+    graphrag: Arc<arc_swap::ArcSwapOption<GraphRAG>>,
+
+    /// Layer 4: writer-vs-writer mutex for `graphrag`. Readers never
+    /// touch this. Concurrent extend_graph batches / /config rebuilds
+    /// serialize on this mutex so the COW snapshot they each take
+    /// reflects the prior writer's mutations.
+    graphrag_writer: Arc<tokio::sync::Mutex<()>>,
 
     // Configuration manager for JSON config
     config_manager: Arc<ConfigManager>,
@@ -165,7 +184,9 @@ struct AppState {
     /// the live chunk count hasn't grown since this counter, return
     /// early without re-running extraction.
     processed_chunk_count: Arc<std::sync::atomic::AtomicUsize>,
-    query_count: Arc<RwLock<usize>>,
+    /// Layer 4: simple counter, lock-free `fetch_add` per recall.
+    /// Was `RwLock<usize>` — silly to take a lock for a counter.
+    query_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Overlay env-var bootstrap defaults onto a `Config.embeddings` block.
@@ -288,7 +309,7 @@ impl AppState {
         };
         log_unified_embedding_line(&config.embeddings, embeddings.load().backend_live());
 
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
         let embedding_dim = embeddings.load().dimension();
         let ingest_policy = IngestPolicy::from_env();
         let auto_append_notify = Arc::new(tokio::sync::Notify::new());
@@ -385,7 +406,8 @@ impl AppState {
                         qdrant: Some(Arc::new(store)),
                         embeddings,
                         config,
-                        graphrag: Arc::new(RwLock::new(None)),
+                        graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
+                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -397,7 +419,7 @@ impl AppState {
                         graph_built: Arc::new(RwLock::new(false)),
                         last_built_at: Arc::new(RwLock::new(None)),
                         processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                        query_count: Arc::new(RwLock::new(0)),
+                        query_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
                         recall_semaphore: recall_semaphore.clone(),
@@ -412,7 +434,8 @@ impl AppState {
                         qdrant: None,
                         embeddings,
                         config,
-                        graphrag: Arc::new(RwLock::new(None)),
+                        graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
+                        graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -424,7 +447,7 @@ impl AppState {
                         graph_built: Arc::new(RwLock::new(false)),
                         last_built_at: Arc::new(RwLock::new(None)),
                         processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                        query_count: Arc::new(RwLock::new(0)),
+                        query_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
                         recall_semaphore: recall_semaphore.clone(),
@@ -439,7 +462,8 @@ impl AppState {
             Self {
                 embeddings,
                 config,
-                graphrag: Arc::new(RwLock::new(None)),
+                graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
+                graphrag_writer: Arc::new(tokio::sync::Mutex::new(())),
                 config_manager: Arc::new(ConfigManager::new()),
                 ingest_policy: ingest_policy.clone(),
                 auto_append_notify: auto_append_notify.clone(),
@@ -451,7 +475,7 @@ impl AppState {
                 graph_built: Arc::new(RwLock::new(false)),
                 last_built_at: Arc::new(RwLock::new(None)),
                 processed_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                query_count: Arc::new(RwLock::new(0)),
+                query_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 events_store: events_store.clone(),
                 event_bus: event_bus.clone(),
                 recall_semaphore: recall_semaphore.clone(),
@@ -610,7 +634,7 @@ async fn root(state: Data<AppState>) -> impl Responder {
         "version": env!("CARGO_PKG_VERSION"),
         "status": "running",
         "backend": if state.has_qdrant() { "qdrant" } else { "memory" },
-        "graphrag_configured": state.graphrag.read().await.is_some(),
+        "graphrag_configured": state.graphrag.load().is_some(),
         "documentation": "/swagger",
         "openapi_spec": "/openapi.json",
         "endpoints": {
@@ -655,7 +679,7 @@ async fn root(state: Data<AppState>) -> impl Responder {
 async fn health(state: Data<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let doc_count;
     let graph_built;
-    let query_count = *state.query_count.read().await;
+    let query_count = state.query_count.load(std::sync::atomic::Ordering::Relaxed);
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
@@ -680,7 +704,7 @@ async fn health(state: Data<AppState>) -> Result<Json<HealthResponse>, ApiError>
         graph_built = *state.graph_built.read().await;
     }
 
-    let cfg = state.config.read().await;
+    let cfg = state.config.load_full();
     let svc = state.embeddings.load_full();
     let emb_block = HealthEmbeddings {
         backend: cfg.embeddings.backend.clone(),
@@ -748,7 +772,7 @@ async fn query(
     let start = std::time::Instant::now();
 
     // Increment query count
-    *state.query_count.write().await += 1;
+    state.query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mode = body.mode.unwrap_or_default();
 
@@ -964,14 +988,17 @@ async fn graph_aware_query(
         .await
         .map_err(|e| ApiError::InternalError(format!("recall semaphore closed: {e}")))?;
 
-    let graphrag_guard = state.graphrag.read().await;
-    let graphrag = graphrag_guard.as_ref().ok_or_else(|| {
+    // Layer 4: wait-free pointer load. No blocking; if a writer is
+    // mid-batch, recall sees the prior snapshot and proceeds.
+    let graphrag_snap = state.graphrag.load_full();
+    let graphrag = graphrag_snap.as_ref().ok_or_else(|| {
         ApiError::BadRequest(
             "Mode requires a configured chat backend. POST /config with \
              openai.enabled=true or ollama.enabled=true first."
                 .to_string(),
         )
     })?;
+    let graphrag = graphrag.as_ref();
 
     match mode {
         QueryMode::Local => {
@@ -2318,7 +2345,7 @@ async fn list_documents(state: Data<AppState>) -> Json<ListDocumentsResponse> {
 async fn embeddings_stats(state: Data<AppState>) -> Json<serde_json::Value> {
     let svc = state.embeddings.load_full();
     let stats = svc.get_stats().await;
-    let cfg = state.config.read().await;
+    let cfg = state.config.load_full();
     Json(json!({
         "backend": cfg.embeddings.backend,
         "model": cfg.embeddings.model.clone().unwrap_or_default(),
@@ -2509,66 +2536,84 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
         .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
         .collect();
 
+    // Layer 4: serialize writers, but never block readers. Take the
+    // current snapshot, COW-clone via Arc::make_mut, mutate, atomically
+    // publish.
+    let _writer = state.graphrag_writer.lock().await;
+    let current = state.graphrag.load_full();
+    let Some(current_arc) = current else {
+        return Err(ApiError::BadRequest(
+            "GraphRAG not initialized. Call POST /config first.".to_string(),
+        ));
+    };
+    let mut new_graphrag_arc: Arc<GraphRAG> = current_arc;
     {
-        let mut graphrag_guard = state.graphrag.write().await;
-        if let Some(graphrag) = graphrag_guard.as_mut() {
-            if let Err(e) = graphrag.clear_graph() {
-                tracing::warn!(error = %e, "clear_graph failed before rebuild");
-            }
-            match graphrag.extend_graph(&chunks_for_extract).await {
-                Ok(summary) => {
-                    let entities = summary.total_entities;
-                    let relationships = summary.total_relationships;
+        let graphrag = Arc::make_mut(&mut new_graphrag_arc);
+        if let Err(e) = graphrag.clear_graph() {
+            tracing::warn!(error = %e, "clear_graph failed before rebuild");
+        }
+        match graphrag.extend_graph(&chunks_for_extract).await {
+            Ok(summary) => {
+                let entities = summary.total_entities;
+                let relationships = summary.total_relationships;
 
-                    #[cfg(feature = "qdrant")]
-                    if let Some(qdrant) = state.qdrant.as_ref() {
-                        match graph_persistence::persist_in_memory_graph(graphrag, qdrant, state.embeddings.load_full().as_ref()).await
-                        {
-                            Ok((e, r)) => tracing::info!(
-                                "💾 Persisted graph to Qdrant: {} entities, {} relationships",
-                                e, r
-                            ),
-                            Err(err) => tracing::warn!(
-                                error = %err,
-                                "graph persistence failed; in-memory build is still good but won't survive restart"
-                            ),
-                        }
-                        let now_ts = chrono::Utc::now().timestamp();
-                        if let Err(e) = qdrant.mark_chunks_extracted(&chunk_ids, now_ts).await {
-                            tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks may re-extract on next append");
-                        }
-                    }
-
-                    let processing_time = start.elapsed().as_millis() as u64;
-
-                    *state.graph_built.write().await = true;
-                    *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-                    state
-                        .processed_chunk_count
-                        .store(chunk_ids.len(), std::sync::atomic::Ordering::SeqCst);
-
-                    tracing::info!(
-                        "Rebuilt knowledge graph from {} chunks in {}ms ({} entities, {} relationships)",
-                        chunk_ids.len(), processing_time, entities, relationships
-                    );
-
-                    return Ok(Json(BuildGraphResponse {
-                        success: true,
-                        document_count: chunk_ids.len(),
-                        processing_time_ms: processing_time,
-                        message: format!(
-                            "Knowledge graph built: {} entities, {} relationships",
-                            entities, relationships
+                #[cfg(feature = "qdrant")]
+                if let Some(qdrant) = state.qdrant.as_ref() {
+                    match graph_persistence::persist_in_memory_graph(
+                        graphrag,
+                        qdrant,
+                        state.embeddings.load_full().as_ref(),
+                    )
+                    .await
+                    {
+                        Ok((e, r)) => tracing::info!(
+                            "💾 Persisted graph to Qdrant: {} entities, {} relationships",
+                            e, r
                         ),
-                        backend: "graphrag-pipeline".to_string(),
-                    }));
-                },
-                Err(e) => {
-                    tracing::warn!("GraphRAG pipeline build failed, trying fallback: {}", e);
-                },
-            }
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "graph persistence failed; in-memory build is still good but won't survive restart"
+                        ),
+                    }
+                    let now_ts = chrono::Utc::now().timestamp();
+                    if let Err(e) = qdrant.mark_chunks_extracted(&chunk_ids, now_ts).await {
+                        tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks may re-extract on next append");
+                    }
+                }
+
+                // Publish the rebuilt graph atomically.
+                state.graphrag.store(Some(new_graphrag_arc));
+                drop(_writer);
+
+                let processing_time = start.elapsed().as_millis() as u64;
+                *state.graph_built.write().await = true;
+                *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
+                state
+                    .processed_chunk_count
+                    .store(chunk_ids.len(), std::sync::atomic::Ordering::SeqCst);
+
+                tracing::info!(
+                    "Rebuilt knowledge graph from {} chunks in {}ms ({} entities, {} relationships)",
+                    chunk_ids.len(), processing_time, entities, relationships
+                );
+
+                return Ok(Json(BuildGraphResponse {
+                    success: true,
+                    document_count: chunk_ids.len(),
+                    processing_time_ms: processing_time,
+                    message: format!(
+                        "Knowledge graph built: {} entities, {} relationships",
+                        entities, relationships
+                    ),
+                    backend: "graphrag-pipeline".to_string(),
+                }));
+            },
+            Err(e) => {
+                tracing::warn!("GraphRAG pipeline build failed, trying fallback: {}", e);
+            },
         }
     }
+    drop(_writer);
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
@@ -2803,10 +2848,15 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     let mut last_total_relationships = 0usize;
 
     tracing::info!(
-        "do_append_graph: {} chunks to extract, processing in batches of {} (write-lock yielding for recall)",
+        "do_append_graph: {} chunks to extract, processing in batches of {} (Layer 4: writers serialize via mutex; recall reads are wait-free)",
         total_chunks,
         APPEND_BATCH_SIZE,
     );
+
+    // Layer 4: serialize against other writers; recall path never sees
+    // this. Writers acquire here, COW-clone the current snapshot,
+    // mutate a private copy, atomically publish.
+    let _writer = state.graphrag_writer.lock().await;
 
     for (batch_idx, batch) in unextracted.chunks(APPEND_BATCH_SIZE).enumerate() {
         let batch_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
@@ -2815,14 +2865,18 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
             .map(|(id, text)| (graphrag_core::core::ChunkId::new(id.clone()), text.clone()))
             .collect();
 
-        // Phase A (under-lock): extend on this batch, snapshot delta.
+        // COW snapshot: take the current Arc<GraphRAG>, deep-clone via
+        // make_mut (cheap because prior batch published atomically and
+        // any reader holding the prior snapshot doesn't block us).
+        let current = state.graphrag.load_full();
+        let Some(current_arc) = current else {
+            return Err(ApiError::BadRequest(
+                "GraphRAG not initialized. Call POST /config first.".to_string(),
+            ));
+        };
+        let mut new_graphrag_arc: Arc<GraphRAG> = current_arc;
         let (batch_summary, snapshot) = {
-            let mut graphrag_guard = state.graphrag.write().await;
-            let Some(graphrag) = graphrag_guard.as_mut() else {
-                return Err(ApiError::BadRequest(
-                    "GraphRAG not initialized. Call POST /config first.".to_string(),
-                ));
-            };
+            let graphrag = Arc::make_mut(&mut new_graphrag_arc);
             let s = graphrag.extend_graph(&batch_chunks).await.map_err(|e| {
                 ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
             })?;
@@ -2835,7 +2889,12 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
             #[cfg(not(feature = "qdrant"))]
             let snapshot = ();
             (s, snapshot)
-        }; // ← write-lock RELEASED. Queued recalls take their read-locks here.
+        };
+
+        // Atomically publish this batch's mutated snapshot. From this
+        // point new recalls see the +N entities; in-flight recalls
+        // finish on the prior snapshot (correct, just slightly stale).
+        state.graphrag.store(Some(new_graphrag_arc));
 
         total_chunks_processed += batch_summary.chunks_processed;
         total_new_entities += batch_summary.new_entities;
@@ -2844,24 +2903,31 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         last_total_entities = batch_summary.total_entities;
         last_total_relationships = batch_summary.total_relationships;
 
-        // Phase B (LOCK-FREE): persist this batch's delta + mark the
-        // batch's chunks as extracted in qdrant. Failure here is
-        // best-effort — extraction is idempotent; next /append cycle
-        // will re-do this batch if the marker isn't set.
+        // Persist this batch's delta to qdrant + mark chunks extracted.
+        // Best-effort — extraction is idempotent; next /append cycle
+        // re-does this batch if the marker isn't set.
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = state.qdrant.as_ref() {
-            if let Err(err) = graph_persistence::persist_touched_snapshot(
+            let entity_count = snapshot.entities.len();
+            let rel_count = snapshot.relationships.len();
+            match graph_persistence::persist_touched_snapshot(
                 snapshot,
                 qdrant,
                 state.embeddings.load_full().as_ref(),
             )
             .await
             {
-                tracing::warn!(
+                Ok((e, r)) => tracing::info!(
+                    "💾 Persisted delta to Qdrant: {} entities, {} relationships (batch {}; lock-free)",
+                    e, r, batch_idx
+                ),
+                Err(err) => tracing::warn!(
                     error = %err,
                     batch_idx,
+                    touched_entities = entity_count,
+                    touched_relationships = rel_count,
                     "graph persistence failed for batch; will retry on next cycle"
-                );
+                ),
             }
             let now_ts = chrono::Utc::now().timestamp();
             if let Err(e) = qdrant.mark_chunks_extracted(&batch_ids, now_ts).await {
@@ -2872,11 +2938,9 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
                 );
             }
         }
-
-        // Yield so any waiters on the write-lock get scheduled before
-        // we loop back and grab it again.
-        tokio::task::yield_now().await;
     }
+
+    drop(_writer);
 
     let processing_time = start.elapsed().as_millis() as u64;
 
@@ -2928,8 +2992,8 @@ async fn graph_stats(state: Data<AppState>) -> Json<GraphStatsResponse> {
 
     // Try real GraphRAG pipeline stats first
     {
-        let graphrag_guard = state.graphrag.read().await;
-        if let Some(ref graphrag) = *graphrag_guard {
+        let graphrag_guard = state.graphrag.load_full();
+        if let Some(graphrag) = graphrag_guard.as_ref() {
             if let Some(kg) = graphrag.knowledge_graph() {
                 let entity_count = kg.entities().count();
                 let relationship_count = kg.relationships().count();

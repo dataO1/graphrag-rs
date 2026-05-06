@@ -4,6 +4,7 @@ use crate::ollama::OllamaClient;
 use serde::{Deserialize, Serialize};
 
 /// Planner for breaking down complex queries
+#[derive(Clone)]
 pub struct QueryPlanner {
     client: ChatClient,
 }

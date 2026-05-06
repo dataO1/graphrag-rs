@@ -271,6 +271,13 @@ pub use crate::retrieval::hipporag_ppr::{Fact, HippoRAGConfig, HippoRAGRetriever
 /// — the caller looks the bytes up by id from its store before the
 /// call. This keeps graphrag-core's in-memory state to entities +
 /// relationships only.
+///
+/// Layer 4: GraphRAG implements Clone so the host can use copy-on-write
+/// semantics around an `ArcSwap<Arc<GraphRAG>>` — readers do wait-free
+/// pointer loads; writers `Arc::make_mut` (deep-clones only when the
+/// snapshot is shared with a reader), mutate, atomic-swap. Recall and
+/// ingestion never block each other.
+#[derive(Clone)]
 pub struct GraphRAG {
     config: Config,
     knowledge_graph: Option<KnowledgeGraph>,

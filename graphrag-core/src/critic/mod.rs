@@ -15,6 +15,7 @@ pub struct EvaluationResult {
 }
 
 /// Critic for evaluating RAG answers
+#[derive(Clone)]
 pub struct Critic {
     client: Arc<OllamaClient>,
 }

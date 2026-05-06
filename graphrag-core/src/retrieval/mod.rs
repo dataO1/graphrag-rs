@@ -44,6 +44,7 @@ use crate::vector::store::VectorStore;
 /// graphrag-server) inject their real backend via
 /// [`Self::set_embedding_provider`]; without injection, retrieval uses
 /// a hash-based [`HashEmbedder`] sized to `config.embeddings.dimension`.
+#[derive(Clone)]
 pub struct RetrievalSystem {
     vector_store: std::sync::Arc<dyn VectorStore>,
     /// Single source of truth for embedding generation. Always populated.
@@ -52,9 +53,10 @@ pub struct RetrievalSystem {
     config: RetrievalConfig,
     #[cfg(feature = "parallel-processing")]
     parallel_processor: Option<ParallelProcessor>,
-    #[cfg(feature = "pagerank")]
-    pagerank_retriever: Option<PageRankRetrievalSystem>,
-    enriched_retriever: Option<EnrichedRetriever>,
+    // Phase 5 partial: pagerank_retriever and enriched_retriever
+    // fields removed. Their owning modules are unreachable post-Phase 4
+    // and never get populated. Removing them lets RetrievalSystem
+    // derive Clone (Layer 4 needs it for ArcSwap copy-on-write).
     #[cfg(feature = "lazygraphrag")]
     concept_filtering_enabled: bool,
 }
@@ -91,9 +93,6 @@ impl RetrievalSystem {
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
-            #[cfg(feature = "pagerank")]
-            pagerank_retriever: None,
-            enriched_retriever: None,
             #[cfg(feature = "lazygraphrag")]
             concept_filtering_enabled: false,
         })
