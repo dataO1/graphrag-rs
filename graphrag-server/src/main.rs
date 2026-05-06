@@ -2759,14 +2759,8 @@ async fn stale_context_cleanup_loop(state: AppState, interval: std::time::Durati
 async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiError> {
     let start = std::time::Instant::now();
 
-    // Phase 1 (under-lock): run extend_graph (which mutates the
-    // in-memory graph), then snapshot the touched delta into owned
-    // data so we can release the lock before paying for the embed +
-    // qdrant write. Mirrors LightRAG's approach where embedding is
-    // never done while holding any storage lock.
-    // Phase 6: source-of-truth dedup signal is now `entities_extracted_at`
-    // in qdrant payload. Query qdrant for chunks lacking that marker,
-    // hand them to graphrag-core's extractor, then mark them extracted.
+    // Phase 6: source-of-truth dedup signal is `entities_extracted_at`
+    // in qdrant payload. Query qdrant for chunks lacking that marker.
     #[cfg(feature = "qdrant")]
     let unextracted: Vec<(String, String)> = match state.qdrant.as_ref() {
         Some(qdrant) => qdrant
@@ -2778,121 +2772,145 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     #[cfg(not(feature = "qdrant"))]
     let unextracted: Vec<(String, String)> = Vec::new();
 
-    let unextracted_ids: Vec<String> = unextracted.iter().map(|(id, _)| id.clone()).collect();
-    let chunks_for_extract: Vec<(graphrag_core::core::ChunkId, String)> = unextracted
-        .into_iter()
-        .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
-        .collect();
-
-    let (summary, snapshot) = {
-        let mut graphrag_guard = state.graphrag.write().await;
-        let Some(graphrag) = graphrag_guard.as_mut() else {
-            return Err(ApiError::BadRequest(
-                "GraphRAG not initialized. Call POST /config first.".to_string(),
-            ));
-        };
-        let summary = graphrag.extend_graph(&chunks_for_extract).await.map_err(|e| {
-            ApiError::InternalError(format!("Append failed: {}", e))
-        })?;
-        // Empty-delta fast path stays under-lock: no snapshot needed.
-        if summary.chunks_processed == 0 {
-            let processing_time = start.elapsed().as_millis() as u64;
-            return Ok(BuildGraphResponse {
-                success: true,
-                document_count: 0,
-                processing_time_ms: processing_time,
-                message: "No new chunks since last build. Nothing to append.".to_string(),
-                backend: "graphrag-pipeline".to_string(),
-            });
-        }
-        #[cfg(feature = "qdrant")]
-        let snapshot = graph_persistence::snapshot_touched(
-            graphrag,
-            &summary.touched_entity_ids,
-            &summary.touched_relationship_keys,
-        );
-        #[cfg(not(feature = "qdrant"))]
-        let snapshot = ();
-        (summary, snapshot)
-    }; // ← lock released here
-
-    // Mark the just-extracted chunks in qdrant so the next /append
-    // sees them as already-processed. Best-effort — failure here means
-    // we'll re-extract them next cycle (idempotent extraction merges
-    // duplicates, so worst case is wasted LLM cost).
-    #[cfg(feature = "qdrant")]
-    if let Some(qdrant) = state.qdrant.as_ref() {
-        let now_ts = chrono::Utc::now().timestamp();
-        if let Err(e) = qdrant.mark_chunks_extracted(&unextracted_ids, now_ts).await {
-            tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks will re-extract next cycle");
-        }
+    if unextracted.is_empty() {
+        let processing_time = start.elapsed().as_millis() as u64;
+        return Ok(BuildGraphResponse {
+            success: true,
+            document_count: 0,
+            processing_time_ms: processing_time,
+            message: "No new chunks since last build. Nothing to append.".to_string(),
+            backend: "graphrag-pipeline".to_string(),
+        });
     }
 
-    // Phase 2 (LOCK-FREE): embed + qdrant write of the touched delta.
-    // Recall paths can take the GraphRAG write-lock during this window
-    // without blocking on us. Best-effort: persist failure logs and
-    // continues — the in-memory graph is still good for the rest of
-    // the session.
-    #[cfg(feature = "qdrant")]
-    if let Some(qdrant) = state.qdrant.as_ref() {
-        let entity_count = snapshot.entities.len();
-        let rel_count = snapshot.relationships.len();
-        match graph_persistence::persist_touched_snapshot(
-            snapshot,
-            qdrant,
-            state.embeddings.load_full().as_ref(),
-        )
-        .await
-        {
-            Ok((e, r)) => tracing::info!(
-                "💾 Persisted delta to Qdrant: {} entities, {} relationships (touched only; graph unchanged in size)",
-                e, r
-            ),
-            Err(err) => tracing::warn!(
-                error = %err,
-                touched_entities = entity_count,
-                touched_relationships = rel_count,
-                "graph persistence failed; in-memory append is still good but won't survive restart"
-            ),
+    // Layer 4 (write-lock yielding): chunk the work into small batches
+    // so the GraphRAG write-lock isn't held for the entire LLM run.
+    // extend_graph internally uses EXTRACTION_CONCURRENCY=N parallel
+    // LLM calls; sizing each batch == that concurrency means each
+    // batch is one round of LLM calls (~5-15s), then the lock
+    // releases and queued recalls (read-lock) get a window before
+    // the next batch grabs the write-lock again. Without this, a
+    // cold-start migration that re-extracts thousands of chunks
+    // blocks recall for hours.
+    const APPEND_BATCH_SIZE: usize = 16;
+
+    let total_chunks = unextracted.len();
+    let mut total_chunks_processed = 0usize;
+    let mut total_new_entities = 0usize;
+    let mut total_new_relationships = 0usize;
+    let mut total_mentions_merged = 0usize;
+    let mut last_total_entities = 0usize;
+    let mut last_total_relationships = 0usize;
+
+    tracing::info!(
+        "do_append_graph: {} chunks to extract, processing in batches of {} (write-lock yielding for recall)",
+        total_chunks,
+        APPEND_BATCH_SIZE,
+    );
+
+    for (batch_idx, batch) in unextracted.chunks(APPEND_BATCH_SIZE).enumerate() {
+        let batch_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+        let batch_chunks: Vec<(graphrag_core::core::ChunkId, String)> = batch
+            .iter()
+            .map(|(id, text)| (graphrag_core::core::ChunkId::new(id.clone()), text.clone()))
+            .collect();
+
+        // Phase A (under-lock): extend on this batch, snapshot delta.
+        let (batch_summary, snapshot) = {
+            let mut graphrag_guard = state.graphrag.write().await;
+            let Some(graphrag) = graphrag_guard.as_mut() else {
+                return Err(ApiError::BadRequest(
+                    "GraphRAG not initialized. Call POST /config first.".to_string(),
+                ));
+            };
+            let s = graphrag.extend_graph(&batch_chunks).await.map_err(|e| {
+                ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
+            })?;
+            #[cfg(feature = "qdrant")]
+            let snapshot = graph_persistence::snapshot_touched(
+                graphrag,
+                &s.touched_entity_ids,
+                &s.touched_relationship_keys,
+            );
+            #[cfg(not(feature = "qdrant"))]
+            let snapshot = ();
+            (s, snapshot)
+        }; // ← write-lock RELEASED. Queued recalls take their read-locks here.
+
+        total_chunks_processed += batch_summary.chunks_processed;
+        total_new_entities += batch_summary.new_entities;
+        total_new_relationships += batch_summary.new_relationships;
+        total_mentions_merged += batch_summary.mentions_merged;
+        last_total_entities = batch_summary.total_entities;
+        last_total_relationships = batch_summary.total_relationships;
+
+        // Phase B (LOCK-FREE): persist this batch's delta + mark the
+        // batch's chunks as extracted in qdrant. Failure here is
+        // best-effort — extraction is idempotent; next /append cycle
+        // will re-do this batch if the marker isn't set.
+        #[cfg(feature = "qdrant")]
+        if let Some(qdrant) = state.qdrant.as_ref() {
+            if let Err(err) = graph_persistence::persist_touched_snapshot(
+                snapshot,
+                qdrant,
+                state.embeddings.load_full().as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    batch_idx,
+                    "graph persistence failed for batch; will retry on next cycle"
+                );
+            }
+            let now_ts = chrono::Utc::now().timestamp();
+            if let Err(e) = qdrant.mark_chunks_extracted(&batch_ids, now_ts).await {
+                tracing::warn!(
+                    error = %e,
+                    batch_idx,
+                    "mark_chunks_extracted failed; batch will re-extract next cycle"
+                );
+            }
         }
+
+        // Yield so any waiters on the write-lock get scheduled before
+        // we loop back and grab it again.
+        tokio::task::yield_now().await;
     }
 
     let processing_time = start.elapsed().as_millis() as u64;
 
     *state.graph_built.write().await = true;
     *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-    // Bump the processed_chunks counter by chunks_processed for /health
-    // telemetry. Coarser than the old in-memory HashSet count but
-    // monotonic across runs, which is what the dashboard needs.
+    // Bump the processed_chunks counter by total processed.
     state
         .processed_chunk_count
-        .fetch_add(summary.chunks_processed, std::sync::atomic::Ordering::SeqCst);
+        .fetch_add(total_chunks_processed, std::sync::atomic::Ordering::SeqCst);
 
     tracing::info!(
-        "extend_graph: {} delta chunks, +{} entities, +{} rels, {} mentions merged, {} touched-entities, {} touched-rels ({}ms; graph: {} entities, {} rels)",
-        summary.chunks_processed,
-        summary.new_entities,
-        summary.new_relationships,
-        summary.mentions_merged,
-        summary.touched_entity_ids.len(),
-        summary.touched_relationship_keys.len(),
+        "extend_graph: {} chunks across {} batches, +{} entities, +{} rels, {} mentions merged ({}ms; graph: {} entities, {} rels)",
+        total_chunks_processed,
+        (total_chunks + APPEND_BATCH_SIZE - 1) / APPEND_BATCH_SIZE,
+        total_new_entities,
+        total_new_relationships,
+        total_mentions_merged,
         processing_time,
-        summary.total_entities,
-        summary.total_relationships,
+        last_total_entities,
+        last_total_relationships,
     );
 
     Ok(BuildGraphResponse {
         success: true,
-        document_count: summary.chunks_processed,
+        document_count: total_chunks_processed,
         processing_time_ms: processing_time,
         message: format!(
             "Appended {} new chunks: +{} entities, +{} relationships, {} mentions merged ({} entities, {} relationships total)",
-            summary.chunks_processed,
-            summary.new_entities,
-            summary.new_relationships,
-            summary.mentions_merged,
-            summary.total_entities,
-            summary.total_relationships,
+            total_chunks_processed,
+            total_new_entities,
+            total_new_relationships,
+            total_mentions_merged,
+            last_total_entities,
+            last_total_relationships,
         ),
         backend: "graphrag-pipeline".to_string(),
     })
