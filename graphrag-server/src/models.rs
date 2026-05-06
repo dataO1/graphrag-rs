@@ -188,6 +188,14 @@ pub struct QueryResult {
     /// SSE stream as the `oldEtag`/`newEtag` fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+
+    /// RFC 3339 timestamp of when this chunk's current version was
+    /// written (= qdrant `valid_from`, falling back to `timestamp`).
+    /// Lets the answer-composing LLM and the agent prefer the
+    /// freshest source when multiple chunks legitimately disagree
+    /// — recency is the canonical tiebreaker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
 }
 
 fn example_similarity() -> f32 {

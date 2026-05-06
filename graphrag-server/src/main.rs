@@ -743,6 +743,11 @@ async fn query(
                         line_end: r.metadata.line_end,
                         heading_path: r.metadata.heading_path,
                         etag: r.metadata.block_hash.clone(),
+                        last_modified: r
+                            .metadata
+                            .valid_from
+                            .clone()
+                            .or_else(|| Some(r.metadata.timestamp.clone())),
                         block_id: r.metadata.block_id,
                     })
                     .collect();
@@ -817,6 +822,7 @@ async fn query(
                 heading_path: Vec::new(),
                 block_id: None,
                 etag: None,
+                last_modified: Some(doc.added_at.clone()),
             }
         })
         .filter(|r| r.similarity > 0.5)
@@ -882,6 +888,11 @@ async fn graph_aware_query(
                             line_end: r.metadata.line_end,
                             heading_path: r.metadata.heading_path,
                             etag: r.metadata.block_hash.clone(),
+                            last_modified: r
+                                .metadata
+                                .valid_from
+                                .clone()
+                                .or_else(|| Some(r.metadata.timestamp.clone())),
                             block_id: r.metadata.block_id,
                         })
                         .collect(),
@@ -1543,45 +1554,56 @@ async fn emit_stale_context_event(
     let Some(store) = state.events_store.as_ref() else { return };
     let bus = state.event_bus.clone();
 
-    // Cap excerpts; compute a unified diff for "updated" events so
-    // the agent can see exactly what changed inline.
+    // Delta payload shape per change_type (drops redundant fields):
+    //   updated  → unified diff only (carries both old+new lines via
+    //              -/+ markers; storing them again in oldExcerpt /
+    //              newExcerpt is pure duplication)
+    //   added    → newExcerpt only (no prior version → no diff possible)
+    //   removed  → oldExcerpt only (the deleted text; no current version)
+    //
+    // Excerpts are capped at `delta_excerpt_chars`; when the cap fires
+    // we append "(…truncated; recall for the full block)" so the
+    // model knows it's not seeing the whole content. The unified diff
+    // is left uncapped — block-level chunks are bounded ~2 KB by the
+    // chunker, so the diff is intrinsically bounded too.
     let max_chars = store.settings().delta_excerpt_chars;
     let trim = |s: &str| -> String {
         if s.chars().count() <= max_chars {
             s.to_string()
         } else {
-            let mut acc = String::with_capacity(max_chars + 1);
+            let mut acc = String::with_capacity(max_chars + 64);
             for (i, c) in s.chars().enumerate() {
                 if i >= max_chars { break; }
                 acc.push(c);
             }
-            acc.push('…');
+            acc.push_str("… (truncated; recall for the full block)");
             acc
         }
     };
-    let old_excerpt = old_text.map(trim);
-    let new_excerpt = new_text.map(trim);
-    let unified_diff = match (old_text, new_text) {
-        (Some(o), Some(n)) => {
-            // similar's TextDiff handles multi-line input; small-block
-            // size means line-level granularity is plenty.
-            Some(
-                similar::TextDiff::from_lines(o, n)
-                    .unified_diff()
-                    .header("old", "new")
-                    .to_string(),
-            )
+    let delta = match change_type {
+        events_store::ChangeType::Updated => match (old_text, new_text) {
+            (Some(o), Some(n)) => Some(events_store::Delta {
+                old_excerpt: None,
+                new_excerpt: None,
+                unified_diff: Some(
+                    similar::TextDiff::from_lines(o, n)
+                        .unified_diff()
+                        .header("old", "new")
+                        .to_string(),
+                ),
+            }),
+            _ => None,
         },
-        _ => None,
-    };
-    let delta = if old_excerpt.is_some() || new_excerpt.is_some() || unified_diff.is_some() {
-        Some(events_store::Delta {
-            old_excerpt,
-            new_excerpt,
-            unified_diff,
-        })
-    } else {
-        None
+        events_store::ChangeType::Added => new_text.map(|n| events_store::Delta {
+            old_excerpt: None,
+            new_excerpt: Some(trim(n)),
+            unified_diff: None,
+        }),
+        events_store::ChangeType::Removed => old_text.map(|o| events_store::Delta {
+            old_excerpt: Some(trim(o)),
+            new_excerpt: None,
+            unified_diff: None,
+        }),
     };
 
     let pending = events_store::PendingEvent {
