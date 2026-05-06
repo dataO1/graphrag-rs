@@ -607,13 +607,10 @@ async fn root(state: Data<AppState>) -> impl Responder {
                 "endpoint": "POST /api/query",
                 "modes": {
                     "search": "vector similarity over Qdrant (default; fast; no LLM)",
-                    "ask": "graph-aware retrieval + LLM-composed answer",
-                    "explain": "ask + confidence + source attribution + reasoning trace",
-                    "reason": "query decomposition for multi-hop questions",
-                    "local": "LightRAG `local` / MS GraphRAG `local_search`: vector-search entity sidecar → expand 1-hop → LLM answer (entity-centric)",
-                    "global": "LightRAG `global`: high-level keywords → vector-search relationship sidecar → resolve endpoints → LLM answer (theme-centric)",
-                    "hybrid": "LightRAG `hybrid`: dual-keyword extraction; both entity and relationship vector searches merged into one answer (best for mixed entity+theme questions)",
-                    "mix": "LightRAG `mix`: hybrid + chunk-vector results merged; strongest recall, slightly slower"
+                    "local": "LightRAG `local`: low-level keywords → entity-vector seeds → entity-centric retrieval",
+                    "global": "LightRAG `global`: high-level keywords → relationship-vector seeds → theme-centric retrieval",
+                    "hybrid": "LightRAG `hybrid`: both keyword sets merged; best general default",
+                    "mix": "LightRAG `mix`: hybrid + chunk-vector seeds; strongest recall"
                 }
             },
             "documents": {
@@ -970,94 +967,6 @@ async fn graph_aware_query(
     })?;
 
     match mode {
-        QueryMode::Ask => {
-            let answer = graphrag.ask(&body.query).await.map_err(|e| {
-                tracing::error!(error = %e, "ask() failed");
-                ApiError::InternalError(format!("ask() failed: {}", e))
-            })?;
-            let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
-                query: body.query.clone(),
-                mode: mode.as_str().to_string(),
-                results: vector_results,
-                answer: Some(answer),
-                confidence: None,
-                key_entities: None,
-                reasoning_steps: None,
-                sources: None,
-                processing_time_ms: processing_time,
-                backend: "graphrag".to_string(),
-            }))
-        },
-        QueryMode::Explain => {
-            let explained = graphrag.ask_explained(&body.query).await.map_err(|e| {
-                tracing::error!(error = %e, "ask_explained() failed");
-                ApiError::InternalError(format!("ask_explained() failed: {}", e))
-            })?;
-            let sources: Vec<SourceReferenceDto> = explained
-                .sources
-                .iter()
-                .map(|s| SourceReferenceDto {
-                    id: s.id.clone(),
-                    kind: match s.source_type {
-                        graphrag_core::retrieval::SourceType::TextChunk => SourceKind::TextChunk,
-                        graphrag_core::retrieval::SourceType::Entity => SourceKind::Entity,
-                        graphrag_core::retrieval::SourceType::Relationship => {
-                            SourceKind::Relationship
-                        },
-                        graphrag_core::retrieval::SourceType::Summary => SourceKind::Summary,
-                    },
-                    excerpt: s.excerpt.clone(),
-                    relevance: s.relevance_score,
-                })
-                .collect();
-            let reasoning_steps: Vec<ReasoningStepDto> = explained
-                .reasoning_steps
-                .iter()
-                .map(|s| ReasoningStepDto {
-                    step: s.step_number,
-                    description: s.description.clone(),
-                    entities_used: s.entities_used.clone(),
-                    evidence: s.evidence_snippet.clone(),
-                    confidence: s.confidence,
-                })
-                .collect();
-            let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
-                query: body.query.clone(),
-                mode: mode.as_str().to_string(),
-                results: vector_results,
-                answer: Some(explained.answer.clone()),
-                confidence: Some(explained.confidence),
-                key_entities: Some(explained.key_entities.clone()),
-                reasoning_steps: Some(reasoning_steps),
-                sources: Some(sources),
-                processing_time_ms: processing_time,
-                backend: "graphrag".to_string(),
-            }))
-        },
-        QueryMode::Reason => {
-            let answer = graphrag
-                .ask_with_reasoning(&body.query)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "ask_with_reasoning() failed");
-                    ApiError::InternalError(format!("ask_with_reasoning() failed: {}", e))
-                })?;
-            let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
-                query: body.query.clone(),
-                mode: mode.as_str().to_string(),
-                results: vector_results,
-                answer: Some(answer),
-                confidence: None,
-                key_entities: None,
-                reasoning_steps: None,
-                sources: None,
-                processing_time_ms: processing_time,
-                backend: "graphrag".to_string(),
-            }))
-        },
         QueryMode::Local => {
             // Microsoft GraphRAG `local_search` shape:
             //   1. Embed the user query through the EmbeddingService
@@ -1103,8 +1012,28 @@ async fn graph_aware_query(
             }
 
             let max_neighbors_per_seed = 5usize;
+
+            // Phase 6: pre-fetch chunk contents from qdrant for the
+            // mention chunk ids the entity walk would touch. Replaces
+            // the in-memory `kg.chunks().find(...)` lookup that's gone.
+            let chunk_ids_needed: Vec<String> = graphrag
+                .collect_chunk_ids_for_seed_entities(&seed_ids, max_neighbors_per_seed)
+                .into_iter()
+                .map(|c| c.0)
+                .collect();
+            let mut chunk_contents: std::collections::HashMap<graphrag_core::core::ChunkId, String> =
+                std::collections::HashMap::new();
+            #[cfg(feature = "qdrant")]
+            if let Some(qdrant) = state.qdrant.as_ref() {
+                if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_ids_needed).await {
+                    for (id, content) in map {
+                        chunk_contents.insert(graphrag_core::core::ChunkId::new(id), content);
+                    }
+                }
+            }
+
             let explained = graphrag
-                .ask_with_seed_entities(&body.query, &seed_ids, max_neighbors_per_seed)
+                .ask_with_seed_entities(&body.query, &seed_ids, max_neighbors_per_seed, &chunk_contents)
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "ask_with_seed_entities() failed");
@@ -1247,8 +1176,27 @@ async fn graph_aware_query(
             }
 
             let max_neighbors_per_seed = 5usize;
+
+            // Phase 6: pre-fetch chunk contents from qdrant for the
+            // mention + chunk-seed ids the dual-seed walk would touch.
+            let chunk_ids_needed: Vec<String> = graphrag
+                .collect_chunk_ids_for_dual_seeds(&seeds, max_neighbors_per_seed)
+                .into_iter()
+                .map(|c| c.0)
+                .collect();
+            let mut chunk_contents: std::collections::HashMap<graphrag_core::core::ChunkId, String> =
+                std::collections::HashMap::new();
+            #[cfg(feature = "qdrant")]
+            if let Some(qdrant) = state.qdrant.as_ref() {
+                if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_ids_needed).await {
+                    for (id, content) in map {
+                        chunk_contents.insert(graphrag_core::core::ChunkId::new(id), content);
+                    }
+                }
+            }
+
             let explained = graphrag
-                .ask_with_dual_seeds(&body.query, &seeds, max_neighbors_per_seed)
+                .ask_with_dual_seeds(&body.query, &seeds, max_neighbors_per_seed, &chunk_contents)
                 .await
                 .map_err(|e| {
                     tracing::error!(error = %e, "ask_with_dual_seeds() failed");
@@ -1479,6 +1427,7 @@ async fn ingest_blocks(
                 heading_path: block.heading_path.clone(),
                 line_start: block.line_start,
                 line_end: block.line_end,
+                entities_extracted_at: None,
                 custom: HashMap::new(),
             };
             qdrant
@@ -1514,18 +1463,11 @@ async fn ingest_blocks(
             .await;
         }
 
-        // Step 4: pipeline feed (whole-doc text). Keep entity extraction
-        // doc-level so cross-section relations stay visible.
-        {
-            let mut g = state.graphrag.write().await;
-            if let Some(ref mut graphrag) = *g {
-                if let Err(e) = graphrag.add_document_from_text(&full_content) {
-                    tracing::warn!(error = %e, source = %source, "graphrag pipeline feed failed");
-                } else {
-                    *state.graph_built.write().await = false;
-                }
-            }
-        }
+        // Phase 6: chunks now live exclusively in Qdrant (already
+        // written above). The pipeline feed into the in-memory KG is
+        // gone — extend_graph queries Qdrant directly for unextracted
+        // chunks.
+        *state.graph_built.write().await = false;
         state.auto_append_notify.notify_one();
 
         return Ok(BlockIngestOutcome { user_id, added, superseded });
@@ -1816,6 +1758,7 @@ async fn ingest_one_text(
             heading_path: Vec::new(),
             line_start: None,
             line_end: None,
+            entities_extracted_at: None,
             version: Some(new_version),
             valid_from: Some(timestamp.clone()),
             is_current: Some(true),
@@ -1839,19 +1782,8 @@ async fn ingest_one_text(
             tracing::info!("Added document to Qdrant: {} ({})", title, id);
         }
 
-        {
-            let mut g = state.graphrag.write().await;
-            if let Some(ref mut graphrag) = *g {
-                if let Err(e) = graphrag.add_document_from_text(&content) {
-                    tracing::warn!(
-                        error = %e,
-                        "GraphRAG ingest failed; /api/graph/build will skip this doc"
-                    );
-                } else {
-                    *state.graph_built.write().await = false;
-                }
-            }
-        }
+        // Phase 6: chunk lives exclusively in Qdrant; no in-memory feed.
+        *state.graph_built.write().await = false;
 
         // Wake the auto-append coalescer. notify_one stores at most
         // one permit, so a 200-file burst → many wakes → still one
@@ -2545,26 +2477,42 @@ async fn delete_document(
 async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, ApiError> {
     let start = std::time::Instant::now();
 
-    // Try the real GraphRAG pipeline first
+    // Phase 6: build_graph is now a force-rebuild — clear the entity
+    // graph and re-extract from EVERY chunk in qdrant (regardless of
+    // entities_extracted_at). For incremental work, /api/graph/append
+    // is the right endpoint.
+    #[cfg(feature = "qdrant")]
+    let all_chunks: Vec<(String, String)> = match state.qdrant.as_ref() {
+        Some(qdrant) => qdrant
+            .list_full_documents(1_000_000)
+            .await
+            .map_err(|e| ApiError::InternalError(format!("qdrant list failed: {}", e)))?
+            .into_iter()
+            .filter(|(_, md)| md.is_current.unwrap_or(true) && !md.text.is_empty())
+            .map(|(id, md)| (id, md.text))
+            .collect(),
+        None => Vec::new(),
+    };
+    #[cfg(not(feature = "qdrant"))]
+    let all_chunks: Vec<(String, String)> = Vec::new();
+
+    let chunk_ids: Vec<String> = all_chunks.iter().map(|(id, _)| id.clone()).collect();
+    let chunks_for_extract: Vec<(graphrag_core::core::ChunkId, String)> = all_chunks
+        .into_iter()
+        .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
+        .collect();
+
     {
         let mut graphrag_guard = state.graphrag.write().await;
-        if let Some(ref mut graphrag) = *graphrag_guard {
-            // Use actual pipeline to build graph
-            match graphrag.build_graph().await {
-                Ok(_) => {
-                    let (entities, relationships, chunk_count) = graphrag
-                        .knowledge_graph()
-                        .map(|kg| (
-                            kg.entities().count(),
-                            kg.relationships().count(),
-                            kg.chunks().count(),
-                        ))
-                        .unwrap_or((0, 0, 0));
+        if let Some(graphrag) = graphrag_guard.as_mut() {
+            if let Err(e) = graphrag.clear_graph() {
+                tracing::warn!(error = %e, "clear_graph failed before rebuild");
+            }
+            match graphrag.extend_graph(&chunks_for_extract).await {
+                Ok(summary) => {
+                    let entities = summary.total_entities;
+                    let relationships = summary.total_relationships;
 
-                    // Persist the freshly-built graph to Qdrant so it
-                    // survives a server restart. Best-effort: a Qdrant
-                    // failure logs and continues — the in-memory graph
-                    // is still usable for the rest of the session.
                     #[cfg(feature = "qdrant")]
                     if let Some(qdrant) = state.qdrant.as_ref() {
                         match graph_persistence::persist_in_memory_graph(graphrag, qdrant, state.embeddings.load_full().as_ref()).await
@@ -2578,6 +2526,10 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
                                 "graph persistence failed; in-memory build is still good but won't survive restart"
                             ),
                         }
+                        let now_ts = chrono::Utc::now().timestamp();
+                        if let Err(e) = qdrant.mark_chunks_extracted(&chunk_ids, now_ts).await {
+                            tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks may re-extract on next append");
+                        }
                     }
 
                     let processing_time = start.elapsed().as_millis() as u64;
@@ -2586,16 +2538,16 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
                     *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
                     state
                         .processed_chunk_count
-                        .store(chunk_count, std::sync::atomic::Ordering::SeqCst);
+                        .store(chunk_ids.len(), std::sync::atomic::Ordering::SeqCst);
 
                     tracing::info!(
-                        "Built knowledge graph via pipeline in {}ms ({} entities, {} relationships)",
-                        processing_time, entities, relationships
+                        "Rebuilt knowledge graph from {} chunks in {}ms ({} entities, {} relationships)",
+                        chunk_ids.len(), processing_time, entities, relationships
                     );
 
                     return Ok(Json(BuildGraphResponse {
                         success: true,
-                        document_count: state.documents.read().await.len(),
+                        document_count: chunk_ids.len(),
                         processing_time_ms: processing_time,
                         message: format!(
                             "Knowledge graph built: {} entities, {} relationships",
@@ -2606,7 +2558,6 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
                 },
                 Err(e) => {
                     tracing::warn!("GraphRAG pipeline build failed, trying fallback: {}", e);
-                    // Fall through to lower-priority backends
                 },
             }
         }
@@ -2806,14 +2757,34 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     // data so we can release the lock before paying for the embed +
     // qdrant write. Mirrors LightRAG's approach where embedding is
     // never done while holding any storage lock.
-    let (summary, snapshot, processed_chunks_after) = {
+    // Phase 6: source-of-truth dedup signal is now `entities_extracted_at`
+    // in qdrant payload. Query qdrant for chunks lacking that marker,
+    // hand them to graphrag-core's extractor, then mark them extracted.
+    #[cfg(feature = "qdrant")]
+    let unextracted: Vec<(String, String)> = match state.qdrant.as_ref() {
+        Some(qdrant) => qdrant
+            .list_unextracted_chunks(1_000_000)
+            .await
+            .map_err(|e| ApiError::InternalError(format!("list unextracted chunks failed: {}", e)))?,
+        None => Vec::new(),
+    };
+    #[cfg(not(feature = "qdrant"))]
+    let unextracted: Vec<(String, String)> = Vec::new();
+
+    let unextracted_ids: Vec<String> = unextracted.iter().map(|(id, _)| id.clone()).collect();
+    let chunks_for_extract: Vec<(graphrag_core::core::ChunkId, String)> = unextracted
+        .into_iter()
+        .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
+        .collect();
+
+    let (summary, snapshot) = {
         let mut graphrag_guard = state.graphrag.write().await;
         let Some(graphrag) = graphrag_guard.as_mut() else {
             return Err(ApiError::BadRequest(
                 "GraphRAG not initialized. Call POST /config first.".to_string(),
             ));
         };
-        let summary = graphrag.extend_graph().await.map_err(|e| {
+        let summary = graphrag.extend_graph(&chunks_for_extract).await.map_err(|e| {
             ApiError::InternalError(format!("Append failed: {}", e))
         })?;
         // Empty-delta fast path stays under-lock: no snapshot needed.
@@ -2823,10 +2794,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
                 success: true,
                 document_count: 0,
                 processing_time_ms: processing_time,
-                message: format!(
-                    "No new chunks since last build ({} processed). Nothing to append.",
-                    graphrag.processed_chunk_count()
-                ),
+                message: "No new chunks since last build. Nothing to append.".to_string(),
                 backend: "graphrag-pipeline".to_string(),
             });
         }
@@ -2838,9 +2806,20 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         );
         #[cfg(not(feature = "qdrant"))]
         let snapshot = ();
-        let processed_chunks_after = graphrag.processed_chunk_count();
-        (summary, snapshot, processed_chunks_after)
+        (summary, snapshot)
     }; // ← lock released here
+
+    // Mark the just-extracted chunks in qdrant so the next /append
+    // sees them as already-processed. Best-effort — failure here means
+    // we'll re-extract them next cycle (idempotent extraction merges
+    // duplicates, so worst case is wasted LLM cost).
+    #[cfg(feature = "qdrant")]
+    if let Some(qdrant) = state.qdrant.as_ref() {
+        let now_ts = chrono::Utc::now().timestamp();
+        if let Err(e) = qdrant.mark_chunks_extracted(&unextracted_ids, now_ts).await {
+            tracing::warn!(error = %e, "mark_chunks_extracted failed; chunks will re-extract next cycle");
+        }
+    }
 
     // Phase 2 (LOCK-FREE): embed + qdrant write of the touched delta.
     // Recall paths can take the GraphRAG write-lock during this window
@@ -2875,11 +2854,12 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
 
     *state.graph_built.write().await = true;
     *state.last_built_at.write().await = Some(chrono::Utc::now().to_rfc3339());
-    // Mirror processed_chunks count into AppState for /health
-    // and /embeddings/stats consumers.
+    // Bump the processed_chunks counter by chunks_processed for /health
+    // telemetry. Coarser than the old in-memory HashSet count but
+    // monotonic across runs, which is what the dashboard needs.
     state
         .processed_chunk_count
-        .store(processed_chunks_after, std::sync::atomic::Ordering::SeqCst);
+        .fetch_add(summary.chunks_processed, std::sync::atomic::Ordering::SeqCst);
 
     tracing::info!(
         "extend_graph: {} delta chunks, +{} entities, +{} rels, {} mentions merged, {} touched-entities, {} touched-rels ({}ms; graph: {} entities, {} rels)",

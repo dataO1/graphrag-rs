@@ -1,13 +1,8 @@
 [workspace]
 members = [
     "graphrag-core",
-    "graphrag-wasm",
     "graphrag-server",
-    "graphrag-cli",
-    "graphrag_py",
-    "graphrag",
 ]
-exclude = ["examples/web-app"]
 resolver = "2"
 
 [workspace.package]

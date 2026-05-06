@@ -172,114 +172,43 @@ pub async fn set_config(
         .initialize()
         .map_err(|e| ApiError::InternalError(format!("GraphRAG initialization failed: {}", e)))?;
 
-    // Hydrate from Qdrant: every document already in the persistent store
-    // gets re-chunked and pushed into graphrag-core's in-memory
-    // KnowledgeGraph, then their chunk ids are seeded into
-    // `processed_chunks`. Without this, after a server restart the
-    // in-memory chunk index is empty, /api/graph/build only sees chunks
-    // added since restart (a tiny fraction of the corpus), and
-    // /api/graph/append's no-op fast-path lies about how much has
-    // actually been processed. With it: graph_stats matches Qdrant
-    // truth, build_graph covers the full corpus, append_graph only
-    // re-extracts genuinely-new chunks.
-    //
-    // We also restore the previously-extracted entity + relationship
-    // graph from the entities/relationships sidecar collections (Phase H).
-    // Without that, every restart wipes the LLM-extracted graph and
-    // forces re-extraction; with it, build_graph/extend_graph state
-    // genuinely survives restarts.
+    // Phase 6: chunks are NOT loaded into in-memory state on hydrate
+    // anymore. Qdrant is the source of truth for chunk content, chunk
+    // metadata, and the `entities_extracted_at` dedup signal. We only
+    // restore the entity + relationship petgraph from the sidecar
+    // collections (small, ~tens of KB at current scale, load-bearing
+    // for graph traversal in `ask_with_dual_seeds`).
     let mut hydration_summary = json!({
         "documents": 0,
-        "chunks": 0,
-        "skipped": 0,
         "entities": 0,
         "relationships": 0,
         "relationships_skipped_orphan": 0,
     });
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        // 1_000_000 is an arbitrary "drain everything" cap — Qdrant's
-        // scroll naturally short-circuits when next_page_offset is None.
-        match qdrant.list_full_documents(1_000_000).await {
-            Ok(docs) => {
-                let mut hydrated_docs = 0usize;
-                let mut skipped = 0usize;
-                let chunks_before = graphrag
-                    .knowledge_graph()
-                    .map(|kg| kg.chunks().count())
-                    .unwrap_or(0);
-                for (_id, md) in &docs {
-                    if md.text.is_empty() {
-                        skipped += 1;
-                        continue;
-                    }
-                    if let Err(e) = graphrag.add_document_from_text(&md.text) {
-                        tracing::warn!(
-                            error = %e,
-                            title = %md.title,
-                            "hydration: add_document_from_text failed; skipping"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
-                    hydrated_docs += 1;
-                }
-                let chunks_after = graphrag
-                    .knowledge_graph()
-                    .map(|kg| kg.chunks().count())
-                    .unwrap_or(chunks_before);
-                let hydrated_chunks = chunks_after.saturating_sub(chunks_before);
-
-                // Mark every chunk we just rebuilt as "already extracted"
-                // so /api/graph/append won't re-run LLM extraction over
-                // the entire restored corpus on its first tick. New
-                // chunks added via /api/documents after this seeding
-                // are NOT in the set yet, so they remain in the
-                // append-graph delta as expected.
-                let chunk_ids: Vec<_> = graphrag
-                    .knowledge_graph()
-                    .map(|kg| kg.chunks().map(|c| c.id.clone()).collect())
-                    .unwrap_or_default();
-                graphrag.seed_processed_chunks(chunk_ids);
-
-                tracing::info!(
-                    "🔄 Hydrated KnowledgeGraph from Qdrant: {} documents, {} chunks ({} skipped)",
-                    hydrated_docs,
-                    hydrated_chunks,
-                    skipped
-                );
-
-                // Mirror processed-chunk count into AppState so /health
-                // and /api/graph/stats reflect the true post-hydration
-                // state, not the empty pre-hydration state.
-                state.processed_chunk_count.store(
-                    graphrag.processed_chunk_count(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-
-                hydration_summary = json!({
-                    "documents": hydrated_docs,
-                    "chunks": hydrated_chunks,
-                    "skipped": skipped,
-                    "entities": 0,
-                    "relationships": 0,
-                    "relationships_skipped_orphan": 0,
-                });
-            },
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "hydration: list_full_documents failed; starting with empty in-memory graph"
-                );
-            },
-        }
-
-        // Phase H: restore the LLM-extracted entity + relationship graph
-        // from its sidecar collections. Runs after chunk hydration so
-        // the KnowledgeGraph already exists and entities have a parent
-        // to attach to. Best-effort: a load failure (e.g. missing
-        // sidecar collection on a fresh deploy) is normal — we just
-        // start with an empty entity graph and the next build_graph
+        // Document count for telemetry; we don't load text into memory.
+        let doc_count = qdrant
+            .list_full_documents(1_000_000)
+            .await
+            .map(|d| d.len())
+            .unwrap_or(0);
+        tracing::info!(
+            "🔄 Hydrated chunk surface: {} documents in Qdrant (chunks not loaded into memory; extend_graph queries Qdrant for unextracted)",
+            doc_count
+        );
+        state
+            .processed_chunk_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        hydration_summary = json!({
+            "documents": doc_count,
+            "entities": 0,
+            "relationships": 0,
+            "relationships_skipped_orphan": 0,
+        });
+        // Restore the LLM-extracted entity + relationship graph from
+        // its sidecar collections. Best-effort: a load failure (e.g.
+        // missing sidecar on a fresh deploy) is normal — we just start
+        // with an empty entity graph and the next /api/graph/append
         // populates it.
         match crate::graph_persistence::hydrate_in_memory_graph(&mut graphrag, qdrant).await {
             Ok((entities_restored, rels_restored, rels_skipped)) => {
@@ -306,26 +235,11 @@ pub async fn set_config(
         }
     }
 
-    // Store the initialized GraphRAG. We deliberately do NOT call
-    // graphrag.warm_up_embeddings() here: hydrate adds character-window
-    // chunks via add_document_from_text, and on a corpus of 4k+ docs /
-    // 90k+ chunks the synchronous embed-all loop blew through systemd's
-    // ExecStartPost timeout (3+ min) and put the unit in a restart loop.
-    //
-    // The hot recall paths used by the MCP (hybrid / global / mix via
-    // graph_aware_query → ask_with_dual_seeds) traverse the in-memory
-    // graph from caller-supplied seeds (qdrant entity/relation vector
-    // search results) and DO NOT use the in-memory chunk/entity
-    // embeddings. So they work immediately post-hydrate without the
-    // warm-up.
-    //
-    // Modes that DO depend on in-memory embeddings — graphrag-core's
-    // standalone ask/ask_explained/ask_with_reasoning, exposed as
-    // QueryMode::Ask/Explain/Reason — degrade silently here (vector
-    // search inside hybrid_query returns no hits until embeddings
-    // populate). Warm-up still runs eagerly on every build_graph /
-    // extend_graph / ingest path (small delta, fast) so those modes
-    // recover after the next mutation.
+    // Phase 6 end state: graphrag-core's KnowledgeGraph holds only the
+    // entity + relationship petgraph (~50 KB). All chunk content +
+    // metadata + the entities-extracted timestamp live in Qdrant.
+    // /api/graph/append queries Qdrant for chunks lacking the
+    // timestamp, runs LLM extraction, and updates the timestamp.
     *state.graphrag.write().await = Some(graphrag);
 
     tracing::info!("✅ GraphRAG initialized successfully with custom configuration");

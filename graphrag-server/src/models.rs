@@ -15,44 +15,27 @@ use std::fmt;
 
 /// Query mode — how the server interprets the question.
 ///
-/// - `search` (default): pure vector similarity over Qdrant. Fast (~350ms),
-///   returns ranked excerpts. No LLM call. Back-compatible default.
-/// - `ask`: graph-aware retrieval + LLM-generated answer. Calls
-///   `GraphRAG::ask`. Requires a configured chat backend.
-/// - `explain`: like `ask`, but also returns confidence, source attribution
-///   (text-chunk / entity / relationship), reasoning steps, and key entities.
-///   Calls `GraphRAG::ask_explained`.
-/// - `reason`: query decomposition for multi-hop questions; sub-queries are
-///   answered and composed into a final answer. Calls
-///   `GraphRAG::ask_with_reasoning`. Slower than `ask`.
-/// - `local`: Microsoft GraphRAG-style `local_search` and equivalent of
-///   LightRAG's `local` mode. Embeds the query, vector-searches the
-///   entity sidecar (top-K seed entities), expands to 1-hop neighbors,
-///   gathers their mentioning chunks, and feeds the assembled context
-///   to the chat backend.
-/// - `global`: LightRAG-paper `global` mode. Extracts dual-level
-///   keywords from the query (one LLM call), embeds the **high-level**
-///   set, vector-searches the *relationship* sidecar for top-K seed
-///   relations, resolves their endpoint entities, expands neighborhoods,
-///   gathers chunks, sends to chat backend. Themes-and-concepts shape;
-///   answers thematic / cross-cutting questions better than `local`.
-/// - `hybrid`: LightRAG-paper `hybrid` mode. Runs both retrieval streams
-///   — low-level keywords → entity vector search → entity seeds; and
-///   high-level keywords → relationship vector search → relation seeds.
-///   Merges the result sets and feeds the union to the chat backend.
-///   Most graph-aware retrieval; best default for entity-centric
-///   questions where you also want thematic context.
-/// - `mix`: LightRAG-paper `mix` mode. Hybrid plus a chunk-vector
-///   search using the original query — the chunk results are added
-///   directly as seed chunks alongside the entity/relation expansion.
-///   Strongest recall, slightly slower (one extra Qdrant call).
+/// All graph-aware modes follow LightRAG (arxiv 2410.05779) dual-level
+/// retrieval: extract `{low_level, high_level}` keywords with one LLM
+/// call, vector-search the matching Qdrant sidecars, expand from seeds
+/// in the in-memory entity/relationship graph, assemble context, send
+/// to the chat backend.
+///
+/// - `search` (default): pure vector similarity over Qdrant. Fast
+///   (~350ms), returns ranked excerpts. No LLM call. Back-compat default.
+/// - `local`: low-level keywords only → entity-vector seeds →
+///   entity-centric retrieval. Best for questions about a specific
+///   named entity.
+/// - `global`: high-level keywords only → relationship-vector seeds →
+///   thematic / cross-cutting retrieval.
+/// - `hybrid`: both streams merged (entity + relationship seeds).
+///   LightRAG paper's recommended default for graph-aware questions.
+/// - `mix`: hybrid plus a direct chunk-vector search on the original
+///   query — strongest recall, one extra Qdrant call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
     Search,
-    Ask,
-    Explain,
-    Reason,
     Local,
     Global,
     Hybrid,
@@ -69,9 +52,6 @@ impl QueryMode {
     pub fn as_str(self) -> &'static str {
         match self {
             QueryMode::Search => "search",
-            QueryMode::Ask => "ask",
-            QueryMode::Explain => "explain",
-            QueryMode::Reason => "reason",
             QueryMode::Local => "local",
             QueryMode::Global => "global",
             QueryMode::Hybrid => "hybrid",

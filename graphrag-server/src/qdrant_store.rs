@@ -22,9 +22,9 @@
 use qdrant_client::{
     qdrant::{
         points_selector::PointsSelectorOneOf, Condition, CreateCollectionBuilder,
-        DeletePointsBuilder, Distance, Filter, PointStruct, PointsIdsList, ScrollPointsBuilder,
-        SearchPointsBuilder, SetPayloadPointsBuilder, UpsertPointsBuilder, Value as QdrantValue,
-        VectorParamsBuilder,
+        DeletePointsBuilder, Distance, Filter, GetPointsBuilder, PointStruct, PointsIdsList,
+        ScrollPointsBuilder, SearchPointsBuilder, SetPayloadPointsBuilder, UpsertPointsBuilder,
+        Value as QdrantValue, VectorParamsBuilder,
     },
     Qdrant,
 };
@@ -178,6 +178,15 @@ pub struct DocumentMetadata {
     pub line_start: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_end: Option<u32>,
+
+    /// Phase 6: unix-seconds timestamp of when LLM entity extraction
+    /// last ran successfully against this chunk. `None` means "never
+    /// extracted" — `extend_graph` queries qdrant with this filter to
+    /// find work, so this field is the dedup signal that replaces the
+    /// in-memory `processed_chunks` set. Set by graphrag-server after
+    /// every successful entity-extraction batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entities_extracted_at: Option<i64>,
 
     #[serde(flatten)]
     pub custom: HashMap<String, serde_json::Value>,
@@ -916,6 +925,160 @@ impl QdrantStore {
         }
 
         Ok(docs)
+    }
+
+    /// Phase 6: scroll for chunks where `entities_extracted_at` is unset
+    /// (i.e. LLM entity extraction hasn't run yet). This is the source-
+    /// of-truth dedup signal — replaces the in-memory `processed_chunks`
+    /// HashSet that the old graphrag-core flow kept. Filters
+    /// `is_current = true` so superseded versions don't get re-extracted.
+    pub async fn list_unextracted_chunks(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>, QdrantError> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut offset: Option<qdrant_client::qdrant::PointId> = None;
+        let page_size = limit.min(256).max(1);
+
+        // Filter: is_current=true AND entities_extracted_at IS NULL.
+        // Qdrant's `is_empty` matches "field absent or null", which is
+        // exactly the "not yet extracted" signal we want. Combined with
+        // is_current=true so we never re-extract superseded blocks.
+        let filter = Filter {
+            must: vec![
+                Condition::matches("is_current", true),
+                Condition::is_empty("entities_extracted_at"),
+            ],
+            ..Default::default()
+        };
+
+        while out.len() < limit as usize {
+            let mut builder = ScrollPointsBuilder::new(&self.collection_name)
+                .filter(filter.clone())
+                .with_payload(true)
+                .with_vectors(false)
+                .limit(page_size);
+            if let Some(off) = offset.take() {
+                builder = builder.offset(off);
+            }
+            let resp = self
+                .client
+                .scroll(builder)
+                .await
+                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+
+            if resp.result.is_empty() {
+                break;
+            }
+            for point in resp.result {
+                let id = match point_id_to_string(point.clone()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let payload_value = match serde_json::to_value(&point.payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let md: DocumentMetadata = match serde_json::from_value(payload_value) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if md.text.is_empty() {
+                    continue;
+                }
+                out.push((id, md.text));
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+            offset = resp.next_page_offset;
+            if offset.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Phase 6: mark chunks as having had successful LLM entity
+    /// extraction. Sets `entities_extracted_at = ts` on every supplied
+    /// point id. Empty list is a no-op.
+    pub async fn mark_chunks_extracted(
+        &self,
+        point_ids: &[String],
+        ts: i64,
+    ) -> Result<(), QdrantError> {
+        if point_ids.is_empty() {
+            return Ok(());
+        }
+        let mut payload: HashMap<String, QdrantValue> = HashMap::new();
+        payload.insert("entities_extracted_at".to_string(), QdrantValue::from(ts));
+
+        let ids: Vec<qdrant_client::qdrant::PointId> = point_ids
+            .iter()
+            .map(|s| s.clone().into())
+            .collect();
+
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        self.client
+            .set_payload(
+                SetPayloadPointsBuilder::new(&self.collection_name, payload)
+                    .points_selector(PointsSelectorOneOf::Points(PointsIdsList { ids }))
+                    .wait(true),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Phase 6: batch-fetch chunk content by Qdrant point id.
+    /// Used by recall path (graph_aware_query) to populate the
+    /// chunk_contents map for `ask_with_dual_seeds` from the qdrant
+    /// source-of-truth, since the in-memory KG no longer holds
+    /// chunks. Missing ids are silently skipped — caller can detect
+    /// gaps by comparing input vs returned-map size.
+    pub async fn fetch_chunks_by_ids(
+        &self,
+        point_ids: &[String],
+    ) -> Result<HashMap<String, String>, QdrantError> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        if point_ids.is_empty() {
+            return Ok(out);
+        }
+        let ids: Vec<qdrant_client::qdrant::PointId> = point_ids
+            .iter()
+            .map(|s| s.clone().into())
+            .collect();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let resp = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(&self.collection_name, ids)
+                    .with_payload(true)
+                    .with_vectors(false),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+        for point in resp.result {
+            let id = match point_id_to_string(point.clone()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let payload_value = match serde_json::to_value(&point.payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let md: DocumentMetadata = match serde_json::from_value(payload_value) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            out.insert(id, md.text);
+        }
+        Ok(out)
     }
 
     /// Clear all documents from collection
