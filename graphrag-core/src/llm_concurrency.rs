@@ -39,11 +39,14 @@ pub struct AdaptiveConfig {
     /// Multiplicative decrease factor on failure. `0.5` halves the
     /// permit count; `0.25` quarters it. Floored at 1 permit.
     pub failure_decay: f32,
-    /// Minimum gap between consecutive shrinks. Without a cooldown,
-    /// a burst of N simultaneous failures (e.g. 30 in-flight requests
-    /// all timing out when the upstream goes down) would halve N times
-    /// and over-shrink. With a 500ms cooldown, only the first shrinks;
-    /// the rest see they're inside the window and skip.
+    /// Minimum gap between consecutive shrinks. Without a cooldown, a
+    /// burst of N simultaneous failures (e.g. 30 in-flight requests all
+    /// timing out when the upstream goes down) would halve N times and
+    /// over-shrink. The cooldown bounds it to ONE shrink per discrete
+    /// upstream event up to this duration. Default 5000ms (5s, bumped
+    /// from 500ms 2026-05-07): real network blips / DNS retries / TCP
+    /// reconnects often take 1-2s, longer than the old 500ms window
+    /// which would still let the cap collapse on a single blip.
     pub shrink_cooldown_ms: u64,
 }
 
@@ -54,7 +57,7 @@ impl Default for AdaptiveConfig {
             max: 64,
             success_threshold: 10,
             failure_decay: 0.5,
-            shrink_cooldown_ms: 500,
+            shrink_cooldown_ms: 5000,
         }
     }
 }
