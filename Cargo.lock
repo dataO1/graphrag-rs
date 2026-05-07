@@ -4552,8 +4552,6 @@ dependencies = [
 [[package]]
 name = "jsonfixer"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d7f9eec05b17cf9df7758e99e0aded637bda4f12eadca9615fc26bbecbb5d4d"
 dependencies = [
  "log",
  "memchr",

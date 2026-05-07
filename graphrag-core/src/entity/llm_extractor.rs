@@ -294,14 +294,13 @@ impl LLMEntityExtractor {
             },
         }
 
-        // Strategy 4: Look for JSON anywhere in the response
+        // Strategy 4: Look for JSON anywhere in the response and try a plain
+        // serde_json parse. The previous "try repair on the substring" branch
+        // was redundant (strategy 3 already ran repair_json on the full
+        // response) and could trip a no-progress loop in jsonfixer 0.1.0 on
+        // chopped input.
         if let Some(json_str) = Self::find_json_in_text(response) {
             if let Ok(output) = serde_json::from_str::<ExtractionOutput>(json_str) {
-                return Ok(output);
-            }
-
-            // Try repairing the extracted JSON
-            if let Ok(output) = self.repair_and_parse_json(json_str) {
                 return Ok(output);
             }
         }

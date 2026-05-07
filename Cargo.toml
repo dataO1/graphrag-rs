@@ -151,3 +151,9 @@ panic = "abort"
 
 [workspace.metadata.rust-analyzer]
 rustc_private = true
+
+# Local patch: jsonfixer 0.1.0 has an infinite-loop bug in parse_array/parse_object
+# when callees fail to advance the cursor (graphrag-rs OOM 2026-05-07). Vendored
+# copy at vendor/jsonfixer/ adds a no-progress guard.
+[patch.crates-io]
+jsonfixer = { path = "vendor/jsonfixer" }
