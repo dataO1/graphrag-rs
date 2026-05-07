@@ -259,37 +259,34 @@ impl EmbeddingService {
     }
 
     /// Generate embeddings using an OpenAI-compatible server (vLLM, OVMS,
-    /// llama-server, OpenAI itself, …). Chunks `texts` into batches of
-    /// `config.batch_size`, sends each batch in ONE POST with
-    /// `input: [...]` (the OpenAI spec's array form, supported by OVMS,
-    /// vLLM, and llama.cpp's server), runs up to
-    /// [`OPENAI_CONCURRENT_BATCHES`] in parallel via
-    /// `buffer_unordered` to overlap network round-trips with NPU/GPU
-    /// compute.
+    /// llama-server, OpenAI itself, …). One POST per text — required
+    /// because the OVMS `/v3/embeddings` Mediapipe graph in this
+    /// deployment does NOT accept `input: [...]` (array form). Single
+    /// posts are run concurrently via `buffer_unordered`
+    /// ([`OPENAI_CONCURRENT_REQUESTS`] in flight) to overlap network
+    /// round-trips with NPU compute — same throughput win as
+    /// batched-input, no server-side change required.
     ///
-    /// Why: the original implementation was one POST per text,
-    /// sequentially awaited. Persistence batch 0 in the 2026-05-07
-    /// production trace had 1 323 vectors → 1 323 sequential
-    /// round-trips at ~0.66 s each → 14 m 34 s of pure HTTP idle.
-    /// Batched-32 × concurrent-8 should land ≤ 30 s.
+    /// Why: the original sequential `for text in texts { ... }` had
+    /// 1 323 sequential round-trips at ~0.66 s each → 14 m 34 s of
+    /// pure HTTP idle (2026-05-07 production trace). Concurrent
+    /// single-text dispatch lands ≤ 2 min for the same 1 323 vectors.
     ///
     /// Implementation notes — landmines this body steps around:
-    /// - **Typed deserialization** (`OpenAIEmbeddingResponse` struct
-    ///   with `Vec<f32>` per entry) instead of `serde_json::Value`.
-    ///   The first batched-concurrent attempt used `Value` and triggered
-    ///   a 30 GB/min RSS climb during persistence (peaked > 60 GB
-    ///   before the bench was killed). Likely cause: a `Value::Number`
-    ///   tree with 32 × 1024 boxed f64 Numbers per response body, ×
-    ///   8 concurrent in flight, × allocator fragmentation. Strict
-    ///   typed deserialize allocates one contiguous `Vec<f32>` per
-    ///   embedding — ~4 KB/embedding × 32 = 128 KB per batch.
+    /// - **Typed deserialization** (typed struct with `Vec<f32>`)
+    ///   instead of `serde_json::Value`. The first batched-concurrent
+    ///   attempt used `Value` and triggered a 30 GB/min RSS climb —
+    ///   `Value::Number` trees with 1024 boxed f64 Numbers per
+    ///   response × 8 concurrent × allocator fragmentation. Strict
+    ///   typed deserialize allocates one contiguous `Vec<f32>`
+    ///   (~4 KB) per embedding.
     /// - **`resp.bytes()` then `from_slice`** instead of `resp.json()`
-    ///   — gives us a hook to log body size before parse, lets us drop
-    ///   the raw bytes immediately after deserialize.
-    /// - **Per-batch instrumentation** at INFO: response size, parse
-    ///   time, in-flight gauge. ~50 lines per 1 500-vector persist;
-    ///   useful for catching future regressions of this kind.
-    /// - Dimension validation runs per response item.
+    ///   — gives us a hook to log body size + drop the raw bytes
+    ///   immediately after deserialize.
+    /// - **Per-request instrumentation** at INFO every N responses:
+    ///   in-flight gauge, body sizes, parse times. Cheap; helpful
+    ///   when the next regression appears.
+    /// - Dimension validation runs per response.
     #[cfg(feature = "openai")]
     async fn generate_with_openai(
         &self,
@@ -304,8 +301,9 @@ impl EmbeddingService {
             return Ok(Vec::new());
         }
 
-        // Strict typed shape — NOT serde_json::Value. The Value path
-        // costs orders of magnitude more memory at this scale.
+        // Typed shape — NOT serde_json::Value. Strict typed parse
+        // allocates one `Vec<f32>` per embedding; the Value path
+        // pays an order-of-magnitude tax in boxed-Number trees.
         #[derive(serde::Deserialize)]
         struct EmbeddingsResponse {
             data: Vec<EmbeddingEntry>,
@@ -315,35 +313,37 @@ impl EmbeddingService {
             embedding: Vec<f32>,
         }
 
-        // Cap per-call payload size at config.batch_size; cap how many
-        // calls fly concurrently against OVMS at OPENAI_CONCURRENT_BATCHES.
-        const OPENAI_CONCURRENT_BATCHES: usize = 8;
-        let batch_size = self.config.batch_size.max(1);
+        // 8 concurrent single-text POSTs is the OVMS sweet spot.
+        // The Mediapipe graph behind /v3/embeddings does its own
+        // intra-request batching (sub-batch=8 in OVMS config), and
+        // accepts up to ~16 concurrent HTTP requests cleanly. 8 keeps
+        // us comfortably under that without hand-tuning OVMS.
+        const OPENAI_CONCURRENT_REQUESTS: usize = 8;
 
         let url = format!("{}/embeddings", client.base_url.trim_end_matches('/'));
         let dim = self.config.dimension;
         let total = texts.len();
-        let total_batches = total.div_ceil(batch_size);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let in_flight_max = Arc::new(AtomicUsize::new(0));
+        let log_every = (total / 10).max(1); // ~10 progress lines per call
 
         tracing::info!(
-            "embeddings.openai: starting {} batches × {} per batch, total={} texts, concurrency={}",
-            total_batches, batch_size, total, OPENAI_CONCURRENT_BATCHES,
+            "embeddings.openai: starting {} requests, concurrency={}",
+            total, OPENAI_CONCURRENT_REQUESTS,
         );
         let overall_start = std::time::Instant::now();
 
-        // Owned `Vec<String>` per batch — sidesteps a higher-ranked
+        // Owned `Vec<String>` per request — sidesteps a higher-ranked
         // lifetime error when the closure goes through stream::iter.
-        let batch_inputs: Vec<(usize, Vec<String>)> = texts
-            .chunks(batch_size)
+        let inputs: Vec<(usize, String)> = texts
+            .iter()
             .enumerate()
-            .map(|(idx, batch)| (idx, batch.iter().map(|s| s.to_string()).collect()))
+            .map(|(idx, t)| (idx, t.to_string()))
             .collect();
 
-        let collected: Vec<Result<(usize, Vec<Vec<f32>>), EmbeddingError>> =
-            stream::iter(batch_inputs)
-                .map(|(batch_idx, inputs)| {
+        let collected: Vec<Result<(usize, Vec<f32>), EmbeddingError>> =
+            stream::iter(inputs)
+                .map(|(req_idx, input)| {
                     let http = client.http.clone();
                     let url = url.clone();
                     let model = client.model.clone();
@@ -357,7 +357,7 @@ impl EmbeddingService {
 
                         let body = serde_json::json!({
                             "model": model,
-                            "input": inputs,
+                            "input": input,
                         });
                         let mut req = http.post(&url).json(&body);
                         if !api_key.is_empty() {
@@ -372,9 +372,6 @@ impl EmbeddingService {
                                 "HTTP {status} from {url}: {body}"
                             )));
                         }
-                        // Read into bytes first so we can record body
-                        // size for the leak hunt; typed deserialize via
-                        // `from_slice` (no Value tree).
                         let body_bytes = resp.bytes().await?;
                         let body_size = body_bytes.len();
                         let parse_start = std::time::Instant::now();
@@ -386,57 +383,51 @@ impl EmbeddingService {
                                 ))
                             })?;
                         let parse_ms = parse_start.elapsed().as_millis();
-                        // Drop raw bytes immediately — done with them.
                         drop(body_bytes);
 
-                        if parsed.data.len() != inputs.len() {
+                        let entry =
+                            parsed.data.into_iter().next().ok_or_else(|| {
+                                EmbeddingError::GenerationFailed(
+                                    "OpenAI response: empty data[]".to_string(),
+                                )
+                            })?;
+                        if entry.embedding.len() != dim {
                             in_flight.fetch_sub(1, Ordering::SeqCst);
-                            return Err(EmbeddingError::GenerationFailed(format!(
-                                "OpenAI returned {} embeddings for {} inputs",
-                                parsed.data.len(),
-                                inputs.len()
-                            )));
-                        }
-                        let mut out = Vec::with_capacity(inputs.len());
-                        for entry in parsed.data {
-                            if entry.embedding.len() != dim {
-                                in_flight.fetch_sub(1, Ordering::SeqCst);
-                                return Err(EmbeddingError::DimensionMismatch {
-                                    expected: dim,
-                                    actual: entry.embedding.len(),
-                                });
-                            }
-                            out.push(entry.embedding);
+                            return Err(EmbeddingError::DimensionMismatch {
+                                expected: dim,
+                                actual: entry.embedding.len(),
+                            });
                         }
                         let total_ms = started.elapsed().as_millis();
                         let after = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
-                        tracing::info!(
-                            "embeddings.openai: batch {}/{} ok (n={}, body {} B, parse {} ms, total {} ms, in_flight={}→{})",
-                            batch_idx + 1,
-                            total_batches,
-                            inputs.len(),
-                            body_size,
-                            parse_ms,
-                            total_ms,
-                            after + 1,
-                            after,
-                        );
-                        Ok::<_, EmbeddingError>((batch_idx, out))
+                        // Sample one log every ~10% of the request set
+                        // so a 1 500-vector persist emits ~10 INFO
+                        // lines, not 1 500.
+                        if req_idx == 0 || (req_idx + 1) % log_every == 0 || req_idx + 1 == total {
+                            tracing::info!(
+                                "embeddings.openai: req {}/{} ok (body {} B, parse {} ms, total {} ms, in_flight={}→{})",
+                                req_idx + 1,
+                                total,
+                                body_size,
+                                parse_ms,
+                                total_ms,
+                                after + 1,
+                                after,
+                            );
+                        }
+                        Ok::<_, EmbeddingError>((req_idx, entry.embedding))
                     }
                 })
-                .buffer_unordered(OPENAI_CONCURRENT_BATCHES)
+                .buffer_unordered(OPENAI_CONCURRENT_REQUESTS)
                 .collect()
                 .await;
 
-        // Materialize errors first; on success, sort by batch index
-        // and flatten into the original input order.
-        let mut indexed: Vec<(usize, Vec<Vec<f32>>)> =
+        // Materialize errors first; on success, sort by request index
+        // and flatten into original input order.
+        let mut indexed: Vec<(usize, Vec<f32>)> =
             collected.into_iter().collect::<Result<Vec<_>, _>>()?;
         indexed.sort_by_key(|(idx, _)| *idx);
-        let result: Vec<Vec<f32>> = indexed
-            .into_iter()
-            .flat_map(|(_, batch)| batch)
-            .collect();
+        let result: Vec<Vec<f32>> = indexed.into_iter().map(|(_, e)| e).collect();
         tracing::info!(
             "embeddings.openai: done {} embeddings in {} ms (peak in_flight={})",
             result.len(),

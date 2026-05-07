@@ -936,21 +936,55 @@ impl QdrantStore {
         &self,
         limit: u32,
     ) -> Result<Vec<(String, String)>, QdrantError> {
+        self.list_unextracted_chunks_excluding(limit, &[]).await
+    }
+
+    /// Same as `list_unextracted_chunks` but excludes a caller-supplied
+    /// set of point ids — used by the cross-page pipeline in
+    /// `do_append_graph` to skip chunks that are *currently being
+    /// processed* by a still-draining consumer task. Without the
+    /// exclude, those in-flight chunks would re-appear in the next
+    /// page (they're still NULL on `entities_extracted_at`) and double-
+    /// extract.
+    pub async fn list_unextracted_chunks_excluding(
+        &self,
+        limit: u32,
+        exclude_ids: &[String],
+    ) -> Result<Vec<(String, String)>, QdrantError> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut offset: Option<qdrant_client::qdrant::PointId> = None;
         let page_size = limit.min(256).max(1);
 
-        // Filter: is_current=true AND entities_extracted_at IS NULL.
+        // Filter: is_current=true AND entities_extracted_at IS NULL,
+        // AND (when caller provided) NOT in the exclude_ids set.
         // Qdrant's `is_empty` matches "field absent or null", which is
         // exactly the "not yet extracted" signal we want. Combined with
         // is_current=true so we never re-extract superseded blocks.
-        let filter = Filter {
+        let mut filter = Filter {
             must: vec![
                 Condition::matches("is_current", true),
                 Condition::is_empty("entities_extracted_at"),
             ],
             ..Default::default()
         };
+        if !exclude_ids.is_empty() {
+            // Use must_not + has_id to drop the in-flight set. Our
+            // chunk ids are UUID strings throughout.
+            use qdrant_client::qdrant::PointId;
+            let ids: Vec<PointId> = exclude_ids
+                .iter()
+                .map(|s| PointId {
+                    point_id_options: Some(
+                        qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s.clone()),
+                    ),
+                })
+                .collect();
+            filter.must_not.push(Condition {
+                condition_one_of: Some(qdrant_client::qdrant::condition::ConditionOneOf::HasId(
+                    qdrant_client::qdrant::HasIdCondition { has_id: ids },
+                )),
+            });
+        }
 
         while out.len() < limit as usize {
             let mut builder = ScrollPointsBuilder::new(&self.collection_name)

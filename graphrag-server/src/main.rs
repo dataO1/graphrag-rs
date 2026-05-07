@@ -2939,16 +2939,29 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     let mut last_total_relationships = 0usize;
     let mut batch_idx = 0usize;
 
+    // Cross-page pipeline state: previous batch's consumer task is
+    // still draining (embed + qdrant upsert) while we start the
+    // next batch's LLM extraction. The previous batch's chunk ids
+    // get excluded from the next page fetch so we don't double-
+    // extract them. Mark-extracted for the previous batch happens
+    // AFTER its consumer drains (await prev_consumer_handle below)
+    // and BEFORE the next iteration's prev-handoff.
+    #[cfg(feature = "qdrant")]
+    let mut prev_consumer_handle: Option<tokio::task::JoinHandle<(usize, usize)>> = None;
+    #[cfg(feature = "qdrant")]
+    let mut prev_batch_ids: Vec<String> = Vec::new();
+
     loop {
         // Page through unextracted chunks one batch at a time. Each
-        // call to list_unextracted_chunks returns up to BATCH_SIZE
-        // chunks where entities_extracted_at IS NULL. We mark the
-        // batch as extracted at the end of each iteration, so the
-        // NEXT page automatically excludes them — no offset bookkeeping.
+        // call to list_unextracted_chunks_excluding returns up to
+        // BATCH_SIZE chunks where entities_extracted_at IS NULL,
+        // skipping any chunk ids that are still in flight in the
+        // previous batch's consumer. We mark each batch as extracted
+        // AFTER its consumer drains.
         #[cfg(feature = "qdrant")]
         let batch: Vec<(String, String)> = match state.qdrant.as_ref() {
             Some(qdrant) => qdrant
-                .list_unextracted_chunks(append_batch_size as u32)
+                .list_unextracted_chunks_excluding(append_batch_size as u32, &prev_batch_ids)
                 .await
                 .map_err(|e| ApiError::InternalError(format!("list unextracted chunks failed: {}", e)))?,
             None => Vec::new(),
@@ -2962,7 +2975,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
 
         if batch_idx == 0 {
             tracing::info!(
-                "do_append_graph: starting (Layer 4 revised: writer-mutex master, snapshot publish at end; streaming qdrant pages of {})",
+                "do_append_graph: starting (Layer 4 revised: writer-mutex master, snapshot publish at end; streaming qdrant pages of {}, cross-page pipeline)",
                 append_batch_size,
             );
         }
@@ -2973,63 +2986,296 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
             .map(|(id, text)| (graphrag_core::core::ChunkId::new(id), text))
             .collect();
 
-        // Mutate the master in place. No clone, no Arc::make_mut.
-        let batch_summary = master.extend_graph(&batch_chunks).await.map_err(|e| {
-            ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
-        })?;
-
+        // Streaming pipeline: as `extend_graph_streaming` merges each
+        // chunk's extraction into the master graph, it emits a
+        // `ChunkExtractionDelta` to a channel. A consumer task drains
+        // the channel — buffering across chunks for embedding
+        // efficiency, deduplicating entity/rel ids, calling the
+        // existing `persist_touched_snapshot` to embed via OVMS
+        // (concurrent single-text, 8-wide) and upsert to qdrant.
+        // LLM extraction (Spark vLLM) and embedding (OVMS NPU) +
+        // qdrant upserts run concurrently; pipeline wall ≈
+        // max(LLM_total, embed_total) instead of sum.
+        //
+        // Channel capacity (64) bounds the in-memory work-set:
+        // producer's `tx.send().await` blocks if the consumer falls
+        // behind, naturally throttling the merge loop.
         #[cfg(feature = "qdrant")]
-        let snapshot = graph_persistence::snapshot_touched(
-            master,
-            &batch_summary.touched_entity_ids,
-            &batch_summary.touched_relationship_keys,
-        );
+        let (consumer_handle, batch_persist_counts): (
+            Option<tokio::task::JoinHandle<(usize, usize)>>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) = {
+            use std::collections::HashSet;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
-        total_chunks_processed += batch_summary.chunks_processed;
-        total_new_entities += batch_summary.new_entities;
-        total_new_relationships += batch_summary.new_relationships;
-        total_mentions_merged += batch_summary.mentions_merged;
-        last_total_entities = batch_summary.total_entities;
-        last_total_relationships = batch_summary.total_relationships;
+            let batch_idx_for_consumer = batch_idx;
+            let entities_persisted = std::sync::Arc::new(AtomicUsize::new(0));
+            let relationships_persisted = std::sync::Arc::new(AtomicUsize::new(0));
 
-        // Persist this batch's delta to qdrant + mark chunks extracted.
-        // Best-effort — extraction is idempotent; if mark fails the
-        // chunks re-extract next /append cycle.
-        #[cfg(feature = "qdrant")]
-        if let Some(qdrant) = state.qdrant.as_ref() {
-            let entity_count = snapshot.entities.len();
-            let rel_count = snapshot.relationships.len();
-            match graph_persistence::persist_touched_snapshot(
-                snapshot,
-                qdrant,
-                state.embeddings.load_full().as_ref(),
-            )
-            .await
-            {
-                Ok((e, r)) => tracing::info!(
-                    "💾 Persisted delta to Qdrant: {} entities, {} relationships (batch {})",
-                    e, r, batch_idx
-                ),
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    batch_idx,
-                    touched_entities = entity_count,
-                    touched_relationships = rel_count,
-                    "graph persistence failed for batch; will retry on next cycle"
-                ),
+            if let Some(qdrant) = state.qdrant.as_ref().cloned() {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                    graphrag_core::ChunkExtractionDelta,
+                >(64);
+
+                // Move the sender into the GraphRAG call below; the
+                // consumer task receives until the sender drops.
+                let embeddings = state.embeddings.load_full();
+                let ent_persisted = entities_persisted.clone();
+                let rel_persisted = relationships_persisted.clone();
+                let consumer = tokio::spawn(async move {
+                    use graph_persistence::TouchedSnapshot;
+
+                    // Flush threshold: 32 items aligns with the
+                    // OVMS-side concurrent-8 single-text embed (4
+                    // sequential round-trips per flush). Smaller
+                    // means more flushes (more qdrant upserts);
+                    // larger means longer first-flush latency.
+                    const FLUSH_THRESHOLD: usize = 32;
+
+                    let mut seen_entity_ids: HashSet<String> = HashSet::new();
+                    let mut seen_rel_keys: HashSet<(String, String, String)> = HashSet::new();
+                    let mut buf_entities: Vec<(graphrag_core::core::Entity, String)> = Vec::new();
+                    let mut buf_relationships: Vec<(graphrag_core::core::Relationship, String)> = Vec::new();
+                    let mut flush_idx = 0usize;
+
+                    let do_flush = |buf_entities: &mut Vec<_>,
+                                    buf_relationships: &mut Vec<_>,
+                                    flush_idx: &mut usize|
+                     -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send + '_>,
+                    > {
+                        let qdrant = qdrant.clone();
+                        let embeddings = embeddings.clone();
+                        let ent_persisted = ent_persisted.clone();
+                        let rel_persisted = rel_persisted.clone();
+                        let snapshot = TouchedSnapshot {
+                            entities: std::mem::take(buf_entities),
+                            relationships: std::mem::take(buf_relationships),
+                        };
+                        let cur_flush = *flush_idx;
+                        *flush_idx += 1;
+                        Box::pin(async move {
+                            let n_e = snapshot.entities.len();
+                            let n_r = snapshot.relationships.len();
+                            match graph_persistence::persist_touched_snapshot(
+                                snapshot,
+                                qdrant.as_ref(),
+                                embeddings.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok((e, r)) => {
+                                    ent_persisted.fetch_add(e, Ordering::SeqCst);
+                                    rel_persisted.fetch_add(r, Ordering::SeqCst);
+                                    tracing::info!(
+                                        "💾 stream-flush {}: persisted {} entities, {} relationships",
+                                        cur_flush, e, r
+                                    );
+                                },
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        flush_idx = cur_flush,
+                                        touched_entities = n_e,
+                                        touched_relationships = n_r,
+                                        "stream-flush failed; will retry on next cycle (chunks won't get marked extracted)"
+                                    );
+                                },
+                            }
+                        })
+                    };
+
+                    while let Some(delta) = rx.recv().await {
+                        for entity in delta.entities {
+                            let id_str = entity.id.0.clone();
+                            if seen_entity_ids.insert(id_str) {
+                                // Skip entities that already have a
+                                // cached embedding (existing entity
+                                // re-mentioned). persist_touched_snapshot
+                                // ALSO does this filter, but doing it
+                                // here too saves the per-flush bookkeeping.
+                                if entity.embedding.is_some() {
+                                    continue;
+                                }
+                                let text = format!("{} ({})", entity.name, entity.entity_type);
+                                buf_entities.push((entity, text));
+                            }
+                        }
+                        for (rel, src_name, tgt_name) in delta.relationships {
+                            let key = (
+                                rel.source.0.clone(),
+                                rel.relation_type.clone(),
+                                rel.target.0.clone(),
+                            );
+                            if seen_rel_keys.insert(key) {
+                                if rel.embedding.is_some() {
+                                    continue;
+                                }
+                                let text =
+                                    format!("{} {} {}", src_name, rel.relation_type, tgt_name);
+                                buf_relationships.push((rel, text));
+                            }
+                        }
+                        if buf_entities.len() + buf_relationships.len() >= FLUSH_THRESHOLD {
+                            do_flush(&mut buf_entities, &mut buf_relationships, &mut flush_idx)
+                                .await;
+                        }
+                    }
+                    // Sender dropped; drain the tail.
+                    if !buf_entities.is_empty() || !buf_relationships.is_empty() {
+                        do_flush(&mut buf_entities, &mut buf_relationships, &mut flush_idx).await;
+                    }
+                    let e = ent_persisted.load(Ordering::SeqCst);
+                    let r = rel_persisted.load(Ordering::SeqCst);
+                    tracing::info!(
+                        "stream-consumer (batch {}): drained {} flushes, {} entities, {} relationships",
+                        batch_idx_for_consumer, flush_idx, e, r,
+                    );
+                    (e, r)
+                });
+
+                // Drive extraction with the streaming sink. tx is
+                // moved here; on return it drops, signaling the
+                // consumer to drain and exit.
+                let summary_result = master
+                    .extend_graph_streaming(&batch_chunks, Some(tx))
+                    .await;
+
+                let batch_summary = summary_result.map_err(|e| {
+                    ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
+                })?;
+
+                total_chunks_processed += batch_summary.chunks_processed;
+                total_new_entities += batch_summary.new_entities;
+                total_new_relationships += batch_summary.new_relationships;
+                total_mentions_merged += batch_summary.mentions_merged;
+                last_total_entities = batch_summary.total_entities;
+                last_total_relationships = batch_summary.total_relationships;
+
+                (Some(consumer), entities_persisted)
+            } else {
+                // No qdrant — fall back to the in-memory-only path.
+                let batch_summary = master.extend_graph(&batch_chunks).await.map_err(|e| {
+                    ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
+                })?;
+                total_chunks_processed += batch_summary.chunks_processed;
+                total_new_entities += batch_summary.new_entities;
+                total_new_relationships += batch_summary.new_relationships;
+                total_mentions_merged += batch_summary.mentions_merged;
+                last_total_entities = batch_summary.total_entities;
+                last_total_relationships = batch_summary.total_relationships;
+                (None, entities_persisted)
             }
-            let now_ts = chrono::Utc::now().timestamp();
-            if let Err(e) = qdrant.mark_chunks_extracted(&batch_ids, now_ts).await {
-                tracing::warn!(
-                    error = %e,
-                    batch_idx,
-                    "mark_chunks_extracted failed; batch will re-extract next cycle"
-                );
-            }
+        };
+        #[cfg(not(feature = "qdrant"))]
+        {
+            let batch_summary = master.extend_graph(&batch_chunks).await.map_err(|e| {
+                ApiError::InternalError(format!("Append batch {} failed: {}", batch_idx, e))
+            })?;
+            total_chunks_processed += batch_summary.chunks_processed;
+            total_new_entities += batch_summary.new_entities;
+            total_new_relationships += batch_summary.new_relationships;
+            total_mentions_merged += batch_summary.mentions_merged;
+            last_total_entities = batch_summary.total_entities;
+            last_total_relationships = batch_summary.total_relationships;
         }
 
-        let _ = batch_ids; // marked extracted in qdrant; no further use
+        // Cross-page pipeline: instead of awaiting THIS batch's
+        // consumer here, await the PREVIOUS batch's consumer (if
+        // any). That lets the prev batch's embed+upsert run in
+        // parallel with this batch's LLM extraction (which has
+        // already completed by the time we reach here, but the
+        // overlap happened above during extend_graph_streaming).
+        // THIS batch's consumer becomes the new "prev" for the next
+        // iteration to await.
+        //
+        // Mark-chunks-extracted happens AFTER prev's consumer
+        // drains, so a process death mid-cycle leaves any
+        // not-yet-persisted chunks unmarked → ready to re-extract
+        // next cycle (idempotent via merge_entity dedupe).
+        #[cfg(feature = "qdrant")]
+        {
+            // Drain the prev batch (the one we held back to overlap
+            // with this batch's LLM extraction).
+            if let Some(prev_handle) = prev_consumer_handle.take() {
+                match prev_handle.await {
+                    Ok((e, r)) => {
+                        tracing::info!(
+                            "💾 Persisted delta to Qdrant: {} entities, {} relationships (prev-batch streaming complete, current batch_idx={})",
+                            e,
+                            r,
+                            batch_idx,
+                        );
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            batch_idx,
+                            "prev stream-consumer task panicked; prev batch's chunks will NOT be marked extracted (will re-extract next cycle)"
+                        );
+                        let _ = batch_persist_counts;
+                        // Skip mark for prev; reset prev state so
+                        // the new batch becomes the next prev.
+                        prev_batch_ids = batch_ids;
+                        prev_consumer_handle = consumer_handle;
+                        batch_idx += 1;
+                        continue;
+                    },
+                }
+                if !prev_batch_ids.is_empty() {
+                    if let Some(qdrant) = state.qdrant.as_ref() {
+                        let now_ts = chrono::Utc::now().timestamp();
+                        if let Err(e) = qdrant.mark_chunks_extracted(&prev_batch_ids, now_ts).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                batch_idx,
+                                "mark_chunks_extracted (prev batch) failed; prev batch will re-extract next cycle"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Hand off: this batch becomes the new prev. Its
+            // consumer keeps draining in the background; we'll
+            // await it in the next iteration (overlapping with the
+            // next batch's LLM extraction).
+            prev_batch_ids = batch_ids;
+            prev_consumer_handle = consumer_handle;
+        }
+
         batch_idx += 1;
+    }
+
+    // Drain the FINAL prev batch (no next iteration to overlap with).
+    #[cfg(feature = "qdrant")]
+    if let Some(prev_handle) = prev_consumer_handle.take() {
+        match prev_handle.await {
+            Ok((e, r)) => {
+                tracing::info!(
+                    "💾 Persisted delta to Qdrant: {} entities, {} relationships (final batch streaming complete)",
+                    e, r,
+                );
+            },
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "final stream-consumer task panicked; final batch's chunks will NOT be marked extracted"
+                );
+            },
+        }
+        if !prev_batch_ids.is_empty() {
+            if let Some(qdrant) = state.qdrant.as_ref() {
+                let now_ts = chrono::Utc::now().timestamp();
+                if let Err(e) = qdrant.mark_chunks_extracted(&prev_batch_ids, now_ts).await {
+                    tracing::warn!(
+                        error = %e,
+                        "mark_chunks_extracted (final batch) failed; will re-extract next cycle"
+                    );
+                }
+            }
+        }
     }
 
     if batch_idx == 0 {

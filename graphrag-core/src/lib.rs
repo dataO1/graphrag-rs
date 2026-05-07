@@ -431,6 +431,41 @@ pub struct ExtendSummary {
     pub touched_relationship_keys: Vec<(String, String, String)>,
 }
 
+/// Per-chunk extraction delta emitted by
+/// [`GraphRAG::extend_graph_streaming`] AS each chunk's LLM
+/// extraction completes and merges into the master graph. Lets a
+/// caller (e.g. `graphrag-server`'s `do_append_graph`) pipeline
+/// embedding/persistence with extraction — embed each new entity as
+/// soon as it's known, instead of waiting for the whole batch to
+/// finish.
+///
+/// Each delta carries cloned `Entity` / `Relationship` snapshots
+/// (with source/target names resolved at emission time for
+/// relationships). The consumer doesn't need access to the master
+/// graph: it has everything required to compute embedding text and
+/// upsert to qdrant. Cross-chunk deduplication is the consumer's
+/// job — an entity surfacing in two chunks within the same batch
+/// arrives in two deltas; the consumer's `seen` set decides what to
+/// embed.
+#[derive(Debug, Clone)]
+pub struct ChunkExtractionDelta {
+    /// The chunk that just finished extracting.
+    pub chunk_id: ChunkId,
+    /// Cloned `Entity` records for this chunk's contribution
+    /// (includes both newly-added and existing-but-touched entities
+    /// after dedupe-by-id). Cloned at emission time from the live
+    /// graph, so the `embedding` field reflects current state —
+    /// `None` for entities the LLM just minted, `Some` for entities
+    /// previously persisted to qdrant.
+    pub entities: Vec<Entity>,
+    /// Cloned `Relationship` records paired with their source and
+    /// target entity NAMES, resolved from the live graph at
+    /// emission time. Consumers use the names to compute embedding
+    /// text `"src_name relation_type tgt_name"` without needing to
+    /// look up entities.
+    pub relationships: Vec<(Relationship, String, String)>,
+}
+
 /// Build the SOURCE TEXT block for `ask_with_*` synthesis prompts
 /// under a configurable byte budget. Iterates `chunk_ids` in order,
 /// looks up each chunk's text in `chunk_contents`, char-truncates
@@ -798,10 +833,40 @@ impl GraphRAG {
     /// values produced by extraction reference these qdrant ids
     /// directly, so they resolve from Qdrant on subsequent recalls
     /// without any in-memory chunk universe.
+    /// Streaming variant of [`Self::extend_graph`]. Identical
+    /// semantics, but if `delta_sink` is `Some`, every successfully
+    /// extracted chunk emits a [`ChunkExtractionDelta`] AS the merge
+    /// completes — letting a caller (graphrag-server) pipeline
+    /// embedding/persistence with the LLM phase. If `delta_sink` is
+    /// `None`, behaviour is identical to `extend_graph` (no per-chunk
+    /// emissions).
+    ///
+    /// Sends are awaited (`tokio::sync::mpsc::Sender::send`), so a
+    /// slow consumer naturally backpressures the merge loop. This
+    /// caps the in-memory work-set: extraction can't outrun
+    /// embedding by more than the channel's buffer.
+    #[cfg(feature = "async")]
+    pub async fn extend_graph_streaming(
+        &mut self,
+        input_chunks: &[(crate::core::ChunkId, String)],
+        delta_sink: Option<tokio::sync::mpsc::Sender<ChunkExtractionDelta>>,
+    ) -> Result<ExtendSummary> {
+        self.extend_graph_inner(input_chunks, delta_sink).await
+    }
+
     #[cfg(feature = "async")]
     pub async fn extend_graph(
         &mut self,
         input_chunks: &[(crate::core::ChunkId, String)],
+    ) -> Result<ExtendSummary> {
+        self.extend_graph_inner(input_chunks, None).await
+    }
+
+    #[cfg(feature = "async")]
+    async fn extend_graph_inner(
+        &mut self,
+        input_chunks: &[(crate::core::ChunkId, String)],
+        delta_sink: Option<tokio::sync::mpsc::Sender<ChunkExtractionDelta>>,
     ) -> Result<ExtendSummary> {
         use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -873,7 +938,13 @@ impl GraphRAG {
         if self.config.entities.use_gleaning && self.config.chat_enabled() {
             self.extend_with_gleaning(&delta_chunks, &mut metrics, &make_pb).await?;
         } else if self.config.chat_enabled() {
-            self.extend_with_llm_single_pass(&delta_chunks, &mut metrics, &make_pb).await?;
+            self.extend_with_llm_single_pass(
+                &delta_chunks,
+                &mut metrics,
+                &make_pb,
+                delta_sink.as_ref(),
+            )
+            .await?;
         } else if self.config.gliner.enabled {
             #[cfg(feature = "gliner")]
             {
@@ -921,12 +992,20 @@ impl GraphRAG {
     /// branch in `build_graph` but operates on the supplied delta
     /// slice instead of every chunk in the graph, and dedupes
     /// entities by id on insert.
+    ///
+    /// `delta_sink`: when `Some`, each chunk's merge emits a
+    /// [`ChunkExtractionDelta`] before the loop advances. Lets a
+    /// caller pipeline embedding/persistence with extraction. The
+    /// `.send().await` naturally backpressures the merge loop if the
+    /// consumer is slow, so the in-memory work-set stays bounded by
+    /// `channel_capacity + spawn_ahead`.
     #[cfg(feature = "async")]
     async fn extend_with_llm_single_pass(
         &mut self,
         delta_chunks: &[crate::core::TextChunk],
         metrics: &mut ExtractMetrics,
         make_pb: &(impl Fn(u64, indicatif::ProgressStyle) -> indicatif::ProgressBar + Send + Sync),
+        delta_sink: Option<&tokio::sync::mpsc::Sender<ChunkExtractionDelta>>,
     ) -> Result<()> {
         use crate::entity::llm_extractor::LLMEntityExtractor;
         use indicatif::ProgressStyle;
@@ -1042,11 +1121,94 @@ impl GraphRAG {
                             message: "Knowledge graph went away mid-extract".to_string(),
                         }
                     })?;
+                    // Track the per-chunk touched-set (post-dedupe)
+                    // separately from the running batch-wide metrics
+                    // so we can emit a delta covering only THIS
+                    // chunk's contribution. The metrics.touched_*
+                    // accumulators stay correct for the batch-end
+                    // ExtendSummary.
+                    let entities_before = metrics.touched_entity_ids.len();
+                    let rels_before = metrics.touched_relationship_keys.len();
                     for entity in entities {
                         Self::merge_entity(graph, entity, metrics)?;
                     }
                     for relationship in relationships {
                         Self::merge_relationship(graph, relationship, metrics);
+                    }
+
+                    // Emit a streaming delta to the consumer (if any)
+                    // BEFORE advancing the loop, so the consumer can
+                    // start embedding while the next chunk's LLM call
+                    // is still in flight.
+                    //
+                    // Clone the just-merged entities + relationships
+                    // OUT OF the master graph (we still hold &mut
+                    // self.knowledge_graph here, so the consumer
+                    // running in another task wouldn't be able to
+                    // peek). For relationships we resolve src/tgt
+                    // entity names while the lookup is local. The
+                    // clones are bounded per chunk (~10 entities, ~10
+                    // rels typical) so the per-iteration allocation
+                    // is small (~100 KB).
+                    if let Some(sink) = delta_sink {
+                        // Re-borrow as immutable now that merge_*
+                        // returned. Inside this scope we only read.
+                        let graph_ref: &KnowledgeGraph =
+                            self.knowledge_graph.as_ref().expect(
+                                "knowledge_graph just used mutably above and didn't Option-clear",
+                            );
+                        let chunk_entities: Vec<Entity> = metrics
+                            .touched_entity_ids[entities_before..]
+                            .iter()
+                            .filter_map(|id_str| {
+                                let eid = EntityId::new(id_str.clone());
+                                graph_ref.get_entity(&eid).cloned()
+                            })
+                            .collect();
+                        let chunk_relationships: Vec<(Relationship, String, String)> = metrics
+                            .touched_relationship_keys[rels_before..]
+                            .iter()
+                            .filter_map(|(src, rel_type, tgt)| {
+                                let src_eid = EntityId::new(src.clone());
+                                let tgt_eid = EntityId::new(tgt.clone());
+                                let rel = graph_ref
+                                    .relationships()
+                                    .find(|r| {
+                                        r.source == src_eid
+                                            && r.target == tgt_eid
+                                            && r.relation_type == *rel_type
+                                    })
+                                    .cloned()?;
+                                let src_name = graph_ref
+                                    .get_entity(&src_eid)
+                                    .map(|e| e.name.clone())
+                                    .unwrap_or_else(|| "?".to_string());
+                                let tgt_name = graph_ref
+                                    .get_entity(&tgt_eid)
+                                    .map(|e| e.name.clone())
+                                    .unwrap_or_else(|| "?".to_string());
+                                Some((rel, src_name, tgt_name))
+                            })
+                            .collect();
+                        if !chunk_entities.is_empty() || !chunk_relationships.is_empty() {
+                            let delta = ChunkExtractionDelta {
+                                chunk_id: chunk.id.clone(),
+                                entities: chunk_entities,
+                                relationships: chunk_relationships,
+                            };
+                            // Backpressure: if consumer is slow, this
+                            // .await blocks the merge loop. That's the
+                            // natural throttle that keeps extraction
+                            // from outrunning embedding.
+                            if sink.send(delta).await.is_err() {
+                                #[cfg(feature = "tracing")]
+                                tracing::warn!(
+                                    "extend_graph: delta sink closed mid-extract; \
+                                     downstream consumer dropped — continuing \
+                                     extraction without streaming"
+                                );
+                            }
+                        }
                     }
                 },
                 Err(e) => {
