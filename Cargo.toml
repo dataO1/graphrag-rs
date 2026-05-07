@@ -109,8 +109,13 @@ reedline = "0.37"
 ollama-rs = "0.2"
 jsonfixer = "0.1" # JSON repair for malformed LLM output
 
-# HTTP client
+# HTTP clients. ureq stays for the Ollama backend (synchronous, run via
+# spawn_blocking) and the figment/late_chunking helper paths; reqwest is
+# the async client for the OpenAI-compat path on graphrag-core (entity
+# extraction, query planner, completion checks). graphrag-server uses
+# reqwest for embeddings.
 ureq = { version = "2.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # JSON
 json = "0.12"

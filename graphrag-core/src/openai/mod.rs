@@ -10,7 +10,7 @@
 //! Feature gating: `OpenAIConfig` is unconditional so user configs
 //! round-trip through serde whether or not the `openai` feature is on.
 //! `OpenAIClient` and the HTTP path are gated behind `feature = "openai"`
-//! (which itself depends on `ureq` + `async`). Without the feature,
+//! (which itself depends on `reqwest` + `async`). Without the feature,
 //! `chat::ChatClient::from_config` silently treats `openai.enabled = true`
 //! as "no openai available" and falls back to Ollama / None.
 
@@ -114,15 +114,18 @@ impl Default for OpenAIConfig {
 
 /// OpenAI-compatible chat client.
 ///
-/// Uses synchronous `ureq` (matching `OllamaClient`'s choice) wrapped in
-/// `tokio::task::spawn_blocking` for async callers. Keeps stats and a
-/// (currently bypassed) cache hook for parity with `OllamaClient`.
+/// Uses async `reqwest::Client` so callers don't pay the
+/// `spawn_blocking + ureq` round-trip on every chat call. The blocking
+/// thread pool is shared globally with embeddings, file I/O, etc.; with
+/// `llm.max = 128` the OpenAI HTTP path used to starve that pool and cap
+/// effective in-flight requests far below the configured concurrency.
+/// One `reqwest::Client` is built per `OpenAIClient::new` and reused for
+/// the lifetime of the client (connection pooling is automatic).
 #[cfg(feature = "openai")]
 #[derive(Clone)]
 pub struct OpenAIClient {
     config: OpenAIConfig,
-    #[cfg(feature = "ureq")]
-    agent: ureq::Agent,
+    http: reqwest::Client,
     stats: OllamaUsageStats,
 }
 
@@ -139,12 +142,23 @@ impl std::fmt::Debug for OpenAIClient {
 #[cfg(feature = "openai")]
 impl OpenAIClient {
     /// Build a new client. Network is not touched until the first
-    /// `generate*` call.
+    /// `generate*` call. The reqwest client uses HTTP/1.1 keep-alive
+    /// connections by default; one client instance pools them per host.
     pub fn new(config: OpenAIConfig) -> Self {
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds);
+        // The reqwest builder rejects a client built without a runtime if
+        // any cfg goes wrong; a `.build()` failure here would only happen
+        // on a system without TLS support, which our rustls-tls feature
+        // covers. Fall back to the default client (which will fail later
+        // on TLS calls only) rather than panic at construction time.
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            #[cfg(feature = "ureq")]
-            agent: ureq::AgentBuilder::new().build(),
+            http,
             stats: OllamaUsageStats::new(),
         }
     }
@@ -263,90 +277,66 @@ impl OpenAIClient {
     }
 
     /// Send a fully-built chat-completions request body. Shared between
-    /// `generate_with_params` and `generate_with_extras`.
+    /// `generate_with_params` and `generate_with_extras`. Async over
+    /// reqwest — no spawn_blocking, the future yields on every I/O wait
+    /// so the tokio reactor remains free to drive other futures (other
+    /// in-flight LLM calls, embedding HTTP, qdrant writes, …).
     async fn send_chat_request(&self, body: serde_json::Value) -> Result<String> {
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
 
-        let api_key = self.config.api_key.clone();
-        let timeout = std::time::Duration::from_secs(self.config.timeout_seconds);
-        let stats = self.stats.clone();
+        let mut req = self.http.post(&url).json(&body);
+        if !self.config.api_key.is_empty() {
+            req = req.bearer_auth(&self.config.api_key);
+        }
 
-        // ureq is sync — push the network call onto the blocking pool so
-        // we don't block the tokio reactor. Mirrors what OllamaClient does.
-        let response = tokio::task::spawn_blocking(move || -> Result<String> {
-            #[cfg(feature = "ureq")]
-            {
-                let mut req = ureq::AgentBuilder::new()
-                    .timeout(timeout)
-                    .build()
-                    .post(&url)
-                    .set("Content-Type", "application/json");
-                if !api_key.is_empty() {
-                    req = req.set("Authorization", &format!("Bearer {}", api_key));
-                }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                self.stats.record_failure();
+                return Err(GraphRAGError::Generation {
+                    message: format!("OpenAI transport error: {e}"),
+                });
+            },
+        };
 
-                let resp = match req.send_json(body) {
-                    Ok(r) => r,
-                    Err(ureq::Error::Status(code, r)) => {
-                        let body = r.into_string().unwrap_or_default();
-                        stats.record_failure();
-                        return Err(GraphRAGError::Generation {
-                            message: format!("OpenAI HTTP {code}: {body}"),
-                        });
-                    },
-                    Err(e) => {
-                        stats.record_failure();
-                        return Err(GraphRAGError::Generation {
-                            message: format!("OpenAI transport error: {e}"),
-                        });
-                    },
-                };
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            self.stats.record_failure();
+            return Err(GraphRAGError::Generation {
+                message: format!("OpenAI HTTP {code}: {body}"),
+            });
+        }
 
-                let parsed: serde_json::Value = match resp.into_json() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        stats.record_failure();
-                        return Err(GraphRAGError::Generation {
-                            message: format!("OpenAI response parse: {e}"),
-                        });
-                    },
-                };
+        let parsed: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                self.stats.record_failure();
+                return Err(GraphRAGError::Generation {
+                    message: format!("OpenAI response parse: {e}"),
+                });
+            },
+        };
 
-                // OpenAI/llama-server/vLLM all return:
-                //   { choices: [{ message: { role: "assistant", content: "..." } }],
-                //     usage: { prompt_tokens, completion_tokens, total_tokens } }
-                let content = parsed
-                    .pointer("/choices/0/message/content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+        // OpenAI/llama-server/vLLM all return:
+        //   { choices: [{ message: { role: "assistant", content: "..." } }],
+        //     usage: { prompt_tokens, completion_tokens, total_tokens } }
+        let content = parsed
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-                let total_tokens = parsed
-                    .pointer("/usage/total_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                stats.record_success(total_tokens);
+        let total_tokens = parsed
+            .pointer("/usage/total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        self.stats.record_success(total_tokens);
 
-                Ok(content)
-            }
-            #[cfg(not(feature = "ureq"))]
-            {
-                let _ = (url, body, api_key, timeout);
-                stats.record_failure();
-                Err(GraphRAGError::Generation {
-                    message: "OpenAI client requires the `ureq` feature".to_string(),
-                })
-            }
-        })
-        .await
-        .map_err(|e| GraphRAGError::Generation {
-            message: format!("OpenAI join error: {e}"),
-        })??;
-
-        Ok(response)
+        Ok(content)
     }
 
     /// Stub for parity with OllamaClient.

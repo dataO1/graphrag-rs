@@ -177,11 +177,13 @@ corpus-processing = [
 ollama = ["ollama-rs", "async"] # Ollama LLM support (requires async)
 
 # OpenAI-compatible chat backend (vLLM, llama-server, OVMS, OpenRouter,
-# OpenAI itself, ...). Mirrors `ollama` — opt-in, requires async + ureq
-# for the HTTP client. OpenAIConfig itself stays unconditional so
-# user configs round-trip through serde regardless of this flag; only
-# the OpenAIClient and the ChatClient::OpenAI dispatch arm are gated.
-openai = ["ureq", "async"]
+# OpenAI itself, ...). Mirrors `ollama` — opt-in, requires async +
+# reqwest for the async HTTP client (was ureq + spawn_blocking — moved
+# off the blocking thread pool 2026-05-07 to unblock LLM concurrency
+# above ~16 in-flight). OpenAIConfig itself stays unconditional so user
+# configs round-trip through serde regardless of this flag; only the
+# OpenAIClient and the ChatClient::OpenAI dispatch arm are gated.
+openai = ["dep:reqwest", "async"]
 
 # GLiNER-Relex: joint NER + RE via ONNX Runtime (~1.5 GB VRAM, no LLM required)
 gliner = ["dep:gline-rs", "dep:orp", "parking_lot", "dep:composable"]
@@ -211,7 +213,8 @@ petgraph = { workspace = true }
 indexmap = { workspace = true }
 text_analysis = "0.3"
 regex = { workspace = true }
-ureq = { workspace = true, optional = true } # HTTP client (not needed for WASM)
+ureq = { workspace = true, optional = true } # HTTP client (not needed for WASM); used by Ollama backend + late_chunking helper
+reqwest = { workspace = true, optional = true } # Async HTTP client used by the OpenAI-compat backend
 json = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
