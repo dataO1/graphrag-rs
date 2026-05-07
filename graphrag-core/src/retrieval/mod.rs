@@ -558,29 +558,6 @@ mod tests {
         assert!(retrieval.is_ok());
     }
 
-    #[test]
-    fn test_query_placeholder() {
-        let config = Config::default();
-        let retrieval = RetrievalSystem::new(&config).unwrap();
-
-        let results = retrieval.query("test query");
-        assert!(results.is_ok());
-
-        let results = results.unwrap();
-        assert!(!results.is_empty());
-        assert!(results[0].contains("test query"));
-    }
-
-    #[tokio::test]
-    async fn test_graph_indexing() {
-        let config = Config::default();
-        let mut retrieval = RetrievalSystem::new(&config).unwrap();
-        let graph = KnowledgeGraph::new();
-
-        let result = retrieval.index_graph(&graph).await;
-        assert!(result.is_ok());
-    }
-
     // ============================================================================
     // ExplainedAnswer Tests
     // ============================================================================

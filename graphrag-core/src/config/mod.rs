@@ -97,6 +97,16 @@ pub struct Config {
     #[serde(default)]
     pub openai: crate::openai::OpenAIConfig,
 
+    /// Adaptive AIMD concurrency control for chat-LLM upstream calls.
+    /// Backend-agnostic: gates every call so the in-flight budget
+    /// self-tunes to whatever the active upstream can sustain. When
+    /// the local fallback is active (single-slot llama.cpp) the cap
+    /// shrinks within seconds of the first timeout; when the primary
+    /// (e.g. Spark vLLM) comes back, it climbs to `max` over the next
+    /// few minutes of successful calls.
+    #[serde(default, alias = "llm_concurrency")]
+    pub llm: LlmConcurrencyConfig,
+
     /// GLiNER-Relex extractor configuration
     pub gliner: GlinerConfig,
 
@@ -120,6 +130,74 @@ pub struct Config {
     /// Set to `true` when running inside a TUI to avoid corrupting the terminal.
     #[serde(default)]
     pub suppress_progress_bars: bool,
+}
+
+/// Adaptive AIMD concurrency configuration for the chat-LLM upstream.
+///
+/// Backend-agnostic: the AIMD controller in
+/// [`crate::llm_concurrency::AdaptiveSemaphore`] grows the in-flight
+/// permit count by 1 after `success_threshold` consecutive successful
+/// chat completions, and halves it on any transport-level failure
+/// (timeout, connection error, 429, 5xx). Floors at 1, caps at `max`.
+///
+/// JSON / TOML field names match the struct fields (snake_case via
+/// serde defaults). Older configs that lack this section parse fine —
+/// every field has a serde default — so existing deployments continue
+/// to work unchanged.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct LlmConcurrencyConfig {
+    /// Initial permit count at server start. Server-side probe (e.g.
+    /// llama.cpp `/props` returning `total_slots`) can override this
+    /// before the semaphore is constructed; otherwise this static
+    /// default is used. Default 64.
+    #[serde(default = "default_llm_initial")]
+    pub initial: usize,
+    /// Hard cap. Permit count never grows above this value. Default 64.
+    #[serde(default = "default_llm_max")]
+    pub max: usize,
+    /// Number of consecutive successes before the cap grows by 1.
+    /// Default 10.
+    #[serde(default = "default_llm_success_threshold")]
+    pub success_threshold: usize,
+    /// Multiplicative-decrease factor on transport failure. `0.5`
+    /// halves; `0.25` quarters. Floored at 1 permit. Default 0.5.
+    #[serde(default = "default_llm_failure_decay")]
+    pub failure_decay: f32,
+    /// Minimum gap (ms) between consecutive shrinks. Without a
+    /// cooldown, a burst of N simultaneous failures would halve N
+    /// times and over-shrink. Default 500ms.
+    #[serde(default = "default_llm_shrink_cooldown_ms")]
+    pub shrink_cooldown_ms: u64,
+}
+
+fn default_llm_initial() -> usize { 64 }
+fn default_llm_max() -> usize { 64 }
+fn default_llm_success_threshold() -> usize { 10 }
+fn default_llm_failure_decay() -> f32 { 0.5 }
+fn default_llm_shrink_cooldown_ms() -> u64 { 500 }
+
+impl Default for LlmConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            initial: default_llm_initial(),
+            max: default_llm_max(),
+            success_threshold: default_llm_success_threshold(),
+            failure_decay: default_llm_failure_decay(),
+            shrink_cooldown_ms: default_llm_shrink_cooldown_ms(),
+        }
+    }
+}
+
+impl From<LlmConcurrencyConfig> for crate::llm_concurrency::AdaptiveConfig {
+    fn from(c: LlmConcurrencyConfig) -> Self {
+        Self {
+            initial: c.initial,
+            max: c.max,
+            success_threshold: c.success_threshold,
+            failure_decay: c.failure_decay,
+            shrink_cooldown_ms: c.shrink_cooldown_ms,
+        }
+    }
 }
 
 /// GLiNER-Relex extractor configuration (joint NER + RE via ONNX Runtime)
@@ -1498,6 +1576,7 @@ impl Default for Config {
             },
             ollama: crate::ollama::OllamaConfig::default(),
             openai: crate::openai::OpenAIConfig::default(),
+            llm: LlmConcurrencyConfig::default(),
             gliner: GlinerConfig::default(),
             enhancements: enhancements::EnhancementsConfig::default(),
             auto_save: AutoSaveConfig {
@@ -1915,6 +1994,23 @@ impl Config {
                         None
                     }
                 },
+            },
+            llm: LlmConcurrencyConfig {
+                initial: parsed["llm"]["initial"]
+                    .as_usize()
+                    .unwrap_or(default_llm_initial()),
+                max: parsed["llm"]["max"]
+                    .as_usize()
+                    .unwrap_or(default_llm_max()),
+                success_threshold: parsed["llm"]["success_threshold"]
+                    .as_usize()
+                    .unwrap_or(default_llm_success_threshold()),
+                failure_decay: parsed["llm"]["failure_decay"]
+                    .as_f32()
+                    .unwrap_or(default_llm_failure_decay()),
+                shrink_cooldown_ms: parsed["llm"]["shrink_cooldown_ms"]
+                    .as_u64()
+                    .unwrap_or(default_llm_shrink_cooldown_ms()),
             },
             gliner: GlinerConfig {
                 enabled: parsed["gliner"]["enabled"].as_bool().unwrap_or(false),

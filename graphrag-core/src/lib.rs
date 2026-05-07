@@ -82,6 +82,10 @@ pub mod nlp;
 pub mod ollama;
 pub mod openai;
 pub mod chat;
+/// Adaptive AIMD concurrency control for LLM upstream calls. Backend-
+/// agnostic: gates every chat-completion call so the in-flight budget
+/// self-tunes to whatever the active upstream can sustain.
+pub mod llm_concurrency;
 /// Persistence layer for knowledge graphs (workspace management always available)
 pub mod persistence;
 /// Query processing and execution
@@ -291,6 +295,14 @@ pub struct GraphRAG {
     /// the hash-based dummy `EmbeddingGenerator`. `None` means tests /
     /// standalone use — fall back to dummy.
     embedding_provider: Option<core::traits::DynEmbedder>,
+    /// Adaptive AIMD permit budget for chat-LLM upstream calls. Built
+    /// from `config.llm` in [`GraphRAG::new`]; injected into every
+    /// `ChatClient` constructed during extraction / gleaning / query
+    /// planning so the budget is shared across the entire instance.
+    /// `None` means tests / standalone use that don't go through
+    /// [`GraphRAG::new`] — calls are not gated.
+    #[cfg(feature = "async")]
+    llm_semaphore: Option<std::sync::Arc<llm_concurrency::AdaptiveSemaphore>>,
     #[cfg(feature = "parallel-processing")]
     #[allow(dead_code)]
     parallel_processor: Option<parallel::ParallelProcessor>,
@@ -422,6 +434,10 @@ pub struct ExtendSummary {
 impl GraphRAG {
     /// Create a new GraphRAG instance with the given configuration
     pub fn new(config: Config) -> Result<Self> {
+        #[cfg(feature = "async")]
+        let llm_semaphore = Some(llm_concurrency::AdaptiveSemaphore::new(
+            config.llm.into(),
+        ));
         Ok(Self {
             config,
             knowledge_graph: None,
@@ -429,9 +445,57 @@ impl GraphRAG {
             query_planner: None,
             critic: None,
             embedding_provider: None,
+            #[cfg(feature = "async")]
+            llm_semaphore,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
         })
+    }
+
+    /// Replace the adaptive concurrency semaphore. Hosts that have
+    /// already probed the upstream (e.g. graphrag-server hitting
+    /// `/props` to read `total_slots` from llama.cpp) call this with a
+    /// pre-seeded semaphore so the AIMD controller starts at the
+    /// known-good cap instead of the static `config.llm.initial`.
+    ///
+    /// Must be called BEFORE the first extraction / query call —
+    /// otherwise the previous semaphore is in use by in-flight clients
+    /// and replacing it will not affect them.
+    #[cfg(feature = "async")]
+    pub fn set_llm_semaphore(
+        &mut self,
+        sem: std::sync::Arc<llm_concurrency::AdaptiveSemaphore>,
+    ) {
+        self.llm_semaphore = Some(sem);
+    }
+
+    /// Read access to the current adaptive concurrency semaphore.
+    /// Hosts (graphrag-server) use this to surface live permit counts
+    /// in telemetry / health responses.
+    #[cfg(feature = "async")]
+    pub fn llm_semaphore(
+        &self,
+    ) -> Option<&std::sync::Arc<llm_concurrency::AdaptiveSemaphore>> {
+        self.llm_semaphore.as_ref()
+    }
+
+    /// Build a [`chat::ChatClient`] from the active config with the
+    /// shared adaptive concurrency semaphore attached. Returns `None`
+    /// when neither `ollama.enabled` nor `openai.enabled` is set.
+    ///
+    /// All internal call sites that need a chat client go through this
+    /// helper so the AIMD permit budget is uniformly enforced — there
+    /// is no path that bypasses it.
+    #[cfg(feature = "async")]
+    fn build_chat_client(&self) -> Option<chat::ChatClient> {
+        let mut client = chat::ChatClient::from_config(
+            &self.config.ollama,
+            &self.config.openai,
+        )?;
+        if let Some(sem) = self.llm_semaphore.as_ref() {
+            client = client.with_semaphore(std::sync::Arc::clone(sem));
+        }
+        Some(client)
     }
 
     /// Inject a real embedding service. Call this once after
@@ -520,9 +584,7 @@ impl GraphRAG {
         }
         self.retrieval_system = Some(rs);
 
-        if let Some(client) =
-            chat::ChatClient::from_config(&self.config.ollama, &self.config.openai)
-        {
+        if let Some(client) = self.build_chat_client() {
             self.query_planner = Some(query::planner::QueryPlanner::new(client));
         }
 
@@ -782,16 +844,14 @@ impl GraphRAG {
         metrics: &mut ExtractMetrics,
         make_pb: &(impl Fn(u64, indicatif::ProgressStyle) -> indicatif::ProgressBar + Send + Sync),
     ) -> Result<()> {
-        use crate::chat::ChatClient;
         use crate::entity::llm_extractor::LLMEntityExtractor;
         use indicatif::ProgressStyle;
 
-        let client = ChatClient::from_config(&self.config.ollama, &self.config.openai)
-            .ok_or_else(|| GraphRAGError::Config {
-                message: "extend_graph: chat_enabled() but no ChatClient could be \
-                          constructed; check config.{ollama,openai}.enabled"
-                    .to_string(),
-            })?;
+        let client = self.build_chat_client().ok_or_else(|| GraphRAGError::Config {
+            message: "extend_graph: chat_enabled() but no ChatClient could be \
+                      constructed; check config.{ollama,openai}.enabled"
+                .to_string(),
+        })?;
 
         let entity_types = if self.config.entities.entity_types.is_empty() {
             vec![
@@ -830,30 +890,32 @@ impl GraphRAG {
         );
         pb.set_message("Extending graph (LLM single-pass)");
 
-        // Concurrency knob. EXTRACTION_CONCURRENCY caps how many
-        // chunk extractions can be in flight against the chat backend
-        // simultaneously. Match it to llama-server's `--parallel`
-        // (or vLLM's `--max-num-seqs`); going higher than the
-        // backend's slot count just queues requests and adds latency
-        // without throughput. Default 4 — comfortable for a
-        // ctx=92K/parallel=4 llama-server slot layout (23K per slot,
-        // ample for the ~4K an extraction call needs).
-        let concurrency: usize = std::env::var("EXTRACTION_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|n: &usize| *n >= 1)
-            .unwrap_or(4);
+        // Spawn-ahead bound. The actual in-flight cap is enforced by
+        // the AIMD semaphore inside `ChatClient`; this just controls how
+        // many extraction futures we keep buffered (each holds a chunk
+        // string, so it costs memory). Sized to the configured `max` so
+        // the semaphore is the only real bottleneck — when the cap is
+        // 64, all 64 in-flight calls run concurrently; when AIMD has
+        // shrunk the cap to 1, the other 63 wait at the semaphore
+        // acquire and we still fetch chunks just-in-time.
+        let spawn_ahead = self.config.llm.max.max(1);
 
         let total = delta_chunks.len();
+        let initial_permits = self
+            .llm_semaphore
+            .as_ref()
+            .map(|s| s.current_permits())
+            .unwrap_or(spawn_ahead);
         #[cfg(feature = "tracing")]
         tracing::info!(
             total = total,
-            concurrency = concurrency,
-            "extend_graph: starting LLM single-pass with bounded concurrency"
+            spawn_ahead = spawn_ahead,
+            llm_permits = initial_permits,
+            "extend_graph: starting LLM single-pass (AIMD-gated concurrency)"
         );
 
         // Build a stream of (idx, future-of-result) and let
-        // `buffer_unordered` keep `concurrency` futures in flight.
+        // `buffer_unordered` keep `spawn_ahead` futures in flight.
         // Each future is pure read-only (extractor + chunk → result);
         // graph mutation happens in the serial consumer below where
         // we hold &mut self.knowledge_graph exclusively.
@@ -866,22 +928,27 @@ impl GraphRAG {
                     (idx, chunk, res)
                 }
             })
-            .buffer_unordered(concurrency);
+            .buffer_unordered(spawn_ahead);
 
         let mut completed = 0usize;
         while let Some((idx, chunk, result)) = stream.next().await {
             completed += 1;
             #[cfg(feature = "tracing")]
+            let live_permits = self
+                .llm_semaphore
+                .as_ref()
+                .map(|s| s.current_permits())
+                .unwrap_or(spawn_ahead);
             tracing::info!(
-                "extend_graph: completed delta chunk {}/{} (idx={}, concurrency={}, LLM single-pass)",
+                "extend_graph: completed delta chunk {}/{} (idx={}, llm_permits={}, LLM single-pass)",
                 completed,
                 total,
                 idx,
-                concurrency
+                live_permits
             );
             pb.set_message(format!(
-                "Delta chunk {}/{} (LLM single-pass, c={})",
-                completed, total, concurrency
+                "Delta chunk {}/{} (LLM single-pass, permits={})",
+                completed, total, live_permits
             ));
 
             match result {
@@ -925,16 +992,14 @@ impl GraphRAG {
         metrics: &mut ExtractMetrics,
         make_pb: &(impl Fn(u64, indicatif::ProgressStyle) -> indicatif::ProgressBar + Send + Sync),
     ) -> Result<()> {
-        use crate::chat::ChatClient;
         use crate::entity::GleaningEntityExtractor;
         use indicatif::ProgressStyle;
 
-        let client = ChatClient::from_config(&self.config.ollama, &self.config.openai)
-            .ok_or_else(|| GraphRAGError::Config {
-                message: "extend_graph: chat_enabled() but no ChatClient could be \
-                          constructed"
-                    .to_string(),
-            })?;
+        let client = self.build_chat_client().ok_or_else(|| GraphRAGError::Config {
+            message: "extend_graph: chat_enabled() but no ChatClient could be \
+                      constructed"
+                .to_string(),
+        })?;
 
         let gleaning_config = crate::entity::GleaningConfig {
             max_gleaning_rounds: self.config.entities.max_gleaning_rounds,
@@ -1419,12 +1484,9 @@ impl GraphRAG {
     /// inputs by the caller.
     #[cfg(feature = "async")]
     pub async fn extract_query_keywords(&self, query: &str) -> Result<QueryKeywords> {
-        use crate::chat::ChatClient;
-
-        let client = ChatClient::from_config(&self.config.ollama, &self.config.openai)
-            .ok_or_else(|| GraphRAGError::Generation {
-                message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
-            })?;
+        let client = self.build_chat_client().ok_or_else(|| GraphRAGError::Generation {
+            message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
+        })?;
 
         let prompt = format!(
             "---Goal---\n\
@@ -1623,7 +1685,6 @@ impl GraphRAG {
         max_neighbors_per_seed: usize,
         chunk_contents: &std::collections::HashMap<ChunkId, String>,
     ) -> Result<retrieval::ExplainedAnswer> {
-        use crate::chat::ChatClient;
         use std::collections::{HashMap, HashSet};
 
         let kg = self.knowledge_graph.as_ref().ok_or_else(|| {
@@ -1753,10 +1814,9 @@ impl GraphRAG {
         );
 
         // ---- LLM call -------------------------------------------------
-        let client = ChatClient::from_config(&self.config.ollama, &self.config.openai)
-            .ok_or_else(|| GraphRAGError::Generation {
-                message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
-            })?;
+        let client = self.build_chat_client().ok_or_else(|| GraphRAGError::Generation {
+            message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
+        })?;
 
         let prompt = format!(
             "You are a knowledgeable assistant answering questions grounded in a knowledge graph.\n\n\
@@ -1930,7 +1990,6 @@ impl GraphRAG {
         max_neighbors_per_seed: usize,
         chunk_contents: &std::collections::HashMap<ChunkId, String>,
     ) -> Result<retrieval::ExplainedAnswer> {
-        use crate::chat::ChatClient;
         use std::collections::{HashMap, HashSet};
 
         let kg = self.knowledge_graph.as_ref().ok_or_else(|| {
@@ -2011,10 +2070,9 @@ impl GraphRAG {
 
         // 3. LLM call. Same prompt skeleton + thinking-tag hygiene to
         //    keep output consistent across modes.
-        let client = ChatClient::from_config(&self.config.ollama, &self.config.openai)
-            .ok_or_else(|| GraphRAGError::Generation {
-                message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
-            })?;
+        let client = self.build_chat_client().ok_or_else(|| GraphRAGError::Generation {
+            message: "no chat backend enabled (config.ollama.enabled / config.openai.enabled both false)".to_string(),
+        })?;
 
         let prompt = format!(
             "You are a knowledgeable assistant answering questions grounded in a knowledge graph.\n\n\

@@ -159,6 +159,33 @@ pub async fn set_config(
     // Initialize GraphRAG with the config
     tracing::info!("Initializing GraphRAG with custom configuration...");
 
+    // Best-effort probe of the chat upstream's slot count. llama.cpp's
+    // server exposes `GET /props` with `total_slots` (= --parallel); other
+    // OpenAI-compat backends (vLLM, real OpenAI) typically don't, so a
+    // 404 / non-JSON response is normal — we just fall back to the
+    // configured `llm.initial`. The AIMD controller will discover the
+    // actual capacity within a few minutes either way.
+    let mut config = config;
+    let probed_slots = probe_upstream_slots(&config.openai.base_url).await;
+    if let Some(slots) = probed_slots {
+        let cap = config.llm.max;
+        let seed = slots.clamp(1, cap);
+        tracing::info!(
+            "llm.concurrency: probed total_slots={} from {}/props; seeding initial={} (cap={})",
+            slots,
+            config.openai.base_url.trim_end_matches('/'),
+            seed,
+            cap,
+        );
+        config.llm.initial = seed;
+    } else {
+        tracing::info!(
+            "llm.concurrency: no /props on upstream (or probe failed); using configured initial={} (cap={})",
+            config.llm.initial,
+            config.llm.max,
+        );
+    }
+
     let mut graphrag = graphrag_core::GraphRAG::new(config)
         .map_err(|e| ApiError::InternalError(format!("GraphRAG init failed: {}", e)))?;
 
@@ -269,6 +296,40 @@ pub async fn get_default_config() -> Json<serde_json::Value> {
         "config": config,
         "description": "Default GraphRAG configuration with sensible defaults"
     }))
+}
+
+/// Best-effort probe for the chat upstream's slot count. Hits
+/// `<base_url-without-/v1>/props` with a 2s timeout — that's the
+/// llama.cpp server's properties endpoint, which returns
+/// `{ "total_slots": N, ... }` (matching `--parallel`).
+///
+/// Returns `Some(N)` only on a successful 2xx with a numeric
+/// `total_slots` field. Any failure (404, timeout, non-llama backend,
+/// nginx router that doesn't proxy `/props`, …) returns `None` and the
+/// caller falls back to the configured `llm.initial`. The AIMD
+/// controller discovers actual capacity at runtime regardless.
+async fn probe_upstream_slots(base_url: &str) -> Option<usize> {
+    let trimmed = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let url = format!("{trimmed}/props");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("total_slots")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .filter(|n| *n >= 1)
 }
 
 /// POST /api/config/validate - Validate configuration without applying
