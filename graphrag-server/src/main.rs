@@ -3013,24 +3013,37 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
             let relationships_persisted = std::sync::Arc::new(AtomicUsize::new(0));
 
             if let Some(qdrant) = state.qdrant.as_ref().cloned() {
+                // Channel capacity scales with the LLM concurrency cap so
+                // the merge loop is never blocked on `tx.send().await`
+                // while the consumer is mid-flush. With `llm.max = 128`,
+                // 128 in-flight extractions can each emit a delta before
+                // the consumer drains one — 2× headroom (256) absorbs the
+                // typical burst plus a small flush in flight. Floored at
+                // 64 to match the previous hardcoded value (so callers
+                // running with llm.max=8 don't get an absurdly small
+                // 16-slot channel).
+                let delta_channel_capacity =
+                    (state.config.load().llm.max.saturating_mul(2)).max(64);
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<
                     graphrag_core::ChunkExtractionDelta,
-                >(64);
+                >(delta_channel_capacity);
 
                 // Move the sender into the GraphRAG call below; the
                 // consumer task receives until the sender drops.
                 let embeddings = state.embeddings.load_full();
                 let ent_persisted = entities_persisted.clone();
                 let rel_persisted = relationships_persisted.clone();
+                // Snapshot the flush threshold from the live config so the
+                // moved closure doesn't need state. Floor at 1 so a
+                // misconfigured 0 doesn't stall the consumer.
+                let flush_threshold = state
+                    .config
+                    .load()
+                    .embeddings
+                    .flush_threshold
+                    .max(1);
                 let consumer = tokio::spawn(async move {
                     use graph_persistence::TouchedSnapshot;
-
-                    // Flush threshold: 32 items aligns with the
-                    // OVMS-side concurrent-8 single-text embed (4
-                    // sequential round-trips per flush). Smaller
-                    // means more flushes (more qdrant upserts);
-                    // larger means longer first-flush latency.
-                    const FLUSH_THRESHOLD: usize = 32;
 
                     let mut seen_entity_ids: HashSet<String> = HashSet::new();
                     let mut seen_rel_keys: HashSet<(String, String, String)> = HashSet::new();
@@ -3116,7 +3129,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
                                 buf_relationships.push((rel, text));
                             }
                         }
-                        if buf_entities.len() + buf_relationships.len() >= FLUSH_THRESHOLD {
+                        if buf_entities.len() + buf_relationships.len() >= flush_threshold {
                             do_flush(&mut buf_entities, &mut buf_relationships, &mut flush_idx)
                                 .await;
                         }

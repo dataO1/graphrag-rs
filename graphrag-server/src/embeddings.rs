@@ -263,7 +263,7 @@ impl EmbeddingService {
     /// because the OVMS `/v3/embeddings` Mediapipe graph in this
     /// deployment does NOT accept `input: [...]` (array form). Single
     /// posts are run concurrently via `buffer_unordered`
-    /// ([`OPENAI_CONCURRENT_REQUESTS`] in flight) to overlap network
+    /// (`config.max_concurrent` in flight, default 16) to overlap network
     /// round-trips with NPU compute — same throughput win as
     /// batched-input, no server-side change required.
     ///
@@ -313,12 +313,13 @@ impl EmbeddingService {
             embedding: Vec<f32>,
         }
 
-        // 8 concurrent single-text POSTs is the OVMS sweet spot.
-        // The Mediapipe graph behind /v3/embeddings does its own
-        // intra-request batching (sub-batch=8 in OVMS config), and
-        // accepts up to ~16 concurrent HTTP requests cleanly. 8 keeps
-        // us comfortably under that without hand-tuning OVMS.
-        const OPENAI_CONCURRENT_REQUESTS: usize = 8;
+        // Concurrent in-flight POSTs. Driven by `embeddings.max_concurrent`
+        // (config-overridable; default 16). Was hardcoded 8 — bumped 2026-05-07
+        // after the audit to better saturate the embedding backend (OVMS
+        // pipelines preprocess + NPU + postprocess, so concurrency above
+        // the NPU's effective slot count still buys overlap). Floor at 1
+        // so a misconfigured 0 doesn't deadlock buffer_unordered.
+        let openai_concurrent = self.config.max_concurrent.max(1);
 
         let url = format!("{}/embeddings", client.base_url.trim_end_matches('/'));
         let dim = self.config.dimension;
@@ -329,7 +330,7 @@ impl EmbeddingService {
 
         tracing::info!(
             "embeddings.openai: starting {} requests, concurrency={}",
-            total, OPENAI_CONCURRENT_REQUESTS,
+            total, openai_concurrent,
         );
         let overall_start = std::time::Instant::now();
 
@@ -418,7 +419,7 @@ impl EmbeddingService {
                         Ok::<_, EmbeddingError>((req_idx, entry.embedding))
                     }
                 })
-                .buffer_unordered(OPENAI_CONCURRENT_REQUESTS)
+                .buffer_unordered(openai_concurrent)
                 .collect()
                 .await;
 
@@ -610,6 +611,8 @@ mod tests {
             api_key: None,
             cache_dir: None,
             batch_size: 32,
+            max_concurrent: 16,
+            flush_threshold: 64,
         }
     }
 

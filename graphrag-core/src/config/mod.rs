@@ -171,9 +171,18 @@ pub struct LlmConcurrencyConfig {
     /// halves; `0.25` quarters. Floored at 1 permit. Default 0.5.
     #[serde(default = "default_llm_failure_decay")]
     pub failure_decay: f32,
-    /// Minimum gap (ms) between consecutive shrinks. Without a
-    /// cooldown, a burst of N simultaneous failures would halve N
-    /// times and over-shrink. Default 500ms.
+    /// Minimum gap (ms) between consecutive shrinks. Without a cooldown,
+    /// a burst of N simultaneous failures would halve N times and
+    /// over-shrink — at `llm.max = 128`, a single 1-2s upstream blip
+    /// hitting all in-flight requests can collapse the cap to the floor
+    /// (1) in milliseconds, with ~30s recovery to climb back via
+    /// additive +1-per-`success_threshold`-successes.
+    ///
+    /// Default 5000ms (was 500ms before 2026-05-07): a single discrete
+    /// upstream event of any duration < 5s causes at most ONE shrink.
+    /// Lower this if you actually want fast adaptation to sustained
+    /// upstream degradation; raise it if your upstream has flaky
+    /// 1-2s blips you'd rather absorb than respond to.
     #[serde(default = "default_llm_shrink_cooldown_ms")]
     pub shrink_cooldown_ms: u64,
 }
@@ -182,7 +191,7 @@ fn default_llm_initial() -> usize { 64 }
 fn default_llm_max() -> usize { 64 }
 fn default_llm_success_threshold() -> usize { 10 }
 fn default_llm_failure_decay() -> f32 { 0.5 }
-fn default_llm_shrink_cooldown_ms() -> u64 { 500 }
+fn default_llm_shrink_cooldown_ms() -> u64 { 5000 }
 
 impl Default for LlmConcurrencyConfig {
     fn default() -> Self {
@@ -1133,10 +1142,41 @@ pub struct EmbeddingConfig {
     /// Batch size for processing multiple texts
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// Maximum number of concurrent in-flight embedding HTTP requests
+    /// dispatched by `EmbeddingService::generate_with_openai`. The OVMS
+    /// `/v3/embeddings` Mediapipe graph in our default deployment does
+    /// not accept array input, so the service fans single-text POSTs out
+    /// `buffer_unordered`-style; this knob caps the fanout. NPU-bound
+    /// backends (OVMS) saturate around 8–16; bandwidth-bound vLLM
+    /// embedding endpoints can handle higher. Default 16. Was previously
+    /// hardcoded to 8.
+    #[serde(default = "default_embedding_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Streaming-pipeline flush threshold: graphrag-server's append-graph
+    /// consumer accumulates touched entities + relationships and triggers
+    /// one embed-and-upsert flush when `entities.len() + rels.len()
+    /// >= flush_threshold`. Larger = fewer Qdrant round-trips, larger
+    /// embedding batches per flush, slightly more in-memory buffer
+    /// pressure on the consumer side. Smaller = lower flush latency.
+    /// Pairs with `max_concurrent`: a 64-item flush against
+    /// `max_concurrent = 16` is 4 sequential rounds of 16 in-flight
+    /// embedding posts. Default 64. Was previously hardcoded to 32.
+    #[serde(default = "default_embedding_flush_threshold")]
+    pub flush_threshold: usize,
 }
 
 fn default_batch_size() -> usize {
     32
+}
+
+fn default_embedding_max_concurrent() -> usize {
+    16
+}
+
+fn default_embedding_flush_threshold() -> usize {
+    64
 }
 
 /// Configuration for graph construction
@@ -1601,6 +1641,8 @@ impl Default for Config {
                 api_key: None,
                 cache_dir: None,
                 batch_size: default_batch_size(),
+                max_concurrent: default_embedding_max_concurrent(),
+                flush_threshold: default_embedding_flush_threshold(),
             },
             graph: GraphConfig {
                 max_connections: default_max_connections(),
@@ -1906,6 +1948,12 @@ impl Config {
                 batch_size: parsed["embeddings"]["batch_size"]
                     .as_usize()
                     .unwrap_or(default_batch_size()),
+                max_concurrent: parsed["embeddings"]["max_concurrent"]
+                    .as_usize()
+                    .unwrap_or(default_embedding_max_concurrent()),
+                flush_threshold: parsed["embeddings"]["flush_threshold"]
+                    .as_usize()
+                    .unwrap_or(default_embedding_flush_threshold()),
             },
             graph: GraphConfig {
                 max_connections: parsed["graph"]["max_connections"]
