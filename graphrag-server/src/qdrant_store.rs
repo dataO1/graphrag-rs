@@ -1341,55 +1341,96 @@ impl QdrantStore {
         // persist_graph for one source of truth.
         self.ensure_graph_collections(dimension).await?;
 
-        if !entity_payloads.is_empty() {
-            let points: Vec<PointStruct> = entity_payloads
-                .iter()
-                .map(|(e, embedding)| {
-                    let pid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, e.id.as_bytes())
-                        .to_string();
-                    let payload_value = serde_json::to_value(e).unwrap_or(serde_json::json!({}));
-                    let payload_map: HashMap<String, QdrantValue> = payload_value
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, v)| (k, QdrantValue::from(v)))
-                        .collect();
-                    PointStruct::new(pid, embedding.clone(), payload_map)
-                })
-                .collect();
-            self.client
-                .upsert_points(UpsertPointsBuilder::new(self.entities_collection(), points))
-                .await
-                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
-        }
+        // Build the entity + relationship PointStructs upfront. Cheap
+        // (CPU + serde), so doing it before the Qdrant POST overlap
+        // doesn't waste latency. Empty inputs short-circuit to a no-op
+        // future so the join below stays the same shape regardless.
+        let entity_points: Option<Vec<PointStruct>> = if entity_payloads.is_empty() {
+            None
+        } else {
+            Some(
+                entity_payloads
+                    .iter()
+                    .map(|(e, embedding)| {
+                        let pid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, e.id.as_bytes())
+                            .to_string();
+                        let payload_value =
+                            serde_json::to_value(e).unwrap_or(serde_json::json!({}));
+                        let payload_map: HashMap<String, QdrantValue> = payload_value
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(k, v)| (k, QdrantValue::from(v)))
+                            .collect();
+                        PointStruct::new(pid, embedding.clone(), payload_map)
+                    })
+                    .collect(),
+            )
+        };
 
-        if !relationship_payloads.is_empty() {
-            let points: Vec<PointStruct> = relationship_payloads
-                .iter()
-                .map(|(r, embedding)| {
-                    let stable = format!("{}|{}|{}", r.source, r.relation_type, r.target);
-                    let pid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, stable.as_bytes())
+        let relationship_points: Option<Vec<PointStruct>> = if relationship_payloads.is_empty() {
+            None
+        } else {
+            Some(
+                relationship_payloads
+                    .iter()
+                    .map(|(r, embedding)| {
+                        let stable =
+                            format!("{}|{}|{}", r.source, r.relation_type, r.target);
+                        let pid = uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_OID,
+                            stable.as_bytes(),
+                        )
                         .to_string();
-                    let payload_value = serde_json::to_value(r).unwrap_or(serde_json::json!({}));
-                    let payload_map: HashMap<String, QdrantValue> = payload_value
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, v)| (k, QdrantValue::from(v)))
-                        .collect();
-                    PointStruct::new(pid, embedding.clone(), payload_map)
-                })
-                .collect();
-            self.client
-                .upsert_points(UpsertPointsBuilder::new(
-                    self.relationships_collection(),
-                    points,
-                ))
-                .await
-                .map_err(|e| QdrantError::OperationError(e.to_string()))?;
-        }
+                        let payload_value =
+                            serde_json::to_value(r).unwrap_or(serde_json::json!({}));
+                        let payload_map: HashMap<String, QdrantValue> = payload_value
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(k, v)| (k, QdrantValue::from(v)))
+                            .collect();
+                        PointStruct::new(pid, embedding.clone(), payload_map)
+                    })
+                    .collect(),
+            )
+        };
+
+        // Run the two upserts concurrently — they target distinct
+        // collections (entities sidecar + relationships sidecar), so
+        // the qdrant server already serializes within a single
+        // collection but doesn't between collections. Two HTTP/2
+        // streams in flight halves the per-flush wall time. Was
+        // previously two sequential awaits.
+        let entities_collection = self.entities_collection();
+        let relationships_collection = self.relationships_collection();
+        let client = &self.client;
+
+        let entities_fut = async move {
+            if let Some(points) = entity_points {
+                client
+                    .upsert_points(UpsertPointsBuilder::new(entities_collection, points))
+                    .await
+                    .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+            }
+            Ok::<(), QdrantError>(())
+        };
+        let relationships_fut = async move {
+            if let Some(points) = relationship_points {
+                client
+                    .upsert_points(UpsertPointsBuilder::new(
+                        relationships_collection,
+                        points,
+                    ))
+                    .await
+                    .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+            }
+            Ok::<(), QdrantError>(())
+        };
+
+        tokio::try_join!(entities_fut, relationships_fut)?;
 
         Ok((entity_payloads.len(), relationship_payloads.len()))
     }
