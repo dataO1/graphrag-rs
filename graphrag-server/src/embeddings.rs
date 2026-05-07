@@ -259,61 +259,137 @@ impl EmbeddingService {
     }
 
     /// Generate embeddings using an OpenAI-compatible server (vLLM, OVMS,
-    /// llama-server, OpenAI itself, …). One POST per text — keeps the
-    /// dimension-validation path simple.
+    /// llama-server, OpenAI itself, …). Chunks `texts` into batches of
+    /// `config.batch_size` and sends each batch in ONE POST with
+    /// `input: [...]` (the OpenAI spec's array form, supported by OVMS,
+    /// vLLM, and llama.cpp's server). Runs up to
+    /// [`OPENAI_CONCURRENT_BATCHES`] batches in parallel to overlap
+    /// network round-trips with NPU/GPU compute.
+    ///
+    /// Why this matters: the previous implementation was one POST per
+    /// text (sequentially awaited). Persistence batch 0 in the
+    /// 2026-05-07 production trace had 1 323 vectors → 1 323
+    /// sequential round-trips at ~0.66 s each → 14 m 34 s of pure
+    /// HTTP idle-on-the-wire. Batching to 32-per-call → 42 calls;
+    /// concurrency 8 → ≤6 sequential rounds; total drops to ~10 s
+    /// at the same OVMS-side compute.
+    ///
+    /// Dimension validation runs per response item (every `data[i]`
+    /// is checked against `config.dimension`).
     #[cfg(feature = "openai")]
     async fn generate_with_openai(
         &self,
         client: &OpenAIClient,
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        let url = format!("{}/embeddings", client.base_url.trim_end_matches('/'));
-        let mut results = Vec::with_capacity(texts.len());
+        use futures::stream::{self, StreamExt};
 
-        for text in texts {
-            let body = serde_json::json!({
-                "model": client.model,
-                "input": text,
-            });
-            let mut req = client.http.post(&url).json(&body);
-            if !client.api_key.is_empty() {
-                req = req.bearer_auth(&client.api_key);
-            }
-
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(EmbeddingError::OpenAIError(format!(
-                    "HTTP {status} from {url}: {body}"
-                )));
-            }
-
-            let parsed: serde_json::Value = resp.json().await?;
-            let embedding: Vec<f32> = parsed
-                .get("data")
-                .and_then(|d| d.get(0))
-                .and_then(|d0| d0.get("embedding"))
-                .and_then(|e| e.as_array())
-                .ok_or_else(|| {
-                    EmbeddingError::GenerationFailed(format!(
-                        "OpenAI response missing data[0].embedding: {parsed}"
-                    ))
-                })?
-                .iter()
-                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-                .collect();
-
-            if embedding.len() != self.config.dimension {
-                return Err(EmbeddingError::DimensionMismatch {
-                    expected: self.config.dimension,
-                    actual: embedding.len(),
-                });
-            }
-            results.push(embedding);
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(results)
+        // Cap per-call payload size at config.batch_size; cap how many
+        // calls fly concurrently against OVMS at OPENAI_CONCURRENT_BATCHES.
+        // 8 is comfortable for OVMS-on-NPU (single device, but request
+        // pipelining + JSON-encode/decode overlap give real wins up to
+        // ~8). Tune via the const if a future backend wants different.
+        const OPENAI_CONCURRENT_BATCHES: usize = 8;
+        let batch_size = self.config.batch_size.max(1);
+
+        let url = format!("{}/embeddings", client.base_url.trim_end_matches('/'));
+        let dim = self.config.dimension;
+
+        // Index each batch so we can reassemble results in original
+        // order after `buffer_unordered` shuffles them by completion.
+        // Owned `Vec<String>` (rather than `Vec<&str>`) sidesteps the
+        // higher-ranked lifetime issue that arises when the closure
+        // is passed into `stream::iter().map(...)` — the async block
+        // captures the inputs `move`-style, and the resulting future
+        // can't carry a borrow into a long-lived stream.
+        let batch_inputs: Vec<(usize, Vec<String>)> = texts
+            .chunks(batch_size)
+            .enumerate()
+            .map(|(idx, batch)| (idx, batch.iter().map(|s| s.to_string()).collect()))
+            .collect();
+
+        let collected: Vec<Result<(usize, Vec<Vec<f32>>), EmbeddingError>> =
+            stream::iter(batch_inputs)
+                .map(|(batch_idx, inputs)| {
+                    let http = client.http.clone();
+                    let url = url.clone();
+                    let model = client.model.clone();
+                    let api_key = client.api_key.clone();
+                    async move {
+                        let body = serde_json::json!({
+                            "model": model,
+                            "input": inputs,
+                        });
+                        let mut req = http.post(&url).json(&body);
+                        if !api_key.is_empty() {
+                            req = req.bearer_auth(&api_key);
+                        }
+                        let resp = req.send().await?;
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            return Err(EmbeddingError::OpenAIError(format!(
+                                "HTTP {status} from {url}: {body}"
+                            )));
+                        }
+                        let parsed: serde_json::Value = resp.json().await?;
+                        let data = parsed
+                            .get("data")
+                            .and_then(|d| d.as_array())
+                            .ok_or_else(|| {
+                                EmbeddingError::GenerationFailed(format!(
+                                    "OpenAI response missing data[]: {parsed}"
+                                ))
+                            })?;
+                        if data.len() != inputs.len() {
+                            return Err(EmbeddingError::GenerationFailed(format!(
+                                "OpenAI returned {} embeddings for {} inputs",
+                                data.len(),
+                                inputs.len()
+                            )));
+                        }
+                        let mut out = Vec::with_capacity(inputs.len());
+                        for entry in data {
+                            let embedding: Vec<f32> = entry
+                                .get("embedding")
+                                .and_then(|e| e.as_array())
+                                .ok_or_else(|| {
+                                    EmbeddingError::GenerationFailed(format!(
+                                        "OpenAI response data[] entry missing embedding: {entry}"
+                                    ))
+                                })?
+                                .iter()
+                                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                                .collect();
+                            if embedding.len() != dim {
+                                return Err(EmbeddingError::DimensionMismatch {
+                                    expected: dim,
+                                    actual: embedding.len(),
+                                });
+                            }
+                            out.push(embedding);
+                        }
+                        Ok::<_, EmbeddingError>((batch_idx, out))
+                    }
+                })
+                .buffer_unordered(OPENAI_CONCURRENT_BATCHES)
+                .collect()
+                .await;
+
+        // Materialize errors first; on success, sort by batch index
+        // and flatten into the original input order.
+        let mut indexed: Vec<(usize, Vec<Vec<f32>>)> = collected
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        indexed.sort_by_key(|(idx, _)| *idx);
+        Ok(indexed
+            .into_iter()
+            .flat_map(|(_, batch)| batch)
+            .collect())
     }
 
     /// Generate single embedding
