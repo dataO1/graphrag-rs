@@ -661,17 +661,14 @@ impl ParquetPersistence {
             chunks.iter().map(|c| Some(c.start_offset as u64)).collect();
         let end_offsets: UInt64Array = chunks.iter().map(|c| Some(c.end_offset as u64)).collect();
 
-        // Build embeddings ListArray
+        // Phase 7: TextChunk no longer carries an embedding field;
+        // chunk vectors live exclusively in qdrant. Parquet save
+        // writes a null per chunk to preserve the schema column;
+        // legacy parquet readers see "embedding present per chunk
+        // but always null" rather than a structural diff.
         let mut embedding_builder = ListBuilder::new(arrow::array::Float32Builder::new());
-        for chunk in chunks.iter() {
-            if let Some(ref emb) = chunk.embedding {
-                for &val in emb {
-                    embedding_builder.values().append_value(val);
-                }
-                embedding_builder.append(true);
-            } else {
-                embedding_builder.append(false); // null
-            }
+        for _chunk in chunks.iter() {
+            embedding_builder.append(false); // null — embedding lives in qdrant now
         }
         let embeddings = embedding_builder.finish();
 
@@ -859,28 +856,15 @@ impl ParquetPersistence {
                     message: "Invalid summary column type".to_string(),
                 })?;
 
+            // Phase 7: TextChunk no longer carries an embedding
+            // field; the parquet column is preserved in the schema
+            // (writer-side change above writes nulls) but isn't
+            // loaded into the chunk struct. `embeddings` column is
+            // referenced only to keep the schema-validation
+            // `downcast_ref` upthread; chunk vectors live in qdrant.
+            let _ = &embeddings;
+
             for i in 0..batch.num_rows() {
-                // Extract embedding
-                let embedding = if !embeddings.is_null(i) {
-                    let emb_list = embeddings.value(i);
-                    let emb_floats = emb_list
-                        .as_any()
-                        .downcast_ref::<Float32Array>()
-                        .ok_or_else(|| GraphRAGError::Config {
-                            message: "Invalid embedding list type".to_string(),
-                        })?;
-
-                    let mut emb_vec = Vec::with_capacity(emb_floats.len());
-                    for j in 0..emb_floats.len() {
-                        if !emb_floats.is_null(j) {
-                            emb_vec.push(emb_floats.value(j));
-                        }
-                    }
-                    Some(emb_vec)
-                } else {
-                    None
-                };
-
                 // Extract entities
                 let mut entities = Vec::new();
                 if !entities_col.is_null(i) {
@@ -941,7 +925,6 @@ impl ParquetPersistence {
                     content: contents.value(i).to_string(),
                     start_offset: start_offsets.value(i) as usize,
                     end_offset: end_offsets.value(i) as usize,
-                    embedding,
                     entities,
                     metadata,
                 };

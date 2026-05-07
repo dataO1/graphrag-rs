@@ -143,12 +143,12 @@ impl HybridRetriever {
             }
         }
 
-        for chunk in graph.chunks() {
-            if let Some(embedding) = &chunk.embedding {
-                let id = format!("chunk:{}", chunk.id);
-                self.vector_index.add_vector(id, embedding.clone())?;
-            }
-        }
+        // Phase 7: chunks no longer carry an in-memory `embedding`
+        // field; chunk vectors live in qdrant. graph.chunks() is
+        // also empty in production. This module (`retrieval::hybrid`)
+        // is unreachable from graphrag-server, kept compiling pending
+        // Phase 5 dead-code deletion. The block stays as a no-op.
+        for _chunk in graph.chunks() {}
 
         // Build vector index
         if !self.vector_index.is_empty() {

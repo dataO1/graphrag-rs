@@ -194,7 +194,15 @@ pub struct Document {
     pub chunks: Vec<TextChunk>,
 }
 
-/// A chunk of text from a document
+/// A chunk of text from a document.
+///
+/// Phase 7 (2026-05-07): the `embedding: Option<Vec<f32>>` field was
+/// removed. Chunk vectors live exclusively in qdrant; the in-memory
+/// graph never carried a useful embedding here in production
+/// (graphrag-server reads chunk embeddings from qdrant via
+/// `fetch_chunks_by_ids`), and keeping the field meant per-chunk
+/// 4 KB of `Vec<f32>` rode along inside every `master.clone()`
+/// snapshot publish — feeding the OOM trace.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextChunk {
     /// Unique identifier for the chunk
@@ -207,8 +215,6 @@ pub struct TextChunk {
     pub start_offset: usize,
     /// Ending character offset in the original document
     pub end_offset: usize,
-    /// Optional vector embedding for the chunk
-    pub embedding: Option<Vec<f32>>,
     /// List of entity IDs mentioned in this chunk
     pub entities: Vec<EntityId>,
     /// Semantic metadata for the chunk (chapter, keywords, summary, etc.)
@@ -341,13 +347,30 @@ impl Relationship {
     }
 }
 
-/// Knowledge graph containing entities and their relationships
+/// Knowledge graph containing entities and their relationships.
+///
+/// Phase 7 (2026-05-07): the in-memory `chunks: IndexMap<ChunkId, TextChunk>`
+/// and `documents: IndexMap<DocumentId, Document>` fields were removed.
+/// graphrag-server's production path never populated them (Phase 6
+/// already redirected ingest to qdrant; `add_document` / `add_chunk`
+/// were dead in the hot path), but they rode along inside every
+/// `master.clone()` snapshot publish, contributing to the per-cycle
+/// memory footprint that fed the 88 GB anon-rss OOM trace
+/// (`memory/project_graphrag_oom_long_uptime.md`). Chunks + documents
+/// are now exclusively in qdrant; lookups go through
+/// `qdrant_store::fetch_chunks_by_ids` / `list_full_documents`.
+///
+/// The accessor methods (`chunks()`, `documents()`, `get_chunk()`,
+/// etc.) are preserved as no-ops returning empty iterators / `None`
+/// so dead-code retrieval submodules (Phase 5 cleanup target —
+/// `hybrid`, `enriched`, `pagerank_retrieval`, `async_graphrag`,
+/// `rograg/`) still compile without per-callsite patches. They
+/// produce empty results, which is harmless: those modules are
+/// unreachable from the production graphrag-server pipeline.
 #[derive(Debug, Clone)]
 pub struct KnowledgeGraph {
     graph: Graph<Entity, Relationship>,
     entity_index: HashMap<EntityId, NodeIndex>,
-    documents: IndexMap<DocumentId, Document>,
-    chunks: IndexMap<ChunkId, TextChunk>,
 
     /// Hierarchical organization of relationships (Phase 3.1)
     #[cfg(feature = "async")]
@@ -361,25 +384,17 @@ impl KnowledgeGraph {
         Self {
             graph: Graph::new(),
             entity_index: HashMap::new(),
-            documents: IndexMap::new(),
-            chunks: IndexMap::new(),
             #[cfg(feature = "async")]
             relationship_hierarchy: None,
         }
     }
 
-    /// Add a document to the knowledge graph
-    pub fn add_document(&mut self, document: Document) -> Result<()> {
-        let document_id = document.id.clone();
-
-        // Add chunks to the index
-        for chunk in &document.chunks {
-            self.chunks.insert(chunk.id.clone(), chunk.clone());
-        }
-
-        // Store the document
-        self.documents.insert(document_id, document);
-
+    /// Add a document to the knowledge graph.
+    ///
+    /// Phase 7: no-op. Documents and their chunks live in qdrant;
+    /// the in-memory graph never tracked them in production. Method
+    /// is kept for API compatibility with tests / standalone uses.
+    pub fn add_document(&mut self, _document: Document) -> Result<()> {
         Ok(())
     }
 
@@ -477,9 +492,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
-    /// Add a chunk to the knowledge graph
-    pub fn add_chunk(&mut self, chunk: TextChunk) -> Result<()> {
-        self.chunks.insert(chunk.id.clone(), chunk);
+    /// Add a chunk to the knowledge graph.
+    ///
+    /// Phase 7: no-op. Chunks live in qdrant.
+    pub fn add_chunk(&mut self, _chunk: TextChunk) -> Result<()> {
         Ok(())
     }
 
@@ -489,14 +505,17 @@ impl KnowledgeGraph {
         self.graph.node_weight(*node_idx)
     }
 
-    /// Get a document by ID
-    pub fn get_document(&self, id: &DocumentId) -> Option<&Document> {
-        self.documents.get(id)
+    /// Get a document by ID. Phase 7: always `None` in production —
+    /// documents live in qdrant.
+    pub fn get_document(&self, _id: &DocumentId) -> Option<&Document> {
+        None
     }
 
-    /// Get a chunk by ID
-    pub fn get_chunk(&self, id: &ChunkId) -> Option<&TextChunk> {
-        self.chunks.get(id)
+    /// Get a chunk by ID. Phase 7: always `None` in production —
+    /// chunks live in qdrant; use
+    /// `qdrant_store::fetch_chunks_by_ids` instead.
+    pub fn get_chunk(&self, _id: &ChunkId) -> Option<&TextChunk> {
+        None
     }
 
     /// Get a mutable reference to an entity by ID
@@ -505,9 +524,10 @@ impl KnowledgeGraph {
         self.graph.node_weight_mut(*node_idx)
     }
 
-    /// Get a mutable reference to a chunk by ID
-    pub fn get_chunk_mut(&mut self, id: &ChunkId) -> Option<&mut TextChunk> {
-        self.chunks.get_mut(id)
+    /// Get a mutable reference to a chunk by ID. Phase 7: always
+    /// `None` — chunks live in qdrant.
+    pub fn get_chunk_mut(&mut self, _id: &ChunkId) -> Option<&mut TextChunk> {
+        None
     }
 
     /// Get all entities
@@ -520,24 +540,25 @@ impl KnowledgeGraph {
         self.graph.node_weights_mut()
     }
 
-    /// Get all documents
+    /// Get all documents. Phase 7: always empty — documents live
+    /// in qdrant.
     pub fn documents(&self) -> impl Iterator<Item = &Document> {
-        self.documents.values()
+        std::iter::empty()
     }
 
-    /// Get all documents (mutable)
+    /// Get all documents (mutable). Phase 7: always empty.
     pub fn documents_mut(&mut self) -> impl Iterator<Item = &mut Document> {
-        self.documents.values_mut()
+        std::iter::empty()
     }
 
-    /// Get all chunks
+    /// Get all chunks. Phase 7: always empty — chunks live in qdrant.
     pub fn chunks(&self) -> impl Iterator<Item = &TextChunk> {
-        self.chunks.values()
+        std::iter::empty()
     }
 
-    /// Get all chunks (mutable)
+    /// Get all chunks (mutable). Phase 7: always empty.
     pub fn chunks_mut(&mut self) -> impl Iterator<Item = &mut TextChunk> {
-        self.chunks.values_mut()
+        std::iter::empty()
     }
 
     /// Get neighbors of an entity
@@ -676,10 +697,13 @@ impl KnowledgeGraph {
                     content,
                     start_offset,
                     end_offset,
-                    embedding: None, // Embeddings not stored in JSON
                     entities,
                     metadata: ChunkMetadata::default(),
                 };
+                // Phase 7: kg.add_chunk is a no-op; chunks live in
+                // qdrant. We keep the JSON parse for backward compat
+                // with consumers that read load_from_json directly,
+                // but the chunks aren't stored in the in-memory KG.
                 kg.add_chunk(chunk)?;
             }
         }
@@ -786,30 +810,12 @@ impl KnowledgeGraph {
         }
         json_data["relationships"] = relationships_array;
 
-        // Add chunks information with FULL content for persistence
-        let mut chunks_array = json::JsonValue::new_array();
-        for chunk in self.chunks() {
-            let mut chunk_obj = json::object! {
-                "id" => chunk.id.to_string(),
-                "document_id" => chunk.document_id.to_string(),
-                "content" => chunk.content.clone(),  // Full content for persistence
-                "start_offset" => chunk.start_offset,
-                "end_offset" => chunk.end_offset
-            };
-
-            // Add entities list
-            let entities_list: Vec<String> = chunk.entities.iter().map(|e| e.to_string()).collect();
-            chunk_obj["entities"] = entities_list.into();
-
-            // Add embedding info
-            chunk_obj["has_embedding"] = chunk.embedding.is_some().into();
-            if let Some(embedding) = &chunk.embedding {
-                chunk_obj["embedding_dimension"] = embedding.len().into();
-            }
-
-            chunks_array.push(chunk_obj).unwrap();
-        }
-        json_data["chunks"] = chunks_array;
+        // Phase 7: chunks are no longer in the in-memory graph. The
+        // chunks() iterator returns empty; the resulting "chunks":[]
+        // array is preserved in the JSON for backwards compatibility
+        // with consumers expecting the field. Authoritative chunk
+        // data (content, embedding, metadata) lives in qdrant.
+        json_data["chunks"] = json::JsonValue::new_array();
 
         // Add documents information with FULL content for persistence
         let mut documents_array = json::JsonValue::new_array();
@@ -1298,15 +1304,15 @@ impl TextChunk {
             content,
             start_offset,
             end_offset,
-            embedding: None,
             entities: Vec::new(),
             metadata: ChunkMetadata::default(),
         }
     }
 
-    /// Add an embedding to the chunk
-    pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
-        self.embedding = Some(embedding);
+    /// Add an embedding to the chunk. Phase 7: no-op — chunk
+    /// embeddings live in qdrant, not in the in-memory chunk.
+    /// Method preserved for API compatibility.
+    pub fn with_embedding(self, _embedding: Vec<f32>) -> Self {
         self
     }
 

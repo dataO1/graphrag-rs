@@ -30,6 +30,19 @@ openai = ["graphrag-core/openai"]
 [dependencies]
 graphrag-core = { path = "../graphrag-core", features = ["caching", "lightrag", "pagerank", "memory-storage"] }
 
+# mimalloc as the global allocator. The default Rust allocator (glibc
+# malloc on Linux) retains free arenas indefinitely — for a long-running
+# process that allocates large transient buffers (`master.clone()` of
+# the in-memory KnowledgeGraph at each /api/graph/append cycle, ~200 MB
+# each), RSS climbs monotonically. 2026-05-07: graphrag-server hit
+# 88 GB anon-rss after 1h 13min uptime + 8 publish cycles → OOM-killed.
+# mimalloc returns arenas to the OS aggressively and has a portable
+# Rust crate with no autoconf-style native build dependencies (jemalloc
+# was the first try but its autoconf probe of `strerror_r` returned
+# the wrong type under glibc + the build's CFLAGS, blocking the build).
+# See `memory/project_graphrag_oom_long_uptime.md`.
+mimalloc = { version = "0.1", default-features = false }
+
 # Optional: Ollama embeddings (requires main graphrag crate)
 ollama-rs = { version = "0.2", optional = true }
 

@@ -844,7 +844,6 @@ impl GraphRAG {
                 content: content.clone(),
                 start_offset: 0,
                 end_offset: content.len(),
-                embedding: None,
                 entities: Vec::new(),
                 metadata: crate::core::ChunkMetadata::default(),
             })
@@ -2313,13 +2312,16 @@ impl GraphRAG {
         self.knowledge_graph.is_some() && self.retrieval_system.is_some()
     }
 
-    /// Check if documents have been added
+    /// Check if documents have been added.
+    ///
+    /// Phase 7 (2026-05-07): in-memory chunks were removed; this
+    /// always returns false in production. Kept for API stability
+    /// with tests / standalone usage. Hosts that need a real "is
+    /// the corpus populated?" check should query qdrant directly
+    /// (`list_full_documents` / `count` against the chunk
+    /// collection).
     pub fn has_documents(&self) -> bool {
-        if let Some(graph) = &self.knowledge_graph {
-            graph.chunks().count() > 0
-        } else {
-            false
-        }
+        false
     }
 
     /// Check if graph has been built
@@ -2358,13 +2360,13 @@ impl GraphRAG {
         }
     }
 
-    /// Get chunk by ID
-    pub fn get_chunk(&self, chunk_id: &str) -> Option<&TextChunk> {
-        if let Some(graph) = &self.knowledge_graph {
-            graph.chunks().find(|c| c.id.0 == chunk_id)
-        } else {
-            None
-        }
+    /// Get chunk by ID.
+    ///
+    /// Phase 7: always `None` — in-memory chunks were removed.
+    /// Use the qdrant store's `fetch_chunks_by_ids` from the host
+    /// instead. Method preserved for API compat.
+    pub fn get_chunk(&self, _chunk_id: &str) -> Option<&TextChunk> {
+        None
     }
 
 

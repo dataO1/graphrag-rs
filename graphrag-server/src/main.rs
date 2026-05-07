@@ -25,6 +25,16 @@
 //! # Browser: http://localhost:8080/swagger
 //! ```
 
+// mimalloc as the global allocator. graphrag-server allocates large
+// transient buffers each /api/graph/append cycle (the master clone of
+// the in-memory KnowledgeGraph for the ArcSwap snapshot publish) and
+// runs for hours. The default glibc malloc retains free arenas
+// indefinitely under that pattern; mimalloc returns them aggressively.
+// 2026-05-07 repro: 88 GB anon-rss after 1h 13min uptime → OOM-killed.
+// See `memory/project_graphrag_oom_long_uptime.md` for the full chain.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use actix_cors::Cors;
 use actix_web::{
     web::{self, Data, Json, Path as WebPath},
