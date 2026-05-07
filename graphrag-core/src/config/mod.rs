@@ -2075,6 +2075,7 @@ impl Config {
                         None
                     }
                 },
+                guided_json: parsed["openai"]["guided_json"].as_bool().unwrap_or(false),
             },
             llm: LlmConcurrencyConfig {
                 initial: parsed["llm"]["initial"]

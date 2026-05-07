@@ -141,6 +141,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+# Build profile is production-tuned (cgu=1, thin LTO) for max runtime
+# performance. The Nix build at graphrag-rs-nix/pkgs/graphrag-rs.nix
+# accepts a `buildSpeed` parameter that overrides cgu / lto via
+# CARGO_PROFILE_RELEASE_* env vars when faster iteration is needed.
 
 [profile.wasm-release]
 inherits = "release"

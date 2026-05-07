@@ -150,6 +150,21 @@ pub const ENTITY_EXTRACTION_JSON_SCHEMA: &str = r#"{
   "required": ["entities", "relationships"]
 }"#;
 
+/// Lazily-parsed [`ENTITY_EXTRACTION_JSON_SCHEMA`] as a `&'static
+/// serde_json::Value`. Used by the OpenAI-compat entity extractor to
+/// build a `response_format: { type: "json_schema", ... }` payload so
+/// vLLM / llama.cpp / real-OpenAI constrain the sampler to the schema.
+/// Parsing happens once on first call (the const string is small;
+/// [`std::sync::OnceLock`] keeps subsequent lookups effectively free).
+pub fn entity_extraction_json_schema_value() -> &'static serde_json::Value {
+    use std::sync::OnceLock;
+    static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::from_str(ENTITY_EXTRACTION_JSON_SCHEMA)
+            .expect("ENTITY_EXTRACTION_JSON_SCHEMA is a valid JSON literal")
+    })
+}
+
 /// Structured extraction output from LLM entity and relationship analysis.
 ///
 /// This structure contains the results from LLM-based entity extraction,

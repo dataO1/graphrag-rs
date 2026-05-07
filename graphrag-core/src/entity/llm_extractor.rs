@@ -6,7 +6,10 @@
 
 use crate::{
     core::{ChunkId, Entity, EntityId, EntityMention, Relationship, TextChunk},
-    entity::prompts::{EntityData, ExtractionOutput, PromptBuilder, RelationshipData},
+    entity::prompts::{
+        entity_extraction_json_schema_value, EntityData, ExtractionOutput, PromptBuilder,
+        RelationshipData,
+    },
     ollama::OllamaClient,
     chat::ChatClient,
     GraphRAGError, Result,
@@ -242,12 +245,24 @@ impl LLMEntityExtractor {
             keep_alive: self.keep_alive.clone(),
             ..Default::default()
         };
-        match self.ollama_client.generate_with_params(prompt, params.clone()).await {
+        // Schema-constrained generation when the OpenAI-compat backend has
+        // `guided_json = true`. On any other path (Ollama, or OpenAI with
+        // the flag off) this falls through to plain `generate_with_params`
+        // and the existing parse/repair pipeline runs unchanged.
+        let schema = entity_extraction_json_schema_value();
+        let name = "extraction_output";
+        match self
+            .ollama_client
+            .generate_for_structured_output(prompt, params.clone(), schema, name)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) => {
                 tracing::warn!("LLM call failed, retrying: {}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                self.ollama_client.generate_with_params(prompt, params).await
+                self.ollama_client
+                    .generate_for_structured_output(prompt, params, schema, name)
+                    .await
             },
         }
     }

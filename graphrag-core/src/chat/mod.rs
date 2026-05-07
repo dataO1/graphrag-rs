@@ -158,6 +158,59 @@ impl ChatClient {
         }
     }
 
+    /// Generate a response constrained to a JSON Schema.
+    ///
+    /// On the OpenAI-compat backend with `guided_json = true`, attaches
+    /// `response_format: { type: "json_schema", json_schema: { name,
+    /// schema, strict: true } }` and routes through the per-call extras
+    /// path so the upstream sampler (vLLM xgrammar / outlines, llama.cpp
+    /// recent, real OpenAI strict mode) can only emit conforming JSON.
+    ///
+    /// On every other path (Ollama backend, or OpenAI with
+    /// `guided_json = false`) this falls back to plain
+    /// `generate_with_params` — the schema and name arguments are
+    /// silently ignored. Caller's existing parse / repair pipeline then
+    /// runs unchanged. Plumbing Ollama's native `format` field is left
+    /// for a follow-up.
+    pub async fn generate_for_structured_output(
+        &self,
+        prompt: &str,
+        params: OllamaGenerationParams,
+        schema: &serde_json::Value,
+        name: &str,
+    ) -> Result<String> {
+        self.gated(self.dispatch_structured(prompt, params, schema, name)).await
+    }
+
+    async fn dispatch_structured(
+        &self,
+        prompt: &str,
+        params: OllamaGenerationParams,
+        schema: &serde_json::Value,
+        name: &str,
+    ) -> Result<String> {
+        match &self.backend {
+            #[cfg(feature = "openai")]
+            Backend::OpenAI(c) if c.config().guided_json => {
+                let extras = serde_json::json!({
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": name,
+                            "schema": schema,
+                            "strict": true,
+                        }
+                    }
+                });
+                c.generate_with_extras(prompt, params, extras).await
+            }
+            _ => {
+                let _ = (schema, name);
+                self.dispatch_generate_with_params(prompt, params).await
+            }
+        }
+    }
+
     /// Wrap the inner generate future with semaphore acquire +
     /// success/failure classification. When no semaphore is attached,
     /// the inner future runs ungated and the result is returned as-is.

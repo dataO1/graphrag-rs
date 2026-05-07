@@ -75,6 +75,17 @@ pub struct OpenAIConfig {
     /// Must be a JSON object; non-object values are ignored on merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Value>,
+
+    /// Attach a JSON Schema `response_format` to entity-extraction calls so
+    /// the upstream sampler is constrained to emit conforming JSON. vLLM
+    /// (xgrammar / outlines), llama.cpp (recent), and real OpenAI all
+    /// honor `response_format: { type: "json_schema", ... }`. Backends
+    /// without support typically 400 on the extra field — flip this off
+    /// in that case. Default `false` to preserve existing behavior on
+    /// upgrade. Only the entity-extractor path uses this; query planner
+    /// and completion checks continue to send free-form requests.
+    #[serde(default)]
+    pub guided_json: bool,
 }
 
 fn default_base_url() -> String { "http://localhost:8000/v1".to_string() }
@@ -96,6 +107,7 @@ impl Default for OpenAIConfig {
             temperature: Some(0.7),
             enable_caching: default_enable_caching(),
             extra_body: None,
+            guided_json: false,
         }
     }
 }
@@ -222,15 +234,41 @@ impl OpenAIClient {
         prompt: &str,
         params: OllamaGenerationParams,
     ) -> Result<String> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-
         // Body construction extracted into build_request_body so unit
         // tests can assert on the wire shape (incl. extra_body merge
         // precedence) without standing up an HTTP server.
         let body = self.build_request_body(prompt, &params);
+        self.send_chat_request(body).await
+    }
+
+    /// Same as [`Self::generate_with_params`] but merges per-call `extras`
+    /// (a JSON object) into the request body on top of `config.extra_body`
+    /// and the standard fields. Used by the entity extractor to attach
+    /// `response_format: { type: "json_schema", ... }` so vLLM /
+    /// llama.cpp / real-OpenAI sample tokens that conform to the
+    /// extraction schema. Non-object `extras` are ignored.
+    pub async fn generate_with_extras(
+        &self,
+        prompt: &str,
+        params: OllamaGenerationParams,
+        extras: serde_json::Value,
+    ) -> Result<String> {
+        let mut body = self.build_request_body(prompt, &params);
+        if let (Some(obj), Some(extras_obj)) = (body.as_object_mut(), extras.as_object()) {
+            for (k, v) in extras_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        self.send_chat_request(body).await
+    }
+
+    /// Send a fully-built chat-completions request body. Shared between
+    /// `generate_with_params` and `generate_with_extras`.
+    async fn send_chat_request(&self, body: serde_json::Value) -> Result<String> {
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
 
         let api_key = self.config.api_key.clone();
         let timeout = std::time::Duration::from_secs(self.config.timeout_seconds);
@@ -340,6 +378,7 @@ mod tests {
             temperature: Some(0.2),
             enable_caching: true,
             extra_body: None,
+            guided_json: false,
         }
     }
 
