@@ -143,6 +143,20 @@ pub struct QueryResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
+    /// Absolute filesystem path the agent can pass directly to a
+    /// `read` / `cat` tool, if the chunk excerpt is genuinely
+    /// insufficient. Resolved server-side from `source` against the
+    /// configured ingest roots:
+    ///   - `obsidian://vault/<vault>/<rel>` → `<allowed_root>/<rel>`
+    ///     where `<allowed_root>`'s basename matches `<vault>`.
+    ///   - `file://<path>` → `<path>` (must be under an allowed root).
+    ///   - Other schemes (https://, arxiv:, doi:, …) → `None`.
+    /// `None` means "the agent shouldn't try to filesystem-read this
+    /// chunk" — the source is either external or not under a root
+    /// the server has configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_path: Option<String>,
+
     /// 1-indexed inclusive `[lineStart, lineEnd]` in the source file.
     /// Snapshot at ingest time — may have drifted if the file changed
     /// since. Use as a navigation hint, not a stable id.

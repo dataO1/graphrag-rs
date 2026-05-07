@@ -226,6 +226,77 @@ fn truncate_excerpt(s: &str, target_bytes: usize) -> String {
     format!("{}...", &s[..end])
 }
 
+/// Resolve a source URI on a recall result to an absolute filesystem
+/// path the agent can hand to a `read`/`cat` tool, IF the source is
+/// actually under one of the server's configured ingest roots.
+/// Returns `None` for external schemes (https://, arxiv:, doi:, …) or
+/// when the resolved path would escape every allowed root — those are
+/// the cases where the agent shouldn't try to filesystem-read the chunk.
+///
+/// Supports:
+///   - `obsidian://vault/<vault>/<rel>` — vault basename match against
+///     each allowed root, returns `<root>/<decoded-rel>` on first hit.
+///   - `file://<path>` — accepts the path verbatim if it sits under any
+///     allowed root.
+fn resolve_source_to_absolute_path(
+    source: &str,
+    policy: &ingest_policy::IngestPolicy,
+) -> Option<String> {
+    if source.starts_with("obsidian://vault/") {
+        let rest = &source["obsidian://vault/".len()..];
+        let mut split = rest.splitn(2, '/');
+        let vault_enc = split.next()?;
+        let rel_enc = split.next()?;
+        let vault = percent_decode(vault_enc);
+        let rel = percent_decode(rel_enc);
+        for root in &policy.allowed_roots {
+            if root.file_name().and_then(|n| n.to_str()) == Some(vault.as_str()) {
+                let candidate = root.join(&rel);
+                return candidate.to_str().map(|s| s.to_string());
+            }
+        }
+        return None;
+    }
+    if let Some(path_part) = source.strip_prefix("file://") {
+        let path = std::path::Path::new(path_part);
+        for root in &policy.allowed_roots {
+            if path.starts_with(root) {
+                return Some(path_part.to_string());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// Minimal percent-decoder for path components in `obsidian://` URIs.
+/// Standard library has no decode helper, and pulling in the full
+/// `percent-encoding` crate just for this would be heavy. The recall
+/// path only ever sees ASCII-percent-encoded URIs from the gateway
+/// plugin's `encodeURIComponent`, so a small loop is sufficient.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                },
+                _ => {},
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
 fn overlay_embedding_env_vars(emb: &mut graphrag_core::config::EmbeddingConfig) {
     if let Ok(b) = std::env::var("EMBEDDING_BACKEND") {
         emb.backend = b;
@@ -807,22 +878,30 @@ async fn query(
             Ok(search_results) => {
                 let results: Vec<QueryResult> = search_results
                     .into_iter()
-                    .map(|r| QueryResult {
-                        document_id: r.id,
-                        title: r.metadata.title,
-                        similarity: r.score,
-                        excerpt: truncate_excerpt(&r.metadata.text, 800),
-                        source: r.metadata.source,
-                        line_start: r.metadata.line_start,
-                        line_end: r.metadata.line_end,
-                        heading_path: r.metadata.heading_path,
-                        etag: r.metadata.block_hash.clone(),
-                        last_modified: r
+                    .map(|r| {
+                        let absolute_path = r
                             .metadata
-                            .valid_from
-                            .clone()
-                            .or_else(|| Some(r.metadata.timestamp.clone())),
-                        block_id: r.metadata.block_id,
+                            .source
+                            .as_deref()
+                            .and_then(|s| resolve_source_to_absolute_path(s, &state.ingest_policy));
+                        QueryResult {
+                            document_id: r.id,
+                            title: r.metadata.title,
+                            similarity: r.score,
+                            excerpt: truncate_excerpt(&r.metadata.text, 800),
+                            source: r.metadata.source,
+                            absolute_path,
+                            line_start: r.metadata.line_start,
+                            line_end: r.metadata.line_end,
+                            heading_path: r.metadata.heading_path,
+                            etag: r.metadata.block_hash.clone(),
+                            last_modified: r
+                                .metadata
+                                .valid_from
+                                .clone()
+                                .or_else(|| Some(r.metadata.timestamp.clone())),
+                            block_id: r.metadata.block_id,
+                        }
                     })
                     .collect();
 
@@ -887,6 +966,7 @@ async fn query(
                 similarity,
                 excerpt,
                 source: None,
+                absolute_path: None,
                 line_start: None,
                 line_end: None,
                 heading_path: Vec::new(),
@@ -944,22 +1024,30 @@ async fn graph_aware_query(
                 {
                     Ok(results) => results
                         .into_iter()
-                        .map(|r| QueryResult {
-                            document_id: r.id,
-                            title: r.metadata.title,
-                            similarity: r.score,
-                            excerpt: truncate_excerpt(&r.metadata.text, 800),
-                            source: r.metadata.source,
-                            line_start: r.metadata.line_start,
-                            line_end: r.metadata.line_end,
-                            heading_path: r.metadata.heading_path,
-                            etag: r.metadata.block_hash.clone(),
-                            last_modified: r
+                        .map(|r| {
+                            let absolute_path = r
                                 .metadata
-                                .valid_from
-                                .clone()
-                                .or_else(|| Some(r.metadata.timestamp.clone())),
-                            block_id: r.metadata.block_id,
+                                .source
+                                .as_deref()
+                                .and_then(|s| resolve_source_to_absolute_path(s, &state.ingest_policy));
+                            QueryResult {
+                                document_id: r.id,
+                                title: r.metadata.title,
+                                similarity: r.score,
+                                excerpt: truncate_excerpt(&r.metadata.text, 800),
+                                source: r.metadata.source,
+                                absolute_path,
+                                line_start: r.metadata.line_start,
+                                line_end: r.metadata.line_end,
+                                heading_path: r.metadata.heading_path,
+                                etag: r.metadata.block_hash.clone(),
+                                last_modified: r
+                                    .metadata
+                                    .valid_from
+                                    .clone()
+                                    .or_else(|| Some(r.metadata.timestamp.clone())),
+                                block_id: r.metadata.block_id,
+                            }
                         })
                         .collect(),
                     Err(_) => Vec::new(),
