@@ -2893,19 +2893,26 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
 
     // Layer 4 (revised): mutate the writer-owned master in place across
     // all batches; publish a snapshot ONCE at the end. Stream
-    // unextracted chunks from qdrant in pages of APPEND_BATCH_SIZE
+    // unextracted chunks from qdrant in pages of append_batch_size
     // instead of loading all in RAM up front (the old "load 4448 ×
     // chunk_text into Vec<(String,String)>" path was a bare-RAM
     // hazard on large vaults with monster docs).
     //
-    // Sized to match graphrag-core's `EXTRACTION_CONCURRENCY` (=64 in
-    // production). Smaller batches cap in-flight LLM calls below the
-    // configured concurrency: extend_graph spawns up to N parallel
-    // LLM extractions per call, but if the batch only has 16 chunks
-    // the stream completes in 1 round of 16 (vLLM running ~16 reqs)
-    // instead of 1 round of 64 — wasting 75% of the slot budget.
-    // Memory: 64 × ~10KB chunk text ≈ 640KB, still bounded.
-    const APPEND_BATCH_SIZE: usize = 64;
+    // Pages of unextracted chunks pulled from qdrant per loop
+    // iteration. Sized to match `config.llm.max` — the AIMD permit
+    // cap inside `ChatClient`. Coupling these is what keeps the two
+    // knobs from disagreeing: if the page is smaller than the permit
+    // cap, the extend_graph stream completes before all permits are
+    // ever in flight (e.g. 64-chunk page with cap=128 ⇒ only 64 reqs
+    // ever go to vLLM at once — half the slot budget unused). If
+    // bigger, we just fetch more chunks than we can immediately fan
+    // out, costing memory without throughput. Equal is correct.
+    //
+    // `.max(1)` guards against pathological config (cap=0); the
+    // AIMD layer separately clamps `llm.max` to ≥1 in
+    // AdaptiveConfig::sanitize, so this is belt-and-braces.
+    let cfg_snapshot = state.config.load_full();
+    let append_batch_size: usize = cfg_snapshot.llm.max.max(1);
 
     let mut master_guard = state.graphrag_writer.lock().await;
     let Some(master) = master_guard.as_mut() else {
@@ -2931,7 +2938,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         #[cfg(feature = "qdrant")]
         let batch: Vec<(String, String)> = match state.qdrant.as_ref() {
             Some(qdrant) => qdrant
-                .list_unextracted_chunks(APPEND_BATCH_SIZE as u32)
+                .list_unextracted_chunks(append_batch_size as u32)
                 .await
                 .map_err(|e| ApiError::InternalError(format!("list unextracted chunks failed: {}", e)))?,
             None => Vec::new(),
@@ -2946,7 +2953,7 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         if batch_idx == 0 {
             tracing::info!(
                 "do_append_graph: starting (Layer 4 revised: writer-mutex master, snapshot publish at end; streaming qdrant pages of {})",
-                APPEND_BATCH_SIZE,
+                append_batch_size,
             );
         }
 
