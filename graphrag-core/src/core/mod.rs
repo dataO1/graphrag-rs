@@ -459,6 +459,27 @@ impl KnowledgeGraph {
     /// of the same edge (different relation_type) are still allowed —
     /// the graph models multi-edges between the same pair.
     pub fn add_relationship(&mut self, relationship: Relationship) -> Result<()> {
+        self.add_relationship_with_dedup_status(relationship).map(|_| ())
+    }
+
+    /// Variant of [`Self::add_relationship`] that reports whether the
+    /// relationship was newly inserted (`Ok(true)`) or deduplicated as
+    /// an exact `(source, target, relation_type)` match against an
+    /// existing edge (`Ok(false)`). `Err` is reserved for missing
+    /// endpoints and matches `add_relationship`'s error case verbatim.
+    ///
+    /// Why this exists: the merge path in
+    /// [`crate::GraphRAG::merge_relationship`] previously scanned the
+    /// entire edge set with `relationships().any(...)` to decide
+    /// whether to bump `metrics.new_relationships`. At graph scale
+    /// (~20k edges) and ~1500 touched relationships per 128-chunk
+    /// extraction batch, that O(E) walk per merge cost ~9–13s on the
+    /// serial critical path. This variant lets the merge cheaply read
+    /// the bool that the dedup branch already computed.
+    pub fn add_relationship_with_dedup_status(
+        &mut self,
+        relationship: Relationship,
+    ) -> Result<bool> {
         let source_idx = *self.entity_index.get(&relationship.source).ok_or_else(|| {
             crate::GraphRAGError::GraphConstruction {
                 message: format!("Source entity {} not found", relationship.source),
@@ -473,9 +494,9 @@ impl KnowledgeGraph {
 
         // Cheap dedup: scan outgoing edges of source for an identical
         // (target, relation_type) pair. petgraph doesn't index edges
-        // by endpoints; for typical graph sizes (low thousands) this
-        // is fine, and avoids double-counting cross-chunk mentions
-        // of the same semantic relationship.
+        // by endpoints, but `edges(source_idx)` returns only the
+        // out-degree of that node, which stays small even on a 20k-edge
+        // graph (typical hub entities have <100 outgoing edges).
         use petgraph::visit::EdgeRef;
         let already_present = self
             .graph
@@ -485,11 +506,11 @@ impl KnowledgeGraph {
                     && edge.weight().relation_type == relationship.relation_type
             });
         if already_present {
-            return Ok(());
+            return Ok(false);
         }
 
         self.graph.add_edge(source_idx, target_idx, relationship);
-        Ok(())
+        Ok(true)
     }
 
     /// Add a chunk to the knowledge graph.

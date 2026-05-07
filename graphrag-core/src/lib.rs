@@ -1659,32 +1659,46 @@ impl GraphRAG {
         Ok(())
     }
 
-    /// Thin metrics-tracking wrapper over `KnowledgeGraph::add_relationship`.
-    /// `add_relationship` itself dedupes by `(source, target,
-    /// relation_type)` and silently ignores missing-endpoint errors
-    /// (matching build_graph's existing behavior — the relationship's
-    /// target may have been extracted from a chunk that hasn't been
-    /// processed yet). This wrapper just counts how many were genuinely
-    /// new for telemetry by scanning before the add.
+    /// Thin metrics-tracking wrapper over
+    /// `KnowledgeGraph::add_relationship_with_dedup_status`.
+    /// `add_relationship_with_dedup_status` itself dedupes by `(source,
+    /// target, relation_type)` against the source node's outgoing
+    /// edges (petgraph `edges(node)` is O(out_degree), small even on
+    /// large graphs) and reports whether a NEW edge was inserted.
+    /// Missing-endpoint errors are silently ignored — matching
+    /// build_graph's existing behavior, since the relationship's
+    /// endpoint may have been extracted from a chunk that hasn't been
+    /// processed yet.
+    ///
+    /// 2026-05-07: switched from a separate
+    /// `graph.relationships().any(...)` O(E) scan to reading the
+    /// dedup bool directly. On a 128-chunk batch with ~20k existing
+    /// edges and ~1500 touched relationships, the old scan was the
+    /// dominant cost on the merge's serial critical path (~9–13s);
+    /// this drops it to roughly the cost of `edges(source).any(...)`
+    /// per touched rel.
     fn merge_relationship(
         graph: &mut KnowledgeGraph,
         relationship: Relationship,
         metrics: &mut ExtractMetrics,
     ) {
-        let was_existing = graph.relationships().any(|r| {
-            r.source == relationship.source
-                && r.target == relationship.target
-                && r.relation_type == relationship.relation_type
-        });
         let src = relationship.source.0.clone();
         let tgt = relationship.target.0.clone();
         let rel_type = relationship.relation_type.clone();
-        if graph.add_relationship(relationship).is_ok() && !was_existing {
-            metrics.new_relationships += 1;
-            metrics.touch_relationship(&src, &rel_type, &tgt);
+        match graph.add_relationship_with_dedup_status(relationship) {
+            Ok(true) => {
+                metrics.new_relationships += 1;
+                metrics.touch_relationship(&src, &rel_type, &tgt);
+            },
+            Ok(false) => {
+                // Dedup'd against an existing edge — no metric bump,
+                // no touch. Matches the pre-2026-05-07 behavior.
+            },
+            Err(_) => {
+                // Missing endpoint, intentionally ignored — see
+                // add_relationship_with_dedup_status' docs.
+            },
         }
-        // add_relationship error (missing endpoint) is intentionally
-        // ignored — see method docs.
     }
 
 
