@@ -431,6 +431,91 @@ pub struct ExtendSummary {
     pub touched_relationship_keys: Vec<(String, String, String)>,
 }
 
+/// Build the SOURCE TEXT block for `ask_with_*` synthesis prompts
+/// under a configurable byte budget. Iterates `chunk_ids` in order,
+/// looks up each chunk's text in `chunk_contents`, char-truncates
+/// per-chunk to `max_chars_per_chunk`, and stops admitting chunks
+/// once the running total would exceed `chunks_budget` (when set).
+///
+/// `chunks_budget = None` disables the cap (unbounded). The host —
+/// graphrag-server's /config flow — resolves the user's
+/// `config.synthesis.max_input_chars` (auto-detected from the chat
+/// upstream's `/v1/models[].max_model_len` or llama.cpp's `/props`
+/// when set to 0) into a concrete chunk-text budget via
+/// `Config::synthesis_chunks_budget()` before this function is called.
+///
+/// Logs a warning when chunks get dropped so operators can see when
+/// the budget is the bottleneck (e.g. a popular seed entity whose
+/// mention set runs into the hundreds, the original repro).
+fn build_chunks_block<'a, I>(
+    chunk_ids: I,
+    chunk_contents: &'a std::collections::HashMap<ChunkId, String>,
+    chunks_budget: Option<usize>,
+    max_chars_per_chunk: usize,
+) -> String
+where
+    I: IntoIterator<Item = &'a ChunkId>,
+{
+    let chunk_ids: Vec<&ChunkId> = chunk_ids.into_iter().collect();
+    let total_input = chunk_ids.len();
+    let mut out = String::new();
+    let mut admitted = 0usize;
+    let mut dropped = 0usize;
+    for cid in &chunk_ids {
+        let Some(content) = chunk_contents.get(*cid) else { continue };
+        let trimmed = char_truncate(content, max_chars_per_chunk);
+        // +3 accounts for the "- " prefix + trailing "\n\n" separator.
+        let needed = trimmed.len() + 3 + if out.is_empty() { 0 } else { 2 };
+        if let Some(cap) = chunks_budget {
+            if out.len() + needed > cap {
+                dropped = total_input - admitted;
+                break;
+            }
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("- ");
+        out.push_str(&trimmed);
+        admitted += 1;
+    }
+    #[cfg(feature = "tracing")]
+    if dropped > 0 {
+        tracing::warn!(
+            admitted = admitted,
+            dropped = dropped,
+            chars = out.len(),
+            budget = ?chunks_budget,
+            "ask_with_*: SOURCE TEXT budget hit; dropped {dropped} chunk(s) \
+             (admitted {admitted}, {} chars). Raise `synthesis.max_input_chars` \
+             — or unset (= 0) to re-enable upstream auto-detect — if your model's \
+             context window allows more.",
+            out.len(),
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (admitted, dropped);
+    out
+}
+
+/// Char-boundary-safe truncation. `s.len()` is bytes, not chars; a
+/// naive `&s[..n]` panics if `n` falls inside a multi-byte UTF-8
+/// sequence (emoji-laden chunks were the original repro). Walks
+/// `char_indices` and stops at the last char boundary ≤ `max_bytes`.
+fn char_truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = 0usize;
+    for (i, _) in s.char_indices() {
+        if i > max_bytes {
+            break;
+        }
+        end = i;
+    }
+    s[..end].to_string()
+}
+
 impl GraphRAG {
     /// Create a new GraphRAG instance with the given configuration
     pub fn new(config: Config) -> Result<Self> {
@@ -1801,12 +1886,12 @@ impl GraphRAG {
                 .join("\n")
         };
 
-        let chunks_block = chunk_ids
-            .iter()
-            .filter_map(|cid| chunk_contents.get(cid).map(|c| (cid, c)))
-            .map(|(_, c)| format!("- {}", c))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let chunks_block = build_chunks_block(
+            &chunk_ids,
+            chunk_contents,
+            self.config.synthesis_chunks_budget(),
+            self.config.synthesis.max_chars_per_chunk,
+        );
 
         let context = format!(
             "ENTITIES:\n{}\n\nRELATIONSHIPS:\n{}\n\nSOURCE TEXT:\n{}",
@@ -2056,12 +2141,12 @@ impl GraphRAG {
                 .join("\n")
         };
 
-        let chunks_block = chunk_ids
-            .iter()
-            .filter_map(|cid| chunk_contents.get(cid).map(|c| (cid, c)))
-            .map(|(_, c)| format!("- {}", c))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let chunks_block = build_chunks_block(
+            &chunk_ids,
+            chunk_contents,
+            self.config.synthesis_chunks_budget(),
+            self.config.synthesis.max_chars_per_chunk,
+        );
 
         let context = format!(
             "ENTITIES:\n{}\n\nRELATIONSHIPS:\n{}\n\nSOURCE TEXT:\n{}",

@@ -107,6 +107,14 @@ pub struct Config {
     #[serde(default, alias = "llm_concurrency")]
     pub llm: LlmConcurrencyConfig,
 
+    /// Recall-synthesis prompt budget. Caps the size of the SOURCE
+    /// TEXT block in `ask_with_*` so a popular seed entity whose
+    /// mention set runs into the hundreds doesn't balloon the prompt
+    /// past the chat upstream's max context (the original repro:
+    /// vLLM 400 Bad Request with 261 K input tokens vs 262 K cap).
+    #[serde(default)]
+    pub synthesis: SynthesisConfig,
+
     /// GLiNER-Relex extractor configuration
     pub gliner: GlinerConfig,
 
@@ -196,6 +204,61 @@ impl From<LlmConcurrencyConfig> for crate::llm_concurrency::AdaptiveConfig {
             success_threshold: c.success_threshold,
             failure_decay: c.failure_decay,
             shrink_cooldown_ms: c.shrink_cooldown_ms,
+        }
+    }
+}
+
+/// Recall-synthesis prompt budget for `ask_with_dual_seeds` /
+/// `ask_with_seed_entities`.
+///
+/// The synthesis call's prompt has three parts: a fixed SKELETON
+/// (the prompt template + ENTITIES + RELATIONSHIPS blocks, usually
+/// a few KB), the SOURCE TEXT block (the chunk contents, the part
+/// that explodes when popular entities have many mentions), and
+/// the requested completion. The math:
+///
+/// ```text
+///   chunks_budget  =  max_input_chars  -  skeleton_reserve_chars
+///   model_total    =  max_input_chars  +  output_reserve(=max_tokens × 4)
+/// ```
+///
+/// `max_input_chars = 0` triggers graphrag-server's startup probe of
+/// the chat upstream — `GET /v1/models[].max_model_len` (vLLM) or
+/// `GET /props.default_generation_settings.n_ctx_train` (llama.cpp)
+/// — which resolves it before the value reaches graphrag-core.
+/// `0` reaches graphrag-core only when the probe failed AND no user
+/// override was set; in that case [`Config::synthesis_chunks_budget`]
+/// returns `None` (unbounded — old behavior, may overflow).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct SynthesisConfig {
+    /// Total INPUT prompt cap, in chars. `0` = "auto-detect from
+    /// upstream", resolved server-side at /config init. Default `0`.
+    #[serde(default = "default_synthesis_max_input_chars")]
+    pub max_input_chars: usize,
+    /// Per-chunk char cap inside SOURCE TEXT. Truncates outliers so
+    /// a single very long chunk doesn't consume the whole budget.
+    /// Default `2000` (~500 tokens). Set lower for tighter contexts;
+    /// raising past chunk-size adds nothing.
+    #[serde(default = "default_synthesis_max_chars_per_chunk")]
+    pub max_chars_per_chunk: usize,
+    /// How many chars to reserve in `max_input_chars` for the prompt
+    /// SKELETON (template + ENTITIES + RELATIONSHIPS). Default
+    /// `8000`. The chunks_budget actually used by `build_chunks_block`
+    /// is `max_input_chars - skeleton_reserve_chars`.
+    #[serde(default = "default_synthesis_skeleton_reserve_chars")]
+    pub skeleton_reserve_chars: usize,
+}
+
+fn default_synthesis_max_input_chars() -> usize { 0 }
+fn default_synthesis_max_chars_per_chunk() -> usize { 2_000 }
+fn default_synthesis_skeleton_reserve_chars() -> usize { 8_000 }
+
+impl Default for SynthesisConfig {
+    fn default() -> Self {
+        Self {
+            max_input_chars: default_synthesis_max_input_chars(),
+            max_chars_per_chunk: default_synthesis_max_chars_per_chunk(),
+            skeleton_reserve_chars: default_synthesis_skeleton_reserve_chars(),
         }
     }
 }
@@ -1577,6 +1640,7 @@ impl Default for Config {
             ollama: crate::ollama::OllamaConfig::default(),
             openai: crate::openai::OpenAIConfig::default(),
             llm: LlmConcurrencyConfig::default(),
+            synthesis: SynthesisConfig::default(),
             gliner: GlinerConfig::default(),
             enhancements: enhancements::EnhancementsConfig::default(),
             auto_save: AutoSaveConfig {
@@ -1689,6 +1753,23 @@ impl Config {
     /// gate previously asked `self.ollama.enabled`, so the OpenAI-compat
     /// backend (vLLM / llama.cpp / OVMS / real OpenAI) gets treated as
     /// equivalent. The actual client dispatch lives in `ChatClient::from_config`.
+    /// Chunk-text budget for the SOURCE TEXT block in `ask_with_*`
+    /// synthesis prompts. `Some(N)` means "admit chunks until total
+    /// chunk text reaches N chars, drop the rest". `None` means
+    /// "unbounded" (graphrag-server probe failed AND user didn't set
+    /// `synthesis.max_input_chars` — caller may overflow the model's
+    /// context, surfaced as a 4xx from the chat upstream).
+    pub fn synthesis_chunks_budget(&self) -> Option<usize> {
+        if self.synthesis.max_input_chars == 0 {
+            return None;
+        }
+        Some(
+            self.synthesis
+                .max_input_chars
+                .saturating_sub(self.synthesis.skeleton_reserve_chars),
+        )
+    }
+
     pub fn chat_enabled(&self) -> bool {
         self.ollama.enabled || self.openai.enabled
     }
@@ -2011,6 +2092,17 @@ impl Config {
                 shrink_cooldown_ms: parsed["llm"]["shrink_cooldown_ms"]
                     .as_u64()
                     .unwrap_or(default_llm_shrink_cooldown_ms()),
+            },
+            synthesis: SynthesisConfig {
+                max_input_chars: parsed["synthesis"]["max_input_chars"]
+                    .as_usize()
+                    .unwrap_or(default_synthesis_max_input_chars()),
+                max_chars_per_chunk: parsed["synthesis"]["max_chars_per_chunk"]
+                    .as_usize()
+                    .unwrap_or(default_synthesis_max_chars_per_chunk()),
+                skeleton_reserve_chars: parsed["synthesis"]["skeleton_reserve_chars"]
+                    .as_usize()
+                    .unwrap_or(default_synthesis_skeleton_reserve_chars()),
             },
             gliner: GlinerConfig {
                 enabled: parsed["gliner"]["enabled"].as_bool().unwrap_or(false),

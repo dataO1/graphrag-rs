@@ -186,6 +186,58 @@ pub async fn set_config(
         );
     }
 
+    // Synthesis prompt budget: when user left `max_input_chars=0`,
+    // probe the chat upstream for its max context window and resolve.
+    // Probe order: vLLM `/v1/models[].max_model_len` → llama.cpp
+    // `/v1/models[].meta.n_ctx_train` → llama.cpp `/props`. Falls
+    // back to a conservative 32 768-char cap (≈ 8 K tokens) if none
+    // of those work, so the cap is never silently absent.
+    if config.synthesis.max_input_chars == 0 {
+        let probed_tokens = probe_upstream_max_model_len(&config.openai.base_url).await;
+        let max_output_tokens = config.openai.max_tokens.unwrap_or(2_000) as usize;
+        let chars_per_token = 4usize;
+        let safety = 0.9f32;
+        let resolved = match probed_tokens {
+            Some(model_max) => {
+                // (input_token_budget) × chars_per_token × safety
+                let input_tokens = model_max.saturating_sub(max_output_tokens);
+                let chars = ((input_tokens as f32) * (chars_per_token as f32) * safety) as usize;
+                tracing::info!(
+                    "synthesis: probed model max_model_len={} tokens; \
+                     resolving max_input_chars={} (output_reserve={} tokens, \
+                     ×{} chars/token, ×{} safety; chunks_budget={})",
+                    model_max,
+                    chars,
+                    max_output_tokens,
+                    chars_per_token,
+                    safety,
+                    chars.saturating_sub(config.synthesis.skeleton_reserve_chars),
+                );
+                chars
+            },
+            None => {
+                let fallback = 32_768usize;
+                tracing::warn!(
+                    "synthesis: no max_model_len from upstream (vLLM /v1/models or \
+                     llama.cpp /props); falling back to max_input_chars={} \
+                     (≈{} tokens). Set `synthesis.max_input_chars` explicitly to \
+                     match your model's context window.",
+                    fallback,
+                    fallback / chars_per_token,
+                );
+                fallback
+            },
+        };
+        config.synthesis.max_input_chars = resolved;
+    } else {
+        tracing::info!(
+            "synthesis: using configured max_input_chars={} (chunks_budget={})",
+            config.synthesis.max_input_chars,
+            config.synthesis.max_input_chars
+                .saturating_sub(config.synthesis.skeleton_reserve_chars),
+        );
+    }
+
     let mut graphrag = graphrag_core::GraphRAG::new(config)
         .map_err(|e| ApiError::InternalError(format!("GraphRAG init failed: {}", e)))?;
 
@@ -296,6 +348,72 @@ pub async fn get_default_config() -> Json<serde_json::Value> {
         "config": config,
         "description": "Default GraphRAG configuration with sensible defaults"
     }))
+}
+
+/// Best-effort probe for the chat upstream's max context window in
+/// **tokens**. Tries three endpoints in order, returns on the first
+/// success:
+///
+/// 1. `GET <base_url>/models` → `data[0].max_model_len` (vLLM's
+///    OpenAI-compat endpoint exposes this in many versions).
+/// 2. `GET <base_url>/models` → `data[0].meta.n_ctx_train` (llama.cpp's
+///    OpenAI-compat endpoint nests it under `meta`).
+/// 3. `GET <base_url-without-/v1>/props` →
+///    `default_generation_settings.n_ctx` or top-level `n_ctx_train`
+///    (llama.cpp's properties endpoint).
+///
+/// Returns `None` for backends that don't advertise context size in
+/// any of those shapes (real OpenAI, OpenRouter, …). Caller falls
+/// back to a conservative default and logs.
+async fn probe_upstream_max_model_len(base_url: &str) -> Option<usize> {
+    let trimmed_v1 = base_url.trim_end_matches('/');
+    let trimmed_root = trimmed_v1.trim_end_matches("/v1").trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+
+    // (1) + (2) — /models is OpenAI-compat surface; both vLLM and
+    // llama.cpp answer here.
+    if let Ok(resp) = client.get(format!("{trimmed_v1}/models")).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                let entry = body.get("data").and_then(|d| d.get(0));
+                if let Some(e) = entry {
+                    if let Some(n) = e.get("max_model_len").and_then(|v| v.as_u64()) {
+                        return Some(n as usize);
+                    }
+                    if let Some(n) = e
+                        .get("meta")
+                        .and_then(|m| m.get("n_ctx_train"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        return Some(n as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    // (3) — llama.cpp /props
+    if let Ok(resp) = client.get(format!("{trimmed_root}/props")).send().await {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(n) = body
+                    .get("default_generation_settings")
+                    .and_then(|g| g.get("n_ctx"))
+                    .and_then(|v| v.as_u64())
+                {
+                    return Some(n as usize);
+                }
+                if let Some(n) = body.get("n_ctx_train").and_then(|v| v.as_u64()) {
+                    return Some(n as usize);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Best-effort probe for the chat upstream's slot count. Hits
