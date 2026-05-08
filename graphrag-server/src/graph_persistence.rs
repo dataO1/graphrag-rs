@@ -278,9 +278,67 @@ pub async fn persist_touched_snapshot(
 ) -> Result<(usize, usize), QdrantError> {
     let dim = embeddings.dimension() as u64;
 
-    // ---- Entities: re-use cached embedding when present, embed only the rest ----
-    let (texts_to_embed, indices_to_embed): (Vec<String>, Vec<usize>) = snapshot
-        .entities
+    // 3-tier embedding lookup. Each tier handles cases the previous
+    // missed; OVMS only fires for genuinely new entities/relationships.
+    //
+    //   Tier 1 — in-process text_cache         (µs, free, within-session)
+    //   Tier 2 — qdrant fetch_*_vectors        (sub-ms batch RPC, cross-restart)
+    //   Tier 3 — OVMS via generate_cached      (~600 ms per request)
+    //
+    // Tier 1 lives inside `generate_cached`. Tier 2 runs here, BEFORE
+    // tier 1, by attaching the qdrant-found vectors directly to
+    // Entity.embedding (which short-circuits the tier-1/tier-3 fallthrough
+    // entirely) and seeding the text_cache so future within-session
+    // requests for the same text bypass qdrant too.
+
+    let mut snapshot_entities = snapshot.entities;
+    let mut snapshot_relationships = snapshot.relationships;
+
+    // ---- Tier 2 (entities): batch-fetch vectors for any entity that
+    //      arrived without an embedding. On hit, attach to
+    //      Entity.embedding AND seed the text cache. On miss, the
+    //      entity stays as-is and the existing tier-1/tier-3 path picks
+    //      it up below.
+    {
+        let lookup_ids: Vec<String> = snapshot_entities
+            .iter()
+            .filter(|(e, _)| e.embedding.is_none())
+            .map(|(e, _)| e.id.0.clone())
+            .collect();
+        if !lookup_ids.is_empty() {
+            match qdrant.fetch_entity_vectors(&lookup_ids).await {
+                Ok(found) if !found.is_empty() => {
+                    let hits = found.len();
+                    let total = lookup_ids.len();
+                    for (e, t) in snapshot_entities.iter_mut() {
+                        if e.embedding.is_none() {
+                            if let Some(v) = found.get(&e.id.0) {
+                                e.embedding = Some(v.clone());
+                                embeddings.seed_cache(t, v).await;
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        "persist: tier-2 (qdrant) hydrated {}/{} entity vectors",
+                        hits, total
+                    );
+                },
+                Ok(_) => {},
+                Err(err) => {
+                    // Non-fatal — entities without a tier-2 hit just
+                    // fall through to tier-3 (re-embed via OVMS).
+                    tracing::warn!(
+                        "persist: tier-2 entity vector fetch failed ({}); falling back to OVMS",
+                        err
+                    );
+                },
+            }
+        }
+    }
+
+    // ---- Tier 1+3 (entities): existing cache + OVMS path on whatever
+    //      remains with embedding=None. ----
+    let (texts_to_embed, indices_to_embed): (Vec<String>, Vec<usize>) = snapshot_entities
         .iter()
         .enumerate()
         .filter_map(|(i, (e, t))| {
@@ -293,12 +351,17 @@ pub async fn persist_touched_snapshot(
         .unzip();
 
     let mut entity_embeddings: Vec<Option<Vec<f32>>> =
-        snapshot.entities.iter().map(|(e, _)| e.embedding.clone()).collect();
+        snapshot_entities.iter().map(|(e, _)| e.embedding.clone()).collect();
 
     if !texts_to_embed.is_empty() {
         let refs: Vec<&str> = texts_to_embed.iter().map(String::as_str).collect();
+        // Cached path: same-text re-mentions (e.g. recurring novel
+        // characters) are served from the in-process text→vector cache
+        // and never round-trip OVMS again. The cache key is the embed
+        // text itself ("<name> (<type>)"), which is deterministic per
+        // entity identity, so cache hits are correct by construction.
         let computed = embeddings
-            .generate(&refs)
+            .generate_cached(&refs)
             .await
             .map_err(|e| QdrantError::OperationError(format!("delta entity embed failed: {}", e)))?;
         for (i, vec) in indices_to_embed.iter().zip(computed) {
@@ -306,8 +369,7 @@ pub async fn persist_touched_snapshot(
         }
     }
 
-    let entity_payloads_with_vec: Vec<(PersistedEntity, Vec<f32>)> = snapshot
-        .entities
+    let entity_payloads_with_vec: Vec<(PersistedEntity, Vec<f32>)> = snapshot_entities
         .iter()
         .zip(entity_embeddings.iter())
         .map(|((e, _), emb)| {
@@ -316,31 +378,73 @@ pub async fn persist_touched_snapshot(
         })
         .collect();
 
-    // ---- Relationships: relationships don't carry cached embeddings today,
-    //      so always batch-embed all of them. The set is small (the touched
-    //      delta), so this stays cheap. ----
-    let (rel_texts_to_embed, rel_indices_to_embed): (Vec<String>, Vec<usize>) = snapshot
-        .relationships
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (r, t))| {
-            if r.embedding.is_some() {
-                None
-            } else {
-                Some((t.clone(), i))
+    // ---- Tier 2 (relationships): same scheme keyed on
+    //      (source, relation_type, target). ----
+    {
+        let lookup_keys: Vec<(String, String, String)> = snapshot_relationships
+            .iter()
+            .filter(|(r, _)| r.embedding.is_none())
+            .map(|(r, _)| (r.source.0.clone(), r.relation_type.clone(), r.target.0.clone()))
+            .collect();
+        if !lookup_keys.is_empty() {
+            match qdrant.fetch_relationship_vectors(&lookup_keys).await {
+                Ok(found) if !found.is_empty() => {
+                    let hits = found.len();
+                    let total = lookup_keys.len();
+                    for (r, t) in snapshot_relationships.iter_mut() {
+                        if r.embedding.is_none() {
+                            let k = (
+                                r.source.0.clone(),
+                                r.relation_type.clone(),
+                                r.target.0.clone(),
+                            );
+                            if let Some(v) = found.get(&k) {
+                                r.embedding = Some(v.clone());
+                                embeddings.seed_cache(t, v).await;
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        "persist: tier-2 (qdrant) hydrated {}/{} relationship vectors",
+                        hits, total
+                    );
+                },
+                Ok(_) => {},
+                Err(err) => {
+                    tracing::warn!(
+                        "persist: tier-2 relationship vector fetch failed ({}); falling back to OVMS",
+                        err
+                    );
+                },
             }
-        })
-        .unzip();
+        }
+    }
 
-    let mut rel_embeddings: Vec<Option<Vec<f32>>> = snapshot
-        .relationships
+    // ---- Tier 1+3 (relationships): cache + OVMS for whatever's still missing. ----
+    let (rel_texts_to_embed, rel_indices_to_embed): (Vec<String>, Vec<usize>) =
+        snapshot_relationships
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (r, t))| {
+                if r.embedding.is_some() {
+                    None
+                } else {
+                    Some((t.clone(), i))
+                }
+            })
+            .unzip();
+
+    let mut rel_embeddings: Vec<Option<Vec<f32>>> = snapshot_relationships
         .iter()
         .map(|(r, _)| r.embedding.clone())
         .collect();
 
     if !rel_texts_to_embed.is_empty() {
         let refs: Vec<&str> = rel_texts_to_embed.iter().map(String::as_str).collect();
-        let computed = embeddings.generate(&refs).await.map_err(|e| {
+        // Same cache as the entity branch above — relationship embed
+        // text is `"<src_name> <relation_type> <tgt_name>"`, also
+        // deterministic per relationship identity.
+        let computed = embeddings.generate_cached(&refs).await.map_err(|e| {
             QdrantError::OperationError(format!("delta relationship embed failed: {}", e))
         })?;
         for (i, vec) in rel_indices_to_embed.iter().zip(computed) {
@@ -348,8 +452,7 @@ pub async fn persist_touched_snapshot(
         }
     }
 
-    let rel_payloads_with_vec: Vec<(PersistedRelationship, Vec<f32>)> = snapshot
-        .relationships
+    let rel_payloads_with_vec: Vec<(PersistedRelationship, Vec<f32>)> = snapshot_relationships
         .iter()
         .zip(rel_embeddings.iter())
         .map(|((r, _), emb)| {

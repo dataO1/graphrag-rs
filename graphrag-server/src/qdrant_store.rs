@@ -1520,6 +1520,138 @@ impl QdrantStore {
         Ok(out)
     }
 
+    /// Batch-fetch entity vectors by entity id from the entities sidecar
+    /// collection. Used as the cross-restart layer in
+    /// `persist_touched_snapshot`'s 3-tier embedding lookup (after the
+    /// in-process text cache, before round-tripping OVMS): if a vector
+    /// for the entity is already persisted, reuse it instead of paying
+    /// to re-embed.
+    ///
+    /// Misses (entity id not yet in qdrant) are silently dropped from
+    /// the result map — caller falls back to OVMS for those. Errors
+    /// from qdrant are returned so the caller can decide whether to
+    /// proceed with a degraded re-embed path.
+    ///
+    /// Point id mapping mirrors `persist_graph_delta` exactly: each
+    /// entity id is hashed to a deterministic UUID v5 under
+    /// `uuid::NAMESPACE_OID`, so this fetch is paired with the upsert
+    /// that produced those vectors.
+    pub async fn fetch_entity_vectors(
+        &self,
+        entity_ids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, QdrantError> {
+        if entity_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let coll = self.entities_collection();
+        if self.client.collection_info(&coll).await.is_err() {
+            return Ok(HashMap::new());
+        }
+
+        // Compute UUID for each entity id and build the reverse map so
+        // we can recover the original id from the qdrant point id.
+        let mut id_to_uuid: HashMap<String, String> = HashMap::with_capacity(entity_ids.len());
+        let mut uuid_to_id: HashMap<String, String> = HashMap::with_capacity(entity_ids.len());
+        for id in entity_ids {
+            let uuid_str =
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, id.as_bytes()).to_string();
+            uuid_to_id.insert(uuid_str.clone(), id.clone());
+            id_to_uuid.insert(id.clone(), uuid_str);
+        }
+
+        let point_ids: Vec<qdrant_client::qdrant::PointId> =
+            id_to_uuid.values().cloned().map(|s| s.into()).collect();
+
+        let resp = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(&coll, point_ids)
+                    .with_payload(false)
+                    .with_vectors(true),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+
+        let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+        for point in resp.result {
+            let pid = match point_id_to_string(point.clone()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let entity_id = match uuid_to_id.get(&pid) {
+                Some(eid) => eid.clone(),
+                None => continue,
+            };
+            let vec_data = match point.vectors.and_then(|v| v.vectors_options) {
+                Some(qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(o)) => o.data,
+                _ => continue,
+            };
+            out.insert(entity_id, vec_data);
+        }
+        Ok(out)
+    }
+
+    /// Batch-fetch relationship vectors keyed by `(source_id,
+    /// relation_type, target_id)`. Same role as
+    /// [`Self::fetch_entity_vectors`] but for the relationships sidecar.
+    /// Point id mapping mirrors `persist_graph_delta`'s
+    /// `"<src>|<rel>|<tgt>"` UUID v5 hash.
+    pub async fn fetch_relationship_vectors(
+        &self,
+        keys: &[(String, String, String)],
+    ) -> Result<HashMap<(String, String, String), Vec<f32>>, QdrantError> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let coll = self.relationships_collection();
+        if self.client.collection_info(&coll).await.is_err() {
+            return Ok(HashMap::new());
+        }
+
+        let mut key_to_uuid: HashMap<(String, String, String), String> =
+            HashMap::with_capacity(keys.len());
+        let mut uuid_to_key: HashMap<String, (String, String, String)> =
+            HashMap::with_capacity(keys.len());
+        for (s, r, t) in keys {
+            let stable = format!("{}|{}|{}", s, r, t);
+            let uuid_str =
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, stable.as_bytes()).to_string();
+            uuid_to_key.insert(uuid_str.clone(), (s.clone(), r.clone(), t.clone()));
+            key_to_uuid.insert((s.clone(), r.clone(), t.clone()), uuid_str);
+        }
+
+        let point_ids: Vec<qdrant_client::qdrant::PointId> =
+            key_to_uuid.values().cloned().map(|s| s.into()).collect();
+
+        let resp = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(&coll, point_ids)
+                    .with_payload(false)
+                    .with_vectors(true),
+            )
+            .await
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
+
+        let mut out: HashMap<(String, String, String), Vec<f32>> = HashMap::new();
+        for point in resp.result {
+            let pid = match point_id_to_string(point.clone()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let key = match uuid_to_key.get(&pid) {
+                Some(k) => k.clone(),
+                None => continue,
+            };
+            let vec_data = match point.vectors.and_then(|v| v.vectors_options) {
+                Some(qdrant_client::qdrant::vectors_output::VectorsOptions::Vector(o)) => o.data,
+                _ => continue,
+            };
+            out.insert(key, vec_data);
+        }
+        Ok(out)
+    }
+
     /// Get collection statistics
     pub async fn stats(&self) -> Result<(usize, usize), QdrantError> {
         let info = self

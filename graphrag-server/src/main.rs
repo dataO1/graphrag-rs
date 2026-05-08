@@ -2448,6 +2448,7 @@ async fn list_documents(state: Data<AppState>) -> Json<ListDocumentsResponse> {
 async fn embeddings_stats(state: Data<AppState>) -> Json<serde_json::Value> {
     let svc = state.embeddings.load_full();
     let stats = svc.get_stats().await;
+    let cache_size = svc.cache_size().await;
     let cfg = state.config.load_full();
     Json(json!({
         "backend": cfg.embeddings.backend,
@@ -2461,6 +2462,7 @@ async fn embeddings_stats(state: Data<AppState>) -> Json<serde_json::Value> {
             "failures": stats.backend_failures,
             "fallback_used": stats.fallback_used,
             "cache_hits": stats.cache_hits,
+            "text_cache_entries": cache_size,
         },
     }))
 }

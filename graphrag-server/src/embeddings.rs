@@ -16,6 +16,7 @@
 use graphrag_core::config::EmbeddingConfig;
 use graphrag_core::vector::EmbeddingGenerator;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -43,6 +44,19 @@ pub struct EmbeddingService {
     openai_client: Option<Arc<OpenAIClient>>,
     fallback_generator: Arc<RwLock<EmbeddingGenerator>>,
     stats: Arc<RwLock<EmbeddingStats>>,
+    /// Process-lifetime text→vector cache. Used exclusively by
+    /// [`Self::generate_cached`], which is called from the
+    /// graph-delta persist path. Embed text for an entity is a
+    /// deterministic function of its name+type
+    /// (`"<name> (<type>)"`), so once a vector is computed for
+    /// "Tom (PERSON)" we can serve every later mention from the
+    /// cache instead of round-tripping OVMS.
+    ///
+    /// On a typical novel the cache holds ~10–50k entries. At 1024
+    /// f32 each that's ~40–200 MB — small relative to the chunks
+    /// dataset. No eviction yet; if a long-running server pushes
+    /// past 100k entries we'll add an LRU layer here.
+    text_cache: Arc<RwLock<HashMap<String, Arc<Vec<f32>>>>>,
 }
 
 /// Embedding statistics
@@ -206,6 +220,7 @@ impl EmbeddingService {
             openai_client,
             fallback_generator,
             stats: Arc::new(RwLock::new(EmbeddingStats::default())),
+            text_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -447,6 +462,96 @@ impl EmbeddingService {
             .ok_or_else(|| EmbeddingError::GenerationFailed("No embedding generated".to_string()))
     }
 
+    /// Cached batch embed. Probes [`Self::text_cache`] for each input;
+    /// rounds out only the misses through [`Self::generate`]; populates
+    /// the cache with the new pairs and returns vectors in input order.
+    ///
+    /// Called from `persist_touched_snapshot` so the graph-delta path
+    /// stops re-embedding the same entity texts on every chunk that
+    /// re-mentions an entity. Query embeddings still go through
+    /// `generate_single` and bypass this cache — query inputs are
+    /// rarely repeated and we don't want to bloat the cache with them.
+    pub async fn generate_cached(
+        &self,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 1: probe cache under a single read lock; collect misses.
+        let mut results: Vec<Option<Arc<Vec<f32>>>> = Vec::with_capacity(texts.len());
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_texts: Vec<String> = Vec::new();
+        {
+            let cache = self.text_cache.read().await;
+            for (i, t) in texts.iter().enumerate() {
+                match cache.get(*t) {
+                    Some(v) => results.push(Some(Arc::clone(v))),
+                    None => {
+                        results.push(None);
+                        miss_indices.push(i);
+                        miss_texts.push((*t).to_string());
+                    },
+                }
+            }
+        }
+
+        let cache_hits = texts.len() - miss_indices.len();
+        if cache_hits > 0 {
+            let mut stats = self.stats.write().await;
+            stats.cache_hits += cache_hits;
+        }
+
+        // Pass 2: embed misses (if any) and populate the cache.
+        if !miss_texts.is_empty() {
+            let refs: Vec<&str> = miss_texts.iter().map(String::as_str).collect();
+            let computed = self.generate(&refs).await?;
+            if computed.len() != miss_indices.len() {
+                return Err(EmbeddingError::GenerationFailed(format!(
+                    "generate_cached: backend returned {} vectors for {} miss inputs",
+                    computed.len(),
+                    miss_indices.len()
+                )));
+            }
+            let mut cache = self.text_cache.write().await;
+            for (idx_in_misses, idx_in_results) in miss_indices.into_iter().enumerate() {
+                let vec = Arc::new(computed[idx_in_misses].clone());
+                cache.insert(miss_texts[idx_in_misses].clone(), Arc::clone(&vec));
+                results[idx_in_results] = Some(vec);
+            }
+        }
+
+        // Final unwrap: every slot must be Some by construction.
+        Ok(results
+            .into_iter()
+            .map(|opt| opt.expect("generate_cached: slot left None").as_ref().clone())
+            .collect())
+    }
+
+    /// Number of distinct embed texts currently cached. Exposed so
+    /// `/embeddings/stats` and `/health` can report the cache size.
+    pub async fn cache_size(&self) -> usize {
+        self.text_cache.read().await.len()
+    }
+
+    /// Externally populate the text cache with a known (text, vector)
+    /// pair. Used by the cross-restart layer in
+    /// `persist_touched_snapshot`: when an entity's vector is recovered
+    /// from the qdrant sidecar (instead of being recomputed via OVMS),
+    /// this seeds the in-process cache so future within-session
+    /// requests for the same text bypass the qdrant RPC too.
+    ///
+    /// Idempotent: a second call for the same text overwrites with the
+    /// new vector. Callers should pass the SAME embed text the
+    /// `generate_cached` path would use (`"<name> (<type>)"` for
+    /// entities, `"<src> <rel> <tgt>"` for relationships) so cache hits
+    /// land.
+    pub async fn seed_cache(&self, text: &str, vector: &[f32]) {
+        let mut cache = self.text_cache.write().await;
+        cache.insert(text.to_string(), Arc::new(vector.to_vec()));
+    }
+
     /// Generate embeddings using Ollama
     #[cfg(feature = "ollama")]
     async fn generate_with_ollama(
@@ -624,5 +729,29 @@ mod tests {
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), 384);
         assert_eq!(embeddings[1].len(), 384);
+    }
+
+    #[tokio::test]
+    async fn test_generate_cached_dedups_repeats() {
+        let service = EmbeddingService::from_config(&hash_cfg(64)).await.unwrap();
+
+        // First call: all misses → cache populates with 2 entries.
+        let r1 = service.generate_cached(&["alpha", "beta"]).await.unwrap();
+        assert_eq!(r1.len(), 2);
+        assert_eq!(service.cache_size().await, 2);
+
+        // Second call mixing hits + a new miss: cache grows to 3,
+        // and the hits return byte-identical vectors.
+        let r2 = service
+            .generate_cached(&["alpha", "gamma", "beta"])
+            .await
+            .unwrap();
+        assert_eq!(r2.len(), 3);
+        assert_eq!(service.cache_size().await, 3);
+        assert_eq!(r2[0], r1[0]); // alpha hit
+        assert_eq!(r2[2], r1[1]); // beta hit
+
+        // Stats should reflect the 2 hits from the second call.
+        assert_eq!(service.get_stats().await.cache_hits, 2);
     }
 }
