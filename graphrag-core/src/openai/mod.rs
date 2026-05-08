@@ -144,6 +144,22 @@ impl OpenAIClient {
     /// Build a new client. Network is not touched until the first
     /// `generate*` call. The reqwest client uses HTTP/1.1 keep-alive
     /// connections by default; one client instance pools them per host.
+    ///
+    /// Timeouts (all four matter under AIMD-driven load):
+    ///   - `timeout(config.timeout_seconds)` — overall per-request
+    ///     deadline. Without it, a hung response can leak the future
+    ///     forever, holding an AIMD permit and accumulating allocations.
+    ///   - `connect_timeout(15s)` — bound the connect phase separately
+    ///     so a dead upstream fails fast instead of eating the full
+    ///     request budget on TCP retries.
+    ///   - `tcp_keepalive(60s)` — kernel-level liveness probes on idle
+    ///     pooled connections. Catches half-dead nginx/Spark conns
+    ///     where peer FIN'd but our side hasn't noticed (the CLOSE-WAIT
+    ///     leak we saw in production: 78 stalled futures, 85 GB RSS in
+    ///     6 minutes before OOM).
+    ///   - `pool_idle_timeout(90s)` — discard pooled idle conns before
+    ///     nginx's keepalive_timeout closes them; avoids `EPIPE` on
+    ///     reuse.
     pub fn new(config: OpenAIConfig) -> Self {
         let timeout = std::time::Duration::from_secs(config.timeout_seconds);
         // The reqwest builder rejects a client built without a runtime if
@@ -153,6 +169,8 @@ impl OpenAIClient {
         // on TLS calls only) rather than panic at construction time.
         let http = reqwest::Client::builder()
             .timeout(timeout)
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

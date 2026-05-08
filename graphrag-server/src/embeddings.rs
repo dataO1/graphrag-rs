@@ -124,8 +124,17 @@ impl EmbeddingService {
                 ));
             }
 
+            // Same timeout-hardening as the chat client in
+            // graphrag-core/src/openai/mod.rs — tcp_keepalive and
+            // connect_timeout catch dead nginx/OVMS conns long before
+            // the 60s overall request budget runs out, so a stuck
+            // future can't sit in CLOSE-WAIT for minutes accumulating
+            // recv-buffer state.
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .tcp_keepalive(std::time::Duration::from_secs(60))
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .build()
                 .map_err(|e| EmbeddingError::OpenAIError(format!("client build failed: {e}")))?;
 
