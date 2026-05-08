@@ -56,11 +56,10 @@ full = [
 wasm-bundle = ["memory-storage", "basic-retrieval", "leiden"]
 
 ## Research Bundle - Advanced features for GraphRAG research
-## Includes: full + ROGRAG, cross-encoder, incremental updates
+## Includes: full + cross-encoder, incremental updates
 ## Best for: Experiments, benchmarking, academic research
 research = [
     "full",
-    "rograg",
     "cross-encoder",
     "incremental",
     "monitoring",
@@ -121,9 +120,6 @@ caching = ["moka", "tracing"]
 
 # Incremental updates feature
 incremental = ["parking_lot", "dashmap"]
-
-# ROGRAG (Robustly Optimized GraphRAG) feature
-rograg = ["derive_more", "strum", "itertools", "tap"]
 
 # API module (requires axum web framework)
 api = ["axum", "tower", "tower-http", "async"]

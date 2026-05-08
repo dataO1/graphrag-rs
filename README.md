@@ -130,41 +130,47 @@ See [graphrag-server/README.md](graphrag-server/README.md) for server documentat
 
 ## 🎯 State-of-the-Art Quality Improvements
 
-GraphRAG-rs implements **5 cutting-edge research papers** (2019-2025) for superior retrieval quality:
+GraphRAG-rs is a LightRAG-style implementation. The headline features are
+production-wired into the runtime retrieval path; some research-grade modules
+exist as compiled-in scaffolding behind feature flags but are not yet called
+from the default `/api/ask` handler. The status column below reflects the
+actual runtime state, not just whether code exists.
 
-### Research-Based Features ✨
+> **Audit reference (2026-05-08)**: see [TODO.md](TODO.md) phases H–L for
+> the planned wire-up / cleanup work corresponding to each ⚠️ row.
 
-| Feature | Impact | Paper | Status |
-|---------|--------|-------|--------|
-| **LightRAG Dual-Level Retrieval** | 6000x token reduction | EMNLP 2025 | ✅ Production |
-| **Leiden Community Detection** | +15% modularity | Sci Reports 2019 | ✅ Production |
-| **Cross-Encoder Reranking** | +20% accuracy | EMNLP 2019 | ✅ Production |
-| **HippoRAG Personalized PageRank** | 10-30x cheaper | NeurIPS 2024 | ✅ Production |
-| **Semantic Chunking** | Better boundaries | LangChain 2024 | ✅ Production |
+### LightRAG runtime path ✨
 
-**Combined Result**: **+20% accuracy** with **99% cost savings**! 🚀
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Dual-level keyword retrieval** | ✅ Wired | LLM extracts low- + high-level keywords; low → entity vector search, high → relationship vector search. `graphrag-core/src/lightrag/dual_retrieval.rs:103-142`, `graphrag-server/src/main.rs:1248-1289` |
+| **Relationship-description retrieval** | ✅ Wired | Relationship sidecar collection in Qdrant; descriptions feed the synthesis prompt via `ask_with_dual_seeds`. |
+| **Incremental graph update** | ✅ Wired | `extend_graph_streaming` + `merge_entity` / `merge_relationship` patch the master graph per chunk; no full rebuild. |
+| **3-tier entity-vector cache** | ✅ Wired | (1) in-process text cache → (2) Qdrant `fetch_entity_vectors` cross-restart fallback → (3) OVMS embed. Recurring entities skip OVMS entirely. |
+| **Cross-restart graph hydrate** | ✅ Wired | `hydrate_in_memory_graph` restores the entity/relationship graph from the Qdrant sidecars on every boot. |
+| **AIMD-gated LLM concurrency** | ✅ Wired | Probe → trust-configured-floor → additive growth on success / multiplicative shrink on failure. |
+| **Per-request retry + strict embed path** | ✅ Wired | 3 attempts at 50/200/500 ms backoff; `generate_strict` refuses silent hash fallback in the persist path. |
 
-### New: Advanced Reasoning & Optimization (2025-2026) 🔬
+### Compiled-in but not wired into runtime ⚠️
 
-Building on state-of-the-art foundations, GraphRAG-rs now implements **7 cutting-edge techniques** from recent research:
+These modules exist behind feature flags and pass their unit tests, but the
+default `/api/ask` handler does not call them. Treat them as research surface,
+not production behavior. (Phase L 2026-05-08 stripped the MS-GraphRAG vestiges
+— symbolic anchoring, dynamic edge weighting, causal chain analysis,
+hierarchical clustering, weight optimization, and the entire ROGRAG pipeline
+— so this list is now down to two genuinely-scaffolded items.)
 
-| Phase | Feature | Impact | Status |
-|-------|---------|--------|--------|
-| **Phase 2** | **Symbolic Anchoring** (CatRAG-style) | Better conceptual queries | ✅ Complete |
-| **Phase 2** | **Dynamic Edge Weighting** | Context-aware ranking | ✅ Complete |
-| **Phase 2** | **Causal Chain Analysis** | Multi-step reasoning | ✅ Complete |
-| **Phase 3** | **Hierarchical Relationship Clustering** | Multi-level organization | ✅ Complete |
-| **Phase 3** | **Graph Weight Optimization** (DW-GRPO) | Adaptive learning | ✅ Complete |
+| Feature | Status | Where it lives |
+|---------|--------|----------------|
+| **Cross-encoder re-ranking** | ⚠️ Scaffolded | `graphrag-core/src/reranking/cross_encoder.rs` — Candle/BERT impl complete, no caller in retrieval path. Phase H wires it. |
+| **Hybrid BM25 + vector retrieval** | ⚠️ Scaffolded | `graphrag-core/src/retrieval/hybrid.rs` — full RRF/Weighted/CombSum/MaxScore fusion, not invoked from default path. Phase J wires it. |
 
-#### Key Capabilities
+### Missing entirely ❌
 
-- **Symbolic Anchoring**: Automatically grounds abstract concepts (like "love" or "justice") to concrete entities for better conceptual query handling
-- **Dynamic Weighting**: Adjusts relationship importance based on query context using semantic, temporal, and causal signals
-- **Causal Reasoning**: Discovers multi-step causal chains with temporal consistency validation
-- **Hierarchical Clustering**: Organizes relationships into multi-level hierarchies using Leiden algorithm with LLM-generated summaries
-- **Weight Optimization**: Learns optimal relationship weights through heuristic optimization for improved retrieval quality
-
-📚 **Full Documentation**: See [graphrag-core/ADVANCED_FEATURES.md](graphrag-core/ADVANCED_FEATURES.md) for implementation details, benchmarks, and research papers.
+| Feature | Notes |
+|---------|-------|
+| **Multi-turn chat memory** | `QueryRequest` has `session_id` for stale-context lease tracking but no `chat_history` / `prior_turns` field. Each `/api/ask` call is single-turn. Phase I. |
+| **Native PDF / DOCX / HTML parser** | Markdown / text / code only. Binary formats route through an external `INGEST_PREPROCESSOR_URL` (Nemotron-Omni or pandoc) — not bundled. Phase K. |
 
 ### Enable Advanced Features
 
@@ -193,30 +199,6 @@ resolution = 1.0
 enabled = true
 model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 top_k = 10                  # +20% accuracy improvement
-
-# Advanced Features (Phases 2-3)
-[advanced_features.symbolic_anchoring]
-min_relevance = 0.3         # Minimum relevance for concept anchors
-max_anchors = 5             # Maximum anchors per query
-
-[advanced_features.dynamic_weighting]
-enable_semantic_boost = true    # Boost relationships similar to query
-enable_temporal_boost = true    # Boost recent/relevant relationships
-enable_causal_boost = true      # Boost strong causal relationships
-
-[advanced_features.causal_analysis]
-min_confidence = 0.3            # Minimum confidence for causal chains
-max_chain_depth = 5             # Maximum chain depth to search
-require_temporal_consistency = true  # Enforce chronological ordering
-
-[advanced_features.hierarchical_clustering]
-num_levels = 3                  # Number of hierarchy levels (2-5)
-generate_summaries = true       # LLM-generated cluster summaries
-
-[advanced_features.weight_optimization]
-learning_rate = 0.05            # Learning rate for optimization
-max_iterations = 20             # Maximum optimization iterations
-use_llm_eval = true             # Use LLM for quality evaluation
 ```
 
 📖 **Quick Start Example**: See [graphrag-core/config-examples/quick-start.toml](graphrag-core/config-examples/quick-start.toml) for a minimal configuration.
@@ -749,7 +731,6 @@ GraphRAG-rs implements cutting-edge 2024 research in retrieval-augmented generat
 - **Incremental Updates**: Zero-downtime real-time graph processing with ACID-like guarantees
 - **Intelligent Caching**: LLM response cache with 80%+ hit rates and 6x cost reduction
 - **Hybrid Retrieval**: Combines semantic, keyword, BM25, and graph-based search strategies
-- **ROGRAG Decomposition**: Advanced query decomposition with 60%→75% accuracy boost, temporal and causal reasoning
 - **Ollama Advanced Integration**: Complete local LLM support with streaming, custom parameters, automatic caching, and metrics tracking
 
 ### Ollama Integration (NEW! ✨)
@@ -846,7 +827,6 @@ caching = ["moka"]                           # LLM response caching
 incremental = []                             # Zero-downtime updates
 pagerank = []                                # Fast-GraphRAG retrieval
 lightrag = []                                # Dual-level retrieval
-rograg = []                                  # Query decomposition
 
 # LLM integrations
 ollama = []                                  # Ollama local models with streaming
@@ -1045,7 +1025,6 @@ A: OpenAI support is planned. Currently works with Ollama's local models.
 - [x] **LightRAG**: Dual-level retrieval (6000x token reduction)
 - [x] **Incremental Updates**: Zero-downtime graph processing
 - [x] **Intelligent Caching**: 80%+ hit rates, 6x cost reduction
-- [x] **ROGRAG**: Query decomposition (60%→75% accuracy) + temporal/causal reasoning
 - [x] **Hybrid Retrieval**: Semantic + keyword + BM25 + graph
 - [x] **Parallel Processing**: Multi-threaded document processing
 - [x] **Configuration System**: Complete TOML-driven pipeline

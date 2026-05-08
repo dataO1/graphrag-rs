@@ -120,10 +120,6 @@ pub mod critic;
 /// Evaluation framework for query results and pipeline validation
 pub mod evaluation;
 
-/// Graph optimization (weight optimization, DW-GRPO)
-#[cfg(feature = "async")]
-pub mod optimization;
-
 /// API endpoints and handlers
 #[cfg(feature = "api")]
 pub mod api;
@@ -155,10 +151,6 @@ pub mod function_calling;
 #[cfg(feature = "incremental")]
 /// Incremental graph updates
 pub mod incremental;
-
-#[cfg(feature = "rograg")]
-/// ROGRAG (Robustly Optimized GraphRAG) implementation
-pub mod rograg;
 
 // Future utility modules (optional, not currently needed):
 // pub mod automatic_entity_linking;  // Advanced entity linking

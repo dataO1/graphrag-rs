@@ -1,7 +1,5 @@
 /// BM25 text retrieval implementation for keyword-based search
 pub mod bm25;
-/// Causal chain analysis for discovering cause-effect paths (Phase 2.3)
-pub mod causal_analysis;
 /// Enriched metadata-aware retrieval
 pub mod enriched;
 /// HippoRAG Personalized PageRank retrieval
@@ -10,8 +8,6 @@ pub mod hipporag_ppr;
 /// Hybrid retrieval combining multiple search strategies
 pub mod hybrid;
 pub mod pagerank_retrieval;
-/// Symbolic anchoring for conceptual queries (Phase 2.1 - CatRAG)
-pub mod symbolic_anchoring;
 
 #[cfg(feature = "parallel-processing")]
 use crate::parallel::ParallelProcessor;

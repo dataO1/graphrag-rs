@@ -929,21 +929,6 @@ Intent: Relational + Temporal
 Strategy: Graph traversal + vector search hybrid
 ```
 
-**C. Query Decomposition (ROGRAG)**
-
-For complex queries, break into sub-queries:
-
-```
-Complex: "Compare Tom's and Huck's roles in finding the treasure"
-
-Decomposed:
-  1. "What role did Tom play in finding the treasure?"
-  2. "What role did Huck play in finding the treasure?"
-  3. [Synthesis] "Compare the two roles"
-
-Accuracy boost: 60% → 75% (15% improvement!)
-```
-
 #### Advanced Query Pipeline
 
 ```rust
@@ -971,10 +956,9 @@ pub async fn execute_query() -> Result<QueryResult> {
 }
 ```
 
-**Module**: `src/query/advanced_pipeline.rs`, `src/rograg/`
+**Module**: `src/query/advanced_pipeline.rs`
 **Performance**:
 - Query analysis: ~50ms
-- Decomposition (if needed): ~100ms
 
 ---
 
@@ -1426,7 +1410,6 @@ fusion_weights = { vector = 0.4, bm25 = 0.3, pagerank = 0.3 }
 |----------|--------------|--------|
 | **Basic** | Intent classification (Factual/Relational/Temporal) | `src/query/mod.rs` |
 | **Advanced** | Multi-modal scoring + Entity extraction | `src/query/advanced_pipeline.rs` |
-| **ROGRAG** | Query decomposition + Logic forms | `src/rograg/logic_form.rs` |
 
 **Query Intent Types**:
 ```rust
@@ -1440,22 +1423,10 @@ pub enum QueryIntent {
 }
 ```
 
-**ROGRAG Decomposition**:
-```
-Complex: "Compare Tom's and Huck's roles in finding the treasure"
-
-Decomposed:
-  1. "What role did Tom play in finding the treasure?"
-  2. "What role did Huck play in finding the treasure?"
-  3. [Synthesis] "Compare the two roles"
-
-Accuracy: 60% → 75% (+15% boost!)
-```
-
 **Configuration**:
 ```toml
 [query_processing]
-analyzer = "advanced"                  # or "basic", "rograg"
+analyzer = "advanced"                  # or "basic"
 enable_decomposition = true
 max_sub_queries = 5
 confidence_threshold = 0.6
@@ -1839,7 +1810,7 @@ pagerank = 0.3                # Graph importance weight
 **H. Stage 6: Query Processing**
 ```toml
 [query_processing]
-analyzer = "advanced"         # Options: basic, advanced, rograg
+analyzer = "advanced"         # Options: basic, advanced
 enable_decomposition = true   # Break complex queries into sub-queries
 max_sub_queries = 5           # Maximum decomposition depth
 confidence_threshold = 0.6    # Minimum confidence for query understanding
@@ -1870,7 +1841,6 @@ gpu_device = 0                # GPU device ID (0 = first GPU)
 **K. Experimental Features**
 ```toml
 [experimental]
-enable_rograg = true          # Query decomposition (+15% accuracy)
 enable_fast_graphrag = true   # PageRank retrieval (27x faster)
 enable_lightrag = true        # Dual-level retrieval (6000x tokens)
 ```
@@ -2284,23 +2254,6 @@ cargo build --features pagerank
 
 **Module**: `src/graph/pagerank.rs`
 
-### ROGRAG (Query Decomposition)
-
-**What**: Breaks complex queries into sub-queries with logic-based reasoning
-
-**Impact**:
-- ✅ **15% accuracy improvement** (60% → 75%)
-- ✅ Handles multi-hop questions
-- ✅ Structured reasoning traces
-
-**Enable**:
-```toml
-[features]
-rograg = []
-```
-
-**Module**: `src/rograg/logic_form.rs`
-
 ### GPU Acceleration
 
 **Options**:
@@ -2446,10 +2399,6 @@ GraphRAG-rs implements cutting-edge research:
 3. **LightRAG** (2024) - "Simple and Fast Retrieval-Augmented Generation"
    - Dual-level retrieval
    - 6000x token reduction
-
-4. **ROGRAG** (2024) - Robust query processing
-   - Query decomposition
-   - 60% → 75% accuracy boost
 
 ---
 
@@ -2718,7 +2667,7 @@ Answer: "Tom and Huck discovered the treasure in McDougal's Cave after
 2. **3 Architectures**: Server-Only ✅ | WASM-Only 🚧 | Hybrid 📅
 3. **Configuration-Driven**: Same code, different behavior via TOML settings
 4. **Dynamic Selection**: Pipeline adapts based on `use_gleaning`, `ollama.enabled`, `retrieval.strategy`
-5. **State-of-the-Art**: LightRAG (6000x reduction) + PageRank (27x speedup) + ROGRAG (+15% accuracy)
+5. **State-of-the-Art**: LightRAG (6000x reduction) + PageRank (27x speedup)
 6. **Production-Ready**: 5.2MB binary, <1s startup, 500ms-2s queries
 7. **Modular**: Enable only what you need via feature flags
 8. **GPU-Accelerated**: CUDA, Metal, Vulkan, WebGPU support

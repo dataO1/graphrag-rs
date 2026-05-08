@@ -59,7 +59,7 @@ graphrag-core = { version = "0.1", features = ["research"] } # Advanced features
 | **`starter`** | Minimal setup to get started | async, ollama, memory-storage, basic-retrieval |
 | **`full`** | Production-ready with common features | starter + pagerank, lightrag, caching, parallel-processing, leiden |
 | **`wasm-bundle`** | Browser-safe features only | memory-storage, basic-retrieval, leiden |
-| **`research`** | Advanced experimental features | full + rograg, cross-encoder, incremental, monitoring |
+| **`research`** | Advanced experimental features | full + cross-encoder, incremental, monitoring |
 
 ## Three Ways to Configure
 
@@ -304,12 +304,6 @@ enable_lightrag = true  # 6000x token reduction!
 ```toml
 [graph]
 enable_pagerank = true  # 27x performance boost
-```
-
-### RoGRAG (Logic Form Reasoning)
-```rust
-// Enable with feature flag: rograg
-let answer = graphrag.ask_with_reasoning("Why did X cause Y?").await?;
 ```
 
 ### Intelligent Caching

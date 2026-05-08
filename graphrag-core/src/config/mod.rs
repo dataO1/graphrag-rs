@@ -130,10 +130,6 @@ pub struct Config {
     /// Zero-cost approach configuration
     pub zero_cost_approach: ZeroCostApproachConfig,
 
-    /// Advanced features configuration (Phases 2-3)
-    #[serde(default)]
-    pub advanced_features: AdvancedFeaturesConfig,
-
     /// Suppress indicatif progress bars (use hidden draw target).
     /// Set to `true` when running inside a TUI to avoid corrupting the terminal.
     #[serde(default)]
@@ -1283,156 +1279,6 @@ pub struct EntityConfig {
     pub max_fact_tokens: usize,
 }
 
-/// Configuration for advanced GraphRAG features (Phases 2-3)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AdvancedFeaturesConfig {
-    /// Phase 2.1: Symbolic Anchoring (CatRAG)
-    /// Automatically applied for conceptual queries - no config needed
-    #[serde(default)]
-    pub symbolic_anchoring: SymbolicAnchoringConfig,
-
-    /// Phase 2.2: Dynamic Edge Weighting
-    /// Query-aware relationship weight adjustment
-    #[serde(default)]
-    pub dynamic_weighting: DynamicWeightingConfig,
-
-    /// Phase 2.3: Causal Chain Analysis
-    /// Multi-step causal reasoning
-    #[serde(default)]
-    pub causal_analysis: CausalAnalysisConfig,
-
-    /// Phase 3.1: Hierarchical Relationship Clustering
-    /// Multi-level relationship organization
-    #[serde(default)]
-    pub hierarchical_clustering: HierarchicalClusteringConfig,
-
-    /// Phase 3.2: Graph Weight Optimization (DW-GRPO)
-    /// Heuristic optimization of relationship weights
-    #[serde(default)]
-    pub weight_optimization: WeightOptimizationConfig,
-}
-
-/// Configuration for Symbolic Anchoring (Phase 2.1)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SymbolicAnchoringConfig {
-    /// Minimum relevance score to keep an anchor (0.0-1.0)
-    #[serde(default = "default_anchor_min_relevance")]
-    pub min_relevance: f32,
-
-    /// Maximum number of anchors to extract per query
-    #[serde(default = "default_max_anchors")]
-    pub max_anchors: usize,
-
-    /// Maximum entities per anchor
-    #[serde(default = "default_max_entities_per_anchor")]
-    pub max_entities_per_anchor: usize,
-}
-
-/// Configuration for Dynamic Edge Weighting (Phase 2.2)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DynamicWeightingConfig {
-    /// Enable semantic boost using embeddings
-    #[serde(default = "default_true")]
-    pub enable_semantic_boost: bool,
-
-    /// Enable temporal boost for recent relationships
-    #[serde(default = "default_true")]
-    pub enable_temporal_boost: bool,
-
-    /// Enable conceptual boost for matching concepts
-    #[serde(default = "default_true")]
-    pub enable_concept_boost: bool,
-
-    /// Enable causal boost for strong causal relationships
-    #[serde(default = "default_true")]
-    pub enable_causal_boost: bool,
-}
-
-/// Configuration for Causal Chain Analysis (Phase 2.3)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CausalAnalysisConfig {
-    /// Minimum confidence for causal chains (0.0-1.0)
-    #[serde(default = "default_causal_min_confidence")]
-    pub min_confidence: f32,
-
-    /// Minimum causal strength to consider (0.0-1.0)
-    #[serde(default = "default_causal_min_strength")]
-    pub min_causal_strength: f32,
-
-    /// Maximum chain depth to search
-    #[serde(default = "default_max_chain_depth")]
-    pub max_chain_depth: usize,
-
-    /// Require temporal consistency in chains
-    #[serde(default = "default_true")]
-    pub require_temporal_consistency: bool,
-}
-
-/// Configuration for Hierarchical Relationship Clustering (Phase 3.1)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct HierarchicalClusteringConfig {
-    /// Number of hierarchy levels (2-5)
-    #[serde(default = "default_num_levels")]
-    pub num_levels: usize,
-
-    /// Resolution parameters for each level (higher = more clusters)
-    /// Length should match num_levels
-    #[serde(default = "default_resolutions")]
-    pub resolutions: Vec<f32>,
-
-    /// Minimum relationships per cluster
-    #[serde(default = "default_min_cluster_size")]
-    pub min_cluster_size: usize,
-
-    /// Generate LLM summaries for clusters (requires Ollama)
-    #[serde(default = "default_true")]
-    pub generate_summaries: bool,
-}
-
-/// Configuration for Graph Weight Optimization (Phase 3.2)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WeightOptimizationConfig {
-    /// Learning rate for weight adjustments (0.01-0.5)
-    #[serde(default = "default_learning_rate")]
-    pub learning_rate: f32,
-
-    /// Maximum optimization iterations
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: usize,
-
-    /// Window size for slope calculation
-    #[serde(default = "default_slope_window")]
-    pub slope_window: usize,
-
-    /// Minimum slope to avoid stagnation
-    #[serde(default = "default_stagnation_threshold")]
-    pub stagnation_threshold: f32,
-
-    /// Use LLM for quality evaluation
-    #[serde(default = "default_true")]
-    pub use_llm_eval: bool,
-
-    /// Objective weights (relevance, faithfulness, conciseness)
-    #[serde(default)]
-    pub objective_weights: ObjectiveWeightsConfig,
-}
-
-/// Configuration for optimization objective weights
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ObjectiveWeightsConfig {
-    /// Weight for relevance objective (0.0-1.0)
-    #[serde(default = "default_relevance_weight")]
-    pub relevance: f32,
-
-    /// Weight for faithfulness objective (0.0-1.0)
-    #[serde(default = "default_faithfulness_weight")]
-    pub faithfulness: f32,
-
-    /// Weight for conciseness objective (0.0-1.0)
-    #[serde(default = "default_conciseness_weight")]
-    pub conciseness: f32,
-}
-
 /// Configuration for retrieval operations
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetrievalConfig {
@@ -1527,76 +1373,6 @@ fn default_max_gleaning_rounds() -> usize {
 
 fn default_validation_confidence() -> f32 {
     0.7
-}
-
-// Advanced features defaults (Phases 2-3)
-
-// Phase 2.1: Symbolic Anchoring
-fn default_anchor_min_relevance() -> f32 {
-    0.3
-}
-
-fn default_max_anchors() -> usize {
-    5
-}
-
-fn default_max_entities_per_anchor() -> usize {
-    10
-}
-
-// Phase 2.3: Causal Analysis
-fn default_causal_min_confidence() -> f32 {
-    0.3
-}
-
-fn default_causal_min_strength() -> f32 {
-    0.5
-}
-
-fn default_max_chain_depth() -> usize {
-    5
-}
-
-// Phase 3.1: Hierarchical Clustering
-fn default_num_levels() -> usize {
-    3
-}
-
-fn default_resolutions() -> Vec<f32> {
-    vec![1.0, 0.5, 0.2]
-}
-
-fn default_min_cluster_size() -> usize {
-    2
-}
-
-// Phase 3.2: Weight Optimization
-fn default_learning_rate() -> f32 {
-    0.1
-}
-
-fn default_max_iterations() -> usize {
-    20
-}
-
-fn default_slope_window() -> usize {
-    3
-}
-
-fn default_stagnation_threshold() -> f32 {
-    0.01
-}
-
-fn default_relevance_weight() -> f32 {
-    0.4
-}
-
-fn default_faithfulness_weight() -> f32 {
-    0.4
-}
-
-fn default_conciseness_weight() -> f32 {
-    0.2
 }
 
 fn default_max_fact_tokens() -> usize {
@@ -1694,7 +1470,6 @@ impl Default for Config {
             },
             summarization: crate::summarization::HierarchicalConfig::default(),
             zero_cost_approach: ZeroCostApproachConfig::default(),
-            advanced_features: AdvancedFeaturesConfig::default(),
             suppress_progress_bars: false,
         }
     }
@@ -1708,84 +1483,6 @@ impl Default for AutoSaveConfig {
             interval_seconds: default_auto_save_interval(),
             workspace_name: None,
             max_versions: default_max_versions(),
-        }
-    }
-}
-
-impl Default for AdvancedFeaturesConfig {
-    fn default() -> Self {
-        Self {
-            symbolic_anchoring: SymbolicAnchoringConfig::default(),
-            dynamic_weighting: DynamicWeightingConfig::default(),
-            causal_analysis: CausalAnalysisConfig::default(),
-            hierarchical_clustering: HierarchicalClusteringConfig::default(),
-            weight_optimization: WeightOptimizationConfig::default(),
-        }
-    }
-}
-
-impl Default for SymbolicAnchoringConfig {
-    fn default() -> Self {
-        Self {
-            min_relevance: default_anchor_min_relevance(),
-            max_anchors: default_max_anchors(),
-            max_entities_per_anchor: default_max_entities_per_anchor(),
-        }
-    }
-}
-
-impl Default for DynamicWeightingConfig {
-    fn default() -> Self {
-        Self {
-            enable_semantic_boost: default_true(),
-            enable_temporal_boost: default_true(),
-            enable_concept_boost: default_true(),
-            enable_causal_boost: default_true(),
-        }
-    }
-}
-
-impl Default for CausalAnalysisConfig {
-    fn default() -> Self {
-        Self {
-            min_confidence: default_causal_min_confidence(),
-            min_causal_strength: default_causal_min_strength(),
-            max_chain_depth: default_max_chain_depth(),
-            require_temporal_consistency: default_true(),
-        }
-    }
-}
-
-impl Default for HierarchicalClusteringConfig {
-    fn default() -> Self {
-        Self {
-            num_levels: default_num_levels(),
-            resolutions: default_resolutions(),
-            min_cluster_size: default_min_cluster_size(),
-            generate_summaries: default_true(),
-        }
-    }
-}
-
-impl Default for WeightOptimizationConfig {
-    fn default() -> Self {
-        Self {
-            learning_rate: default_learning_rate(),
-            max_iterations: default_max_iterations(),
-            slope_window: default_slope_window(),
-            stagnation_threshold: default_stagnation_threshold(),
-            use_llm_eval: default_true(),
-            objective_weights: ObjectiveWeightsConfig::default(),
-        }
-    }
-}
-
-impl Default for ObjectiveWeightsConfig {
-    fn default() -> Self {
-        Self {
-            relevance: default_relevance_weight(),
-            faithfulness: default_faithfulness_weight(),
-            conciseness: default_conciseness_weight(),
         }
     }
 }
@@ -2511,7 +2208,6 @@ impl Config {
             } else {
                 ZeroCostApproachConfig::default()
             },
-            advanced_features: AdvancedFeaturesConfig::default(),
         };
 
         Ok(config)

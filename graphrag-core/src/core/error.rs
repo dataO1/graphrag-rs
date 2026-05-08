@@ -382,52 +382,6 @@ impl From<serde_json::Error> for GraphRAGError {
     }
 }
 
-// ROGRAG error conversions
-#[cfg(feature = "rograg")]
-impl From<crate::rograg::logic_form::LogicFormError> for GraphRAGError {
-    fn from(err: crate::rograg::logic_form::LogicFormError) -> Self {
-        GraphRAGError::Retrieval {
-            message: format!("Logic form error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "rograg")]
-impl From<crate::rograg::processor::ProcessingError> for GraphRAGError {
-    fn from(err: crate::rograg::processor::ProcessingError) -> Self {
-        GraphRAGError::Generation {
-            message: format!("Processing error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "rograg")]
-impl From<crate::rograg::quality_metrics::MetricsError> for GraphRAGError {
-    fn from(err: crate::rograg::quality_metrics::MetricsError) -> Self {
-        GraphRAGError::Validation {
-            message: format!("Metrics error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "rograg")]
-impl From<crate::rograg::streaming::StreamingError> for GraphRAGError {
-    fn from(err: crate::rograg::streaming::StreamingError) -> Self {
-        GraphRAGError::Generation {
-            message: format!("Streaming error: {err}"),
-        }
-    }
-}
-
-#[cfg(feature = "rograg")]
-impl From<crate::rograg::fuzzy_matcher::FuzzyMatchError> for GraphRAGError {
-    fn from(err: crate::rograg::fuzzy_matcher::FuzzyMatchError) -> Self {
-        GraphRAGError::Retrieval {
-            message: format!("Fuzzy match error: {err}"),
-        }
-    }
-}
-
 /// Convenient Result type alias
 pub type Result<T> = std::result::Result<T, GraphRAGError>;
 

@@ -4,7 +4,7 @@
 # 🎯 FULLY TEXT-AGNOSTIC: Works with ANY document type without hardcoded assumptions
 # 🚀 100% DYNAMIC: No hardcoded entity names, characters, or document-specific logic
 # 📚 Use cases: ANY book, article, document, or text - completely domain-agnostic
-# ⚡ Breakthrough Features: PageRank, Caching, Incremental, ROGRAG, Async processing
+# ⚡ Breakthrough Features: PageRank, Caching, Incremental, Async processing
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -130,7 +130,6 @@ temperature = 0.2
 pagerank_retrieval = true       # 27x performance boost
 llm_response_caching = true     # 6x cost reduction
 incremental_updates = true      # Zero-downtime updates
-rograg_decomposition = true     # 60%→75% accuracy improvement
 full_async_processing = true    # Enterprise scalability
 
 [pagerank]
@@ -155,13 +154,6 @@ enabled = true
 conflict_resolution = "merge"
 change_tracking = true
 batch_updates = true
-
-[rograg]
-# ROGRAG query decomposition for accuracy improvement
-enabled = true
-max_decomposition_depth = 3
-fuzzy_fallback = true
-quality_validation = true
 
 [async_processing]
 # Full async architecture for scalability

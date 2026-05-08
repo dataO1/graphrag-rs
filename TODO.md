@@ -347,12 +347,13 @@ Out of Scope
 
 ----
 
-Phase G: rehydrate graphrag-core's KnowledgeGraph from Qdrant on startup (⬜ NOT STARTED)
-⬜ On graphrag-server startup, scroll the Qdrant collection and replay every payload through `add_document_from_text`
-⬜ Re-run `extend_graph` after rehydration so the graph is queryable
-⬜ Honor a `GRAPHRAG_REHYDRATE_ON_STARTUP={true,false,timer}` env so slow-start setups can opt out
-⬜ Surface rehydrate progress / completion via /health
-⬜ Add an integration test that proves /api/graph/stats reports the right `documentCount` after a server restart
+Phase G: rehydrate graphrag-core's KnowledgeGraph from Qdrant on startup (✅ COMPLETED)
+✅ On graphrag-server startup, scroll the Qdrant sidecar collections — done via `hydrate_in_memory_graph` (`graphrag-server/src/graph_persistence.rs:384`)
+✅ Entities + relationships restored directly from sidecar payloads, not re-extracted; production boot log shows `🔄 Restored entity graph from Qdrant: 12383 entities, 26729 relationships (0 orphan rels skipped)` every restart
+✅ Chunk surface hydrated lazily (counts only); chunks stay in Qdrant and `extend_graph_streaming` queries on demand
+⬜ `GRAPHRAG_REHYDRATE_ON_STARTUP={true,false,timer}` env knob — punted; only the synchronous `true` path runs in production. Add the timer mode if a slow-start need ever materializes
+⬜ `/health` field for rehydrate progress — currently logged only; punted
+⬜ Integration test for documentCount post-restart — punted
 
 ----
 
@@ -416,3 +417,114 @@ Proposed Changes
 Out of Scope (Phase H)
 
 - Persistent entity/relationship storage so clean shutdowns don't lose the graph. Bigger refactor — serialization format for entities/relationships/mentions, a save_to_qdrant method writing to a sibling collection, a load_from_qdrant mirror. Punt until G ships.
+
+  → 2026-05-08 update: this work also shipped. Entities and relationships
+    persist to dedicated Qdrant sidecar collections via
+    `persist_touched_snapshot` (`graphrag-server/src/graph_persistence.rs:274`),
+    and the same path drives the 3-tier embed cache (in-process → qdrant
+    fetch → OVMS). Phase G's rehydrate side is fully complementary.
+
+----
+
+# 2026-05-08 LightRAG audit — open work
+
+The LightRAG runtime path is wired (dual-level keywords, relationship-description
+retrieval, incremental updates, cross-restart hydrate, 3-tier embed cache,
+per-request retry). Open items the audit surfaced — picked up after the
+nginx-stall + OOM hardening lands and proves stable.
+
+----
+
+Phase H: cross-encoder re-ranking integration (⬜ NOT STARTED)
+
+Cross-encoder code is compiled in (`graphrag-core/src/reranking/cross_encoder.rs`,
+Candle/BERT impl) but the default `/api/ask` handler never calls it. With
+top-k retrieval already returning ~30 candidates, a cross-encoder rerank
+typically buys +10–20% nDCG at ~50 ms/query.
+
+⬜ Wire `CandleCrossEncoder::rerank(query, candidates)` after vector top-k
+   in `graphrag-server/src/main.rs::ask` and `graph_aware_query`
+⬜ Add `enhancements.cross_encoder.enabled` flag through home-manager so
+   reranking is opt-in until the model size + cold-start cost is validated
+⬜ Decide on model: `cross-encoder/ms-marco-MiniLM-L-6-v2` (current default
+   in code) is 22 MB; could swap to `BAAI/bge-reranker-base` (440 MB,
+   stronger) — leave config-driven
+⬜ Latency budget: emit a `rerank_ms` field on `AskResponse` so we can
+   observe the per-query overhead without enabling debug logs
+
+----
+
+Phase I: multi-turn chat memory (⬜ NOT STARTED)
+
+`QueryRequest` is single-turn today. Follow-ups like "what about X?" lose
+the previous context. Adds a small session-store layer.
+
+⬜ Extend `QueryRequest` with `conversation_id: Option<Uuid>` and
+   `messages: Option<Vec<{role, content}>>` (OpenAI-shaped)
+⬜ New `conversations` table in the existing sqlite events store; ttl 24 h
+⬜ Synthesis prompt includes the prior 4 turns (token-budget-aware)
+⬜ Obsidian gateway plugin: keep a per-pane conversation_id and replay it
+   on each ask
+⬜ Decision: re-retrieve per turn vs cache the prior turn's seeds. Default
+   to re-retrieve — cheap and avoids stale context
+
+----
+
+Phase J: hybrid BM25 + vector retrieval into the default path (⬜ NOT STARTED)
+
+`graphrag-core/src/retrieval/hybrid.rs` is fully implemented (RRF / Weighted
+/ CombSum / MaxScore fusion) but isn't called from `/api/ask`. Vector-only
+retrieval misses rare exact-match terms (filenames, IDs, code symbols).
+
+⬜ Build a tantivy or sled-based BM25 index alongside the qdrant chunk
+   collection on first run; index updates piggyback on the existing
+   `add_document` path
+⬜ Wire `HybridRetriever::retrieve` into `graph_aware_query` behind
+   `enhancements.hybrid_retrieval.enabled`; default to RRF fusion
+⬜ Persist the BM25 index to disk so it survives restarts (matches qdrant)
+⬜ Bench: how much recall does this buy on rare-term queries?
+
+----
+
+Phase K: native PDF / DOCX / HTML ingestion (⬜ NOT STARTED)
+
+Today, `ingest_policy.rs` routes binary formats through an external
+`INGEST_PREPROCESSOR_URL` (Nemotron-Omni or pandoc). Bundling a native
+parser layer removes that external dep for the common cases.
+
+⬜ Add `pdf-extract` (or `lopdf`) for `.pdf`
+⬜ Add `docx-rs` for `.docx`
+⬜ Add `scraper` (or `html2text`) for `.html` / `.htm`
+⬜ Plumb through the `Preprocessor::extract_text` trait so the existing
+   preprocessor can still kick in for unsupported MIME types
+⬜ Update `DEFAULT_ALLOWED_EXTENSIONS` once parsers land
+⬜ Decision: keep the external preprocessor as a feature flag for users
+   who want OCR / table extraction the native parsers don't do
+
+----
+
+Phase L: cleanup MS-GraphRAG vestiges (✅ COMPLETED 2026-05-08)
+
+Strict deletion. Git history is the archive.
+
+✅ Deleted `graphrag-core/src/retrieval/symbolic_anchoring.rs` (CatRAG anchoring)
+✅ Deleted `graphrag-core/src/retrieval/causal_analysis.rs`
+✅ Deleted `graphrag-core/src/optimization/` (graph_weight_optimizer.rs, mod.rs — DW-GRPO)
+✅ Deleted `graphrag-core/src/rograg/` entire directory (9 files: processor, decomposer, intent_classifier, logic_form, fuzzy_matcher, validator, quality_metrics, streaming, mod.rs, tests.rs)
+✅ Removed `AdvancedFeaturesConfig` + 5 nested config structs (`SymbolicAnchoringConfig`, `DynamicWeightingConfig`, `CausalAnalysisConfig`, `HierarchicalClusteringConfig`, `WeightOptimizationConfig`, `ObjectiveWeightsConfig`) from `graphrag-core/src/config/mod.rs`
+✅ Removed all corresponding `default_*` helper functions (anchor/causal/cluster/weight defaults)
+✅ Removed `pub advanced_features: AdvancedFeaturesConfig` field from `Config` and its two `Default::default()` initializers
+✅ Removed 5 ROGRAG `From` impls (LogicFormError, ProcessingError, MetricsError, StreamingError, FuzzyMatchError) from `graphrag-core/src/core/error.rs`
+✅ Removed `pub mod symbolic_anchoring` and `pub mod causal_analysis` from `graphrag-core/src/retrieval/mod.rs`
+✅ Removed `pub mod optimization` and `#[cfg(feature = "rograg")] pub mod rograg` from `graphrag-core/src/lib.rs`
+✅ Removed `rograg` feature flag and its inclusion in the `research` bundle from `graphrag-core/Cargo.toml`
+✅ Deleted `graphrag-core/tests/advanced_features_integration.rs` and `tests/dynamic_weighting_tests.rs`
+✅ Deleted `graphrag-core/benches/advanced_features_benchmark.rs`
+✅ Deleted `graphrag-core/ADVANCED_FEATURES.md`
+✅ Deleted `graphrag-core/config-examples/advanced-features.toml`
+✅ Stripped `[advanced_features.*]` blocks from `graphrag-core/config-examples/quick-start.toml`
+✅ Stripped `[rograg]` blocks and `rograg_decomposition` flags from `config/templates/dynamic_universal.toml`
+✅ Stripped "ROGRAG" mentions from header comments in `config/templates/{web_blog_content,legal_documents,technical_documentation,dynamic_universal}.toml`
+✅ Removed all ROGRAG / vestige references from `README.md`, `graphrag-core/README.md`, `HOW_IT_WORKS.md`, `report.md`
+
+Note: The leiden algorithm (`graph/leiden.rs`) was kept — it's used by `KnowledgeGraph::detect_hierarchical_communities`, the public API, and `graph/hierarchical_relationships.rs`. It is NOT a vestige.

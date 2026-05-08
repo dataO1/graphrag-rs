@@ -46,16 +46,9 @@ Recent updates to the documentation (`README.md`, `tests/e2e/README.md`) reveal 
 
 #### Phase 1: Chunking
 - **cAST (Context-Aware Splitting)**: Tree-sitter based chunking that preserves syntactic boundaries (functions, classes) for code.
-- **Symbolic Anchoring (Phase 2 Prep)**: Grounding abstract concepts to concrete entities.
 
 #### Phase 2: Entity Extraction
-- **Dynamic Edge Weighting**: Context-aware ranking using semantic, temporal, and causal signals.
-- **Causal Chain Analysis**: Discovery of multi-step causal chains with temporal consistency logic (CatRAG-style).
 - **Gleaning Improvements**: Multi-round refinement with iterative LLM calls.
-
-#### Phase 3: Relationship Extraction
-- **Hierarchical Relationship Clustering**: Organizing relationships into multi-level hierarchies (Phase 3).
-- **Graph Weight Optimization (DW-GRPO)**: Adaptive learning for relationship weights.
 
 #### Phase 4: Graph Construction
 - **Leiden Community Detection**: Replaced/augmented Louvain for +15% modularity.

@@ -363,10 +363,10 @@ impl Relationship {
 /// The accessor methods (`chunks()`, `documents()`, `get_chunk()`,
 /// etc.) are preserved as no-ops returning empty iterators / `None`
 /// so dead-code retrieval submodules (Phase 5 cleanup target —
-/// `hybrid`, `enriched`, `pagerank_retrieval`, `async_graphrag`,
-/// `rograg/`) still compile without per-callsite patches. They
-/// produce empty results, which is harmless: those modules are
-/// unreachable from the production graphrag-server pipeline.
+/// `hybrid`, `enriched`, `pagerank_retrieval`, `async_graphrag`)
+/// still compile without per-callsite patches. They produce empty
+/// results, which is harmless: those modules are unreachable from
+/// the production graphrag-server pipeline.
 #[derive(Debug, Clone)]
 pub struct KnowledgeGraph {
     graph: Graph<Entity, Relationship>,
