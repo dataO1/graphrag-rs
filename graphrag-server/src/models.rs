@@ -284,6 +284,14 @@ pub struct QueryResponse {
     /// Processing time in milliseconds
     pub processing_time_ms: u64,
 
+    /// Cross-encoder rerank latency in milliseconds. `None` when the
+    /// reranker was disabled (either by config or by transient
+    /// upstream failure that fell back to the original ordering).
+    /// Lets observability dashboards distinguish vector-search wall
+    /// time from rerank overhead per query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_ms: Option<u64>,
+
     /// Backend used (`qdrant`, `memory`, or `graphrag` for graph-aware modes).
     pub backend: String,
 }

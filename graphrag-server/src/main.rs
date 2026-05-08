@@ -81,6 +81,7 @@ mod config_endpoints;
 
 mod ingest_policy;
 mod events_store;
+mod reranker;
 mod stale_context;
 use ingest_policy::{IngestPolicy, ResolvedPath};
 
@@ -181,6 +182,14 @@ struct AppState {
     /// peak ingest bursts. Slow consumers see RecvError::Lagged and
     /// reconnect with Last-Event-ID for clean recovery.
     event_bus: Option<Arc<tokio::sync::broadcast::Sender<events_store::EventBody>>>,
+
+    /// Live cross-encoder reranker (Phase H). `None` when the runtime
+    /// reranker config is disabled or empty; readers `load_full()` an
+    /// `Arc<Option<RerankerService>>` snapshot and skip the rerank step
+    /// when the inner option is `None`. Same atomic-pointer-swap pattern
+    /// as `embeddings` — `POST /config` rebuilds without touching every
+    /// read site.
+    reranker: Arc<arc_swap::ArcSwap<Option<reranker::RerankerService>>>,
 
     // Authentication state (optional)
     #[cfg(feature = "auth")]
@@ -395,6 +404,27 @@ impl AppState {
         };
         log_unified_embedding_line(&config.embeddings, embeddings.load().backend_live());
 
+        // Phase H: cross-encoder reranker. Built from `config.reranker`;
+        // `from_config` returns None when disabled or misconfigured, in
+        // which case the runtime path is a no-op. Wrapped in an
+        // ArcSwap<Option<...>> so `POST /config` can swap atomically.
+        let reranker = {
+            let svc = reranker::RerankerService::from_config(&config.reranker);
+            if let Some(_) = &svc {
+                tracing::info!(
+                    "reranker: enabled (endpoint={}, model={}, top_n={})",
+                    config.reranker.endpoint,
+                    config.reranker.model,
+                    config.reranker.top_n,
+                );
+            } else if config.reranker.enabled {
+                tracing::info!("reranker: enabled in config but skipped (see prior warn)");
+            } else {
+                tracing::info!("reranker: disabled");
+            }
+            Arc::new(arc_swap::ArcSwap::from_pointee(svc))
+        };
+
         let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
         let embedding_dim = embeddings.load().dimension();
         let ingest_policy = IngestPolicy::from_env();
@@ -509,6 +539,7 @@ impl AppState {
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
                         recall_semaphore: recall_semaphore.clone(),
+                        reranker: reranker.clone(),
                     }
                 },
                 Err(e) => {
@@ -537,6 +568,7 @@ impl AppState {
                         events_store: events_store.clone(),
                         event_bus: event_bus.clone(),
                         recall_semaphore: recall_semaphore.clone(),
+                        reranker: reranker.clone(),
                     }
                 },
             }
@@ -565,6 +597,7 @@ impl AppState {
                 events_store: events_store.clone(),
                 event_bus: event_bus.clone(),
                 recall_semaphore: recall_semaphore.clone(),
+                reranker: reranker.clone(),
             }
         }
     }
@@ -886,7 +919,7 @@ async fn query(
         let vfilter = VersionFilter::from_request(&body);
         match version_aware_search(qdrant.as_ref(), query_embedding, body.top_k, &vfilter).await {
             Ok(search_results) => {
-                let results: Vec<QueryResult> = search_results
+                let mut results: Vec<QueryResult> = search_results
                     .into_iter()
                     .map(|r| {
                         let absolute_path = r
@@ -915,6 +948,8 @@ async fn query(
                     })
                     .collect();
 
+                let rerank_ms = maybe_rerank(&state, &body.query, &mut results).await;
+
                 // Stale-context: record this session's lease entries
                 // (block_id + etag) so the SSE stream and lease/check
                 // can scope events to "blocks A actually retrieved".
@@ -932,6 +967,7 @@ async fn query(
                     reasoning_steps: None,
                     sources: None,
                     processing_time_ms: processing_time,
+                    rerank_ms,
                     backend: "qdrant".to_string(),
                 }));
             },
@@ -1003,6 +1039,7 @@ async fn query(
         reasoning_steps: None,
         sources: None,
         processing_time_ms: processing_time,
+        rerank_ms: None,
         backend: "memory".to_string(),
     }))
 }
@@ -1072,6 +1109,12 @@ async fn graph_aware_query(
             Vec::new()
         }
     };
+
+    // Phase H: optionally rerank the vector hits before they go into
+    // the synthesis prompt and the response. Reordering happens in
+    // place; on failure, the original ordering is preserved.
+    let mut vector_results = vector_results;
+    let rerank_ms = maybe_rerank(state, &body.query, &mut vector_results).await;
 
     // Stale-context: lease the vector hits for this session so the
     // SSE stream can scope events. graphrag_aware_query may take
@@ -1219,6 +1262,7 @@ async fn graph_aware_query(
                 reasoning_steps: Some(reasoning_steps),
                 sources: Some(sources),
                 processing_time_ms: processing_time,
+                rerank_ms,
                 backend: "graphrag-local-search".to_string(),
             }))
         },
@@ -1402,6 +1446,7 @@ async fn graph_aware_query(
                 reasoning_steps: Some(reasoning_steps),
                 sources: Some(sources),
                 processing_time_ms: processing_time,
+                rerank_ms,
                 backend: backend_label.to_string(),
             }))
         },
@@ -1626,6 +1671,38 @@ async fn ingest_blocks(
 /// Record a session's lease entries on the server. Called after each
 /// recall when the client supplied a `session_id`; populates the
 /// SQLite lease table with `(block_id, etag, retrieved_at)` per hit.
+/// Phase H: optional cross-encoder rerank. When the live reranker
+/// snapshot is `Some`, send `(query, results.excerpt[])` to the
+/// configured upstream and reorder in place. Returns the rerank
+/// latency in ms (or `None` when the reranker is disabled or the
+/// rerank call failed — in which case we keep the original ordering
+/// and the caller doesn't surface a `rerank_ms` field).
+///
+/// Strict semantics: a rerank failure is logged at WARN and the
+/// original `results` slice is left untouched. We never poison the
+/// answer with a half-reranked list.
+async fn maybe_rerank(
+    state: &AppState,
+    query: &str,
+    results: &mut Vec<crate::models::QueryResult>,
+) -> Option<u64> {
+    let svc_arc = state.reranker.load_full();
+    let svc = svc_arc.as_ref().as_ref()?;
+    if results.is_empty() {
+        return None;
+    }
+    match svc.rerank(query, results).await {
+        Ok(ms) => Some(ms as u64),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "reranker call failed; keeping original vector ordering"
+            );
+            None
+        },
+    }
+}
+
 /// FIFO eviction past `maxLeasesPerSession` happens inside
 /// `EventsStore::add_leases`. Best-effort — failures log at warn,
 /// don't break the recall response.

@@ -435,21 +435,29 @@ nginx-stall + OOM hardening lands and proves stable.
 
 ----
 
-Phase H: cross-encoder re-ranking integration (⬜ NOT STARTED)
+Phase H: cross-encoder re-ranking integration (⬜ IN PROGRESS)
 
 Cross-encoder code is compiled in (`graphrag-core/src/reranking/cross_encoder.rs`,
-Candle/BERT impl) but the default `/api/ask` handler never calls it. With
-top-k retrieval already returning ~30 candidates, a cross-encoder rerank
+Candle/BERT impl) but the runtime query path never calls it. The MCP
+`recall` tool dispatches through `POST /api/query` →
+`graphrag-server/src/main.rs:1014::graph_aware_query`, NOT a /api/ask
+endpoint (no such route exists). All four MCP query modes — `default`,
+`thorough`, `local`, `simple` — build a `Vec<QueryResult>` from
+`version_aware_search`; the rerank fits right after that and before the
+synthesis prompt (or before the response, in `simple` mode).
+
+With top-k already returning ~30 candidates, cross-encoder rerank
 typically buys +10–20% nDCG at ~50 ms/query.
 
-⬜ Wire `CandleCrossEncoder::rerank(query, candidates)` after vector top-k
-   in `graphrag-server/src/main.rs::ask` and `graph_aware_query`
-⬜ Add `enhancements.cross_encoder.enabled` flag through home-manager so
+⬜ Wire `CandleCrossEncoder::rerank(query, candidates)` after
+   `version_aware_search` in `graphrag-server/src/main.rs::graph_aware_query`
+   AND the `simple`-mode handler — both build the same `Vec<QueryResult>`
+⬜ Add `enhancements.reranker.enabled` flag through home-manager so
    reranking is opt-in until the model size + cold-start cost is validated
 ⬜ Decide on model: `cross-encoder/ms-marco-MiniLM-L-6-v2` (current default
    in code) is 22 MB; could swap to `BAAI/bge-reranker-base` (440 MB,
    stronger) — leave config-driven
-⬜ Latency budget: emit a `rerank_ms` field on `AskResponse` so we can
+⬜ Latency budget: emit a `rerank_ms` field on `QueryResponse` so we can
    observe the per-query overhead without enabling debug logs
 
 ----

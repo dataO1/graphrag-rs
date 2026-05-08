@@ -130,10 +130,70 @@ pub struct Config {
     /// Zero-cost approach configuration
     pub zero_cost_approach: ZeroCostApproachConfig,
 
+    /// Cross-encoder reranking config (Phase H). When `enabled`, the
+    /// runtime retrieval path POSTs the candidate excerpts to a
+    /// Cohere/vLLM-compatible `/rerank` endpoint and reorders by the
+    /// upstream's relevance scores. Disabled by default.
+    #[serde(default)]
+    pub reranker: RerankerConfig,
+
     /// Suppress indicatif progress bars (use hidden draw target).
     /// Set to `true` when running inside a TUI to avoid corrupting the terminal.
     #[serde(default)]
     pub suppress_progress_bars: bool,
+}
+
+/// Cross-encoder reranking config. Wire-shape that home-manager and
+/// `POST /config` populate; consumed by `graphrag-server`'s
+/// `RerankerService::from_config`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RerankerConfig {
+    /// Master toggle. `false` ⇒ no reranker is constructed and the
+    /// runtime path is a no-op.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Base URL of the rerank service. Cohere/vLLM-compatible
+    /// `/rerank` endpoint expected. Example: `http://127.0.0.1:17170/v1`.
+    #[serde(default)]
+    pub endpoint: String,
+
+    /// Model id sent in the rerank request body. Example:
+    /// `BAAI/bge-reranker-base`.
+    #[serde(default)]
+    pub model: String,
+
+    /// Optional bearer token for the upstream. Empty string ⇒ no auth
+    /// header attached.
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Cap on candidates kept after reranking. `0` ⇒ no truncation
+    /// (keeps the upstream's full reordered list).
+    #[serde(default)]
+    pub top_n: usize,
+
+    /// Per-request timeout in seconds. Defaults to 30 to keep slow
+    /// upstreams from holding a recall permit forever.
+    #[serde(default = "default_reranker_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_reranker_timeout() -> u64 {
+    30
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            top_n: 0,
+            timeout_seconds: default_reranker_timeout(),
+        }
+    }
 }
 
 /// Adaptive AIMD concurrency configuration for the chat-LLM upstream.
@@ -1470,6 +1530,7 @@ impl Default for Config {
             },
             summarization: crate::summarization::HierarchicalConfig::default(),
             zero_cost_approach: ZeroCostApproachConfig::default(),
+            reranker: RerankerConfig::default(),
             suppress_progress_bars: false,
         }
     }
@@ -2208,6 +2269,12 @@ impl Config {
             } else {
                 ZeroCostApproachConfig::default()
             },
+            // Reranker config: from_file path doesn't deserialize the
+            // reranker block from the JSON yet (the home-manager →
+            // POST /config flow is the canonical path on graphrag-server).
+            // Keep this consistent with how the other server-only-style
+            // fields default here.
+            reranker: RerankerConfig::default(),
         };
 
         Ok(config)
