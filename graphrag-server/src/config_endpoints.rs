@@ -148,6 +148,26 @@ pub async fn set_config(
     let new_embeddings = Arc::new(new_embeddings);
     state.embeddings.store(new_embeddings.clone());
 
+    // Same pattern for the reranker. Boot-time config has reranker
+    // disabled (graphrag-core defaults); POST /config from
+    // home-manager carries the user's actual reranker block. Without
+    // this swap, the reranker stays None forever even after a valid
+    // config arrives.
+    {
+        let new_reranker = crate::reranker::RerankerService::from_config(&config.reranker);
+        if new_reranker.is_some() {
+            tracing::info!(
+                "reranker: enabled (endpoint={}, model={}, top_n={})",
+                config.reranker.endpoint, config.reranker.model, config.reranker.top_n,
+            );
+        } else if config.reranker.enabled {
+            tracing::info!("reranker: enabled in config but skipped (see prior warn)");
+        } else {
+            tracing::info!("reranker: disabled");
+        }
+        state.reranker.store(std::sync::Arc::new(new_reranker));
+    }
+
     // Update the live config snapshot. AFTER the embedder swap so any
     // reader that wins the race sees old-config + old-embedder or
     // new-config + new-embedder, never new-config + old-embedder.
