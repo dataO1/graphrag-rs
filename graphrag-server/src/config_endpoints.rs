@@ -165,24 +165,48 @@ pub async fn set_config(
     // 404 / non-JSON response is normal — we just fall back to the
     // configured `llm.initial`. The AIMD controller will discover the
     // actual capacity within a few minutes either way.
+    //
+    // The probe can only RAISE `config.llm.initial`, never lower it.
+    // Reason: the configured value is a deliberate user/operator choice
+    // (system flake `llm.initial = 128` for the Spark backend, etc).
+    // We've seen probes return a buggy `total_slots=1` (e.g. nginx
+    // routing chain returns a 502/HTML body that happens to deserialize
+    // to `{ total_slots: 1 }`, or one of the round-robin upstreams
+    // misreports), which would silently pin AIMD at 1 and force +1/10
+    // ramp-up — never reaching the user's intended cap on a finite
+    // workload. Trust the configured initial as a floor; let the probe
+    // bump it higher when the upstream genuinely advertises more slots
+    // than the user knew about.
     let mut config = config;
     let probed_slots = probe_upstream_slots(&config.openai.base_url).await;
+    let configured_initial = config.llm.initial;
+    let cap = config.llm.max;
     if let Some(slots) = probed_slots {
-        let cap = config.llm.max;
-        let seed = slots.clamp(1, cap);
-        tracing::info!(
-            "llm.concurrency: probed total_slots={} from {}/props; seeding initial={} (cap={})",
-            slots,
-            config.openai.base_url.trim_end_matches('/'),
-            seed,
-            cap,
-        );
-        config.llm.initial = seed;
+        let probe_clamped = slots.clamp(1, cap);
+        if probe_clamped > configured_initial {
+            tracing::info!(
+                "llm.concurrency: probed total_slots={} from {}/props; raising initial={} → {} (cap={})",
+                slots,
+                config.openai.base_url.trim_end_matches('/'),
+                configured_initial,
+                probe_clamped,
+                cap,
+            );
+            config.llm.initial = probe_clamped;
+        } else {
+            tracing::info!(
+                "llm.concurrency: probed total_slots={} from {}/props; keeping configured initial={} (probe ≤ configured; cap={})",
+                slots,
+                config.openai.base_url.trim_end_matches('/'),
+                configured_initial,
+                cap,
+            );
+        }
     } else {
         tracing::info!(
             "llm.concurrency: no /props on upstream (or probe failed); using configured initial={} (cap={})",
-            config.llm.initial,
-            config.llm.max,
+            configured_initial,
+            cap,
         );
     }
 

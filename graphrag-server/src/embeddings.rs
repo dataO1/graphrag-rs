@@ -273,6 +273,82 @@ impl EmbeddingService {
         self.generate_with_fallback(texts).await
     }
 
+    /// Strict variant of [`Self::generate`] for the persistence path.
+    /// Identical for the configured-hash backend (where hash IS the
+    /// chosen behavior), but for openai/ollama backends it propagates
+    /// any backend error instead of silently falling back to hash.
+    ///
+    /// Why: hash vectors are deterministic from text and live in a
+    /// totally different cosine-similarity space than the configured
+    /// embedding model. Persisting them alongside real embeddings
+    /// produces silent corruption — the vector lives forever in qdrant,
+    /// paired with a payload that claims it came from the configured
+    /// model. Better to fail the persist (so the chunk gets retried
+    /// next cycle, with the next round of per-request retries inside
+    /// `generate_with_openai`) than poison the search space.
+    pub async fn generate_strict(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let mut stats = self.stats.write().await;
+        stats.total_requests += texts.len();
+        drop(stats);
+
+        // Configured hash backend — that IS the deliberate choice;
+        // serve it. Doesn't apply to *unintended* hash fallback caused
+        // by a real backend going down.
+        if self.config.backend == "hash" {
+            let mut stats = self.stats.write().await;
+            stats.fallback_used += texts.len();
+            drop(stats);
+            return self.generate_with_fallback(texts).await;
+        }
+
+        #[cfg(feature = "openai")]
+        if let Some(client) = &self.openai_client {
+            match self.generate_with_openai(client, texts).await {
+                Ok(embeddings) => {
+                    let mut stats = self.stats.write().await;
+                    stats.backend_success += texts.len();
+                    return Ok(embeddings);
+                },
+                Err(e) => {
+                    let mut stats = self.stats.write().await;
+                    stats.backend_failures += texts.len();
+                    drop(stats);
+                    return Err(EmbeddingError::OpenAIError(format!(
+                        "strict path: openai exhausted (no hash fallback): {e}"
+                    )));
+                },
+            }
+        }
+
+        #[cfg(feature = "ollama")]
+        if let Some(ollama) = &self.ollama_client {
+            match self.generate_with_ollama(ollama, texts).await {
+                Ok(embeddings) => {
+                    let mut stats = self.stats.write().await;
+                    stats.backend_success += texts.len();
+                    return Ok(embeddings);
+                },
+                Err(e) => {
+                    let mut stats = self.stats.write().await;
+                    stats.backend_failures += texts.len();
+                    drop(stats);
+                    return Err(EmbeddingError::OllamaError(format!(
+                        "strict path: ollama exhausted (no hash fallback): {e}"
+                    )));
+                },
+            }
+        }
+
+        // Configured backend isn't hash but has no live client —
+        // probe failed at boot, or the backend went away after boot
+        // and no reconnect path. Either way, refuse to silently
+        // produce hash vectors.
+        Err(EmbeddingError::GenerationFailed(format!(
+            "strict path: configured backend '{}' has no live client; refusing silent hash fallback",
+            self.config.backend,
+        )))
+    }
+
     /// Generate embeddings using an OpenAI-compatible server (vLLM, OVMS,
     /// llama-server, OpenAI itself, …). One POST per text — required
     /// because the OVMS `/v3/embeddings` Mediapipe graph in this
@@ -375,45 +451,135 @@ impl EmbeddingService {
                             "model": model,
                             "input": input,
                         });
-                        let mut req = http.post(&url).json(&body);
-                        if !api_key.is_empty() {
-                            req = req.bearer_auth(&api_key);
-                        }
-                        let resp = req.send().await?;
-                        let status = resp.status();
-                        if !status.is_success() {
-                            in_flight.fetch_sub(1, Ordering::SeqCst);
-                            let body = resp.text().await.unwrap_or_default();
-                            return Err(EmbeddingError::OpenAIError(format!(
-                                "HTTP {status} from {url}: {body}"
-                            )));
-                        }
-                        let body_bytes = resp.bytes().await?;
-                        let body_size = body_bytes.len();
-                        let parse_start = std::time::Instant::now();
-                        let parsed: EmbeddingsResponse =
-                            serde_json::from_slice(&body_bytes).map_err(|e| {
-                                EmbeddingError::GenerationFailed(format!(
-                                    "OpenAI response parse failed (body {} bytes): {}",
-                                    body_size, e
-                                ))
-                            })?;
-                        let parse_ms = parse_start.elapsed().as_millis();
-                        drop(body_bytes);
 
-                        let entry =
-                            parsed.data.into_iter().next().ok_or_else(|| {
-                                EmbeddingError::GenerationFailed(
-                                    "OpenAI response: empty data[]".to_string(),
-                                )
-                            })?;
-                        if entry.embedding.len() != dim {
-                            in_flight.fetch_sub(1, Ordering::SeqCst);
-                            return Err(EmbeddingError::DimensionMismatch {
-                                expected: dim,
-                                actual: entry.embedding.len(),
-                            });
+                        // Per-request retry. Transient transport errors
+                        // (TCP RST under burst, ephemeral pool churn,
+                        // OVMS HTTP queue blip) recover on retry; only
+                        // deterministic failures (4xx, dimension
+                        // mismatch) propagate immediately. With
+                        // concurrency=16 against a backend that does
+                        // 24 REST workers, a single dropped request
+                        // used to fail an entire 49-text batch via
+                        // collect::<Result>::?, which then silently
+                        // hash-corrupted persisted vectors. Three
+                        // attempts at 50/200/500 ms backoff cleared
+                        // every transient we observed in production.
+                        const MAX_ATTEMPTS: u32 = 3;
+                        let mut last_error: Option<EmbeddingError> = None;
+                        let mut success: Option<(Vec<f32>, usize, u128)> = None;
+
+                        for attempt in 1..=MAX_ATTEMPTS {
+                            let mut req = http.post(&url).json(&body);
+                            if !api_key.is_empty() {
+                                req = req.bearer_auth(&api_key);
+                            }
+                            let resp = match req.send().await {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    last_error = Some(EmbeddingError::OpenAIError(format!(
+                                        "transport error to {url} (attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                                    )));
+                                    if attempt < MAX_ATTEMPTS {
+                                        let ms = match attempt { 1 => 50, 2 => 200, _ => 500 };
+                                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                    }
+                                    continue;
+                                },
+                            };
+                            let status = resp.status();
+                            if status.is_client_error() {
+                                // 4xx — deterministic, won't change on retry.
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                let body_text = resp.text().await.unwrap_or_default();
+                                return Err(EmbeddingError::OpenAIError(format!(
+                                    "HTTP {status} from {url} (4xx, no retry): {body_text}"
+                                )));
+                            }
+                            if !status.is_success() {
+                                let body_text = resp.text().await.unwrap_or_default();
+                                last_error = Some(EmbeddingError::OpenAIError(format!(
+                                    "HTTP {status} from {url} (attempt {attempt}/{MAX_ATTEMPTS}): {body_text}"
+                                )));
+                                if attempt < MAX_ATTEMPTS {
+                                    let ms = match attempt { 1 => 50, 2 => 200, _ => 500 };
+                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                }
+                                continue;
+                            }
+                            let body_bytes = match resp.bytes().await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    last_error = Some(EmbeddingError::OpenAIError(format!(
+                                        "body read failed (attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                                    )));
+                                    if attempt < MAX_ATTEMPTS {
+                                        let ms = match attempt { 1 => 50, 2 => 200, _ => 500 };
+                                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                    }
+                                    continue;
+                                },
+                            };
+                            let body_size = body_bytes.len();
+                            let parse_start = std::time::Instant::now();
+                            let parsed: EmbeddingsResponse =
+                                match serde_json::from_slice(&body_bytes) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        last_error = Some(EmbeddingError::GenerationFailed(format!(
+                                            "OpenAI response parse failed (body {body_size} B, attempt {attempt}/{MAX_ATTEMPTS}): {e}"
+                                        )));
+                                        if attempt < MAX_ATTEMPTS {
+                                            let ms = match attempt { 1 => 50, 2 => 200, _ => 500 };
+                                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                        }
+                                        continue;
+                                    },
+                                };
+                            let parse_ms = parse_start.elapsed().as_millis();
+                            drop(body_bytes);
+
+                            let entry = match parsed.data.into_iter().next() {
+                                Some(e) => e,
+                                None => {
+                                    last_error = Some(EmbeddingError::GenerationFailed(
+                                        format!("OpenAI response: empty data[] (attempt {attempt}/{MAX_ATTEMPTS})"),
+                                    ));
+                                    if attempt < MAX_ATTEMPTS {
+                                        let ms = match attempt { 1 => 50, 2 => 200, _ => 500 };
+                                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                    }
+                                    continue;
+                                },
+                            };
+                            if entry.embedding.len() != dim {
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                return Err(EmbeddingError::DimensionMismatch {
+                                    expected: dim,
+                                    actual: entry.embedding.len(),
+                                });
+                            }
+                            success = Some((entry.embedding, body_size, parse_ms));
+                            if attempt > 1 {
+                                tracing::info!(
+                                    "embeddings.openai: req {} recovered on attempt {}/{}",
+                                    req_idx + 1, attempt, MAX_ATTEMPTS,
+                                );
+                            }
+                            break;
                         }
+
+                        let (embedding, body_size, parse_ms) = match success {
+                            Some(s) => s,
+                            None => {
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                return Err(last_error.unwrap_or_else(|| {
+                                    EmbeddingError::OpenAIError(
+                                        "retry loop exhausted with no recorded error".to_string(),
+                                    )
+                                }));
+                            },
+                        };
+
                         let total_ms = started.elapsed().as_millis();
                         let after = in_flight.fetch_sub(1, Ordering::SeqCst) - 1;
                         // Sample one log every ~10% of the request set
@@ -431,7 +597,7 @@ impl EmbeddingService {
                                 after,
                             );
                         }
-                        Ok::<_, EmbeddingError>((req_idx, entry.embedding))
+                        Ok::<_, EmbeddingError>((req_idx, embedding))
                     }
                 })
                 .buffer_unordered(openai_concurrent)
@@ -463,14 +629,22 @@ impl EmbeddingService {
     }
 
     /// Cached batch embed. Probes [`Self::text_cache`] for each input;
-    /// rounds out only the misses through [`Self::generate`]; populates
-    /// the cache with the new pairs and returns vectors in input order.
+    /// rounds out only the misses through [`Self::generate_strict`];
+    /// populates the cache with the new pairs and returns vectors in
+    /// input order.
     ///
     /// Called from `persist_touched_snapshot` so the graph-delta path
     /// stops re-embedding the same entity texts on every chunk that
     /// re-mentions an entity. Query embeddings still go through
     /// `generate_single` and bypass this cache — query inputs are
     /// rarely repeated and we don't want to bloat the cache with them.
+    ///
+    /// Strictness: this path uses `generate_strict`, which never
+    /// silently falls back to hash. A backend exhaustion propagates
+    /// up to `persist_touched_snapshot`, which fails the flush. The
+    /// chunk doesn't get marked extracted and gets retried on the
+    /// next cycle. Far better than poisoning qdrant with hash
+    /// vectors that drift from the model's embedding space.
     pub async fn generate_cached(
         &self,
         texts: &[&str],
@@ -506,7 +680,7 @@ impl EmbeddingService {
         // Pass 2: embed misses (if any) and populate the cache.
         if !miss_texts.is_empty() {
             let refs: Vec<&str> = miss_texts.iter().map(String::as_str).collect();
-            let computed = self.generate(&refs).await?;
+            let computed = self.generate_strict(&refs).await?;
             if computed.len() != miss_indices.len() {
                 return Err(EmbeddingError::GenerationFailed(format!(
                     "generate_cached: backend returned {} vectors for {} miss inputs",
