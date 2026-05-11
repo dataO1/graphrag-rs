@@ -1703,6 +1703,19 @@ mod tests {
             relationships: vec![],
             timestamp: chrono::Utc::now().to_rfc3339(),
             custom: HashMap::new(),
+            // Optional fields added to satisfy struct exhaustiveness (pre-existing test).
+            content_hash: None,
+            user_id: None,
+            version: None,
+            valid_from: None,
+            is_current: None,
+            source: None,
+            block_id: None,
+            block_hash: None,
+            heading_path: vec![],
+            line_start: None,
+            line_end: None,
+            entities_extracted_at: None,
         };
 
         store

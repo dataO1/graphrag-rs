@@ -32,6 +32,15 @@ use std::fmt;
 ///   LightRAG paper's recommended default for graph-aware questions.
 /// - `mix`: hybrid plus a direct chunk-vector search on the original
 ///   query — strongest recall, one extra Qdrant call.
+/// - `hipporag`: Personalised PageRank (PPR) seed scoring via the
+///   HippoRAG strategy (arXiv 2405.14831). Embeds the query once,
+///   fetches top-K entity + relation sidecar hits, runs PPR over the
+///   entity graph, and returns the highest-ranked chunk ids as seeds.
+///   Best for multi-hop questions where the query phrasing is abstract
+///   but the answer is entity-specific. Slower than default (+50–200 ms)
+///   — prefer when default returns 0-or-few hits or bridging across notes
+///   is required. Dispatches to `GraphRAG::ask_with_hipporag` in
+///   graphrag-core. Server wiring is completed in card 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
@@ -40,6 +49,12 @@ pub enum QueryMode {
     Global,
     Hybrid,
     Mix,
+    /// HippoRAG Personalised PageRank retrieval. See enum doc for details.
+    ///
+    /// Wire name: `"hipporag"` (explicit rename overrides the default
+    /// `snake_case` transform, which would produce `"hippo_rag"`).
+    #[serde(rename = "hipporag")]
+    HippoRag,
 }
 
 impl Default for QueryMode {
@@ -56,7 +71,35 @@ impl QueryMode {
             QueryMode::Global => "global",
             QueryMode::Hybrid => "hybrid",
             QueryMode::Mix => "mix",
+            QueryMode::HippoRag => "hipporag",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `QueryMode::HippoRag` must round-trip through JSON serialisation.
+    /// The wire name is `"hipporag"` (snake_case applied to `HippoRag`).
+    #[test]
+    fn test_query_mode_hipporag_serialisation_roundtrip() {
+        let mode = QueryMode::HippoRag;
+
+        // Serialise → JSON string
+        let json = serde_json::to_string(&mode).expect("serialise QueryMode::HippoRag");
+        assert_eq!(json, r#""hipporag""#, "wire name must be \"hipporag\"");
+
+        // Deserialise back → must recover the exact variant
+        let roundtripped: QueryMode =
+            serde_json::from_str(&json).expect("deserialise QueryMode::HippoRag");
+        assert_eq!(roundtripped, QueryMode::HippoRag, "roundtrip must recover HippoRag");
+    }
+
+    /// `as_str()` must return the same token used on the wire.
+    #[test]
+    fn test_query_mode_hipporag_as_str() {
+        assert_eq!(QueryMode::HippoRag.as_str(), "hipporag");
     }
 }
 

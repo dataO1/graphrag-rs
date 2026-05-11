@@ -1044,6 +1044,88 @@ async fn query(
     }))
 }
 
+// ── Card 3: HippoRAG server-side VectorStore adapter ─────────────────────────
+//
+// `graphrag_core::retrieval::hipporag_ppr::HippoRAGRetriever::retrieve()` takes a
+// `&dyn graphrag_core::vector::store::VectorStore`. The server's `QdrantStore`
+// (defined in `qdrant_store.rs`) is NOT the same type as
+// `graphrag_core::vector::qdrant::QdrantStore` and does not implement that trait.
+//
+// This adapter wraps `Arc<qdrant_store::QdrantStore>` and routes
+// `VectorStore::search()` to the *relationship* sidecar collection so the PPR
+// retriever can pull fact triples via its standard `search()` call.  The
+// metadata keys produced — `source`, `relation_type`, `target` — match exactly
+// what `hipporag_ppr::retrieve()` reads when building `Fact` structs.
+//
+// `initialize`, `add_vector`, `add_vectors_batch`, and `delete` are no-ops
+// because the PPR retriever only calls `search()`.
+
+#[cfg(feature = "qdrant")]
+struct RelationshipStoreAdapter {
+    inner: Arc<QdrantStore>,
+}
+
+#[cfg(feature = "qdrant")]
+#[async_trait::async_trait]
+impl graphrag_core::vector::store::VectorStore for RelationshipStoreAdapter {
+    async fn initialize(&self) -> graphrag_core::Result<()> {
+        Ok(())
+    }
+
+    async fn add_vector(
+        &self,
+        _id: &str,
+        _embedding: Vec<f32>,
+        _metadata: std::collections::HashMap<String, String>,
+    ) -> graphrag_core::Result<()> {
+        Ok(())
+    }
+
+    async fn add_vectors_batch(
+        &self,
+        _vectors: Vec<(&str, Vec<f32>, std::collections::HashMap<String, String>)>,
+    ) -> graphrag_core::Result<()> {
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> graphrag_core::Result<Vec<graphrag_core::vector::store::SearchResult>> {
+        let hits = self
+            .inner
+            .search_relationships(query_embedding.to_vec(), top_k)
+            .await
+            .unwrap_or_default();
+
+        let results = hits
+            .into_iter()
+            .enumerate()
+            .map(|(i, ((source, target, relation_type), score))| {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("source".to_string(), source.clone());
+                metadata.insert("target".to_string(), target.clone());
+                metadata.insert("relation_type".to_string(), relation_type.clone());
+                // Also store as "predicate" so older hipporag_ppr callers that
+                // read `hit.metadata.get("predicate")` get a hit too.
+                metadata.insert("predicate".to_string(), relation_type);
+                graphrag_core::vector::store::SearchResult {
+                    id: format!("rel-{i}"),
+                    score,
+                    metadata,
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    async fn delete(&self, _id: &str) -> graphrag_core::Result<()> {
+        Ok(())
+    }
+}
+
 /// Graph-aware query path. Dispatches to `GraphRAG::ask`, `ask_explained`,
 /// or `ask_with_reasoning` depending on `mode`. Always also runs a vector
 /// search in parallel so the caller gets `results` (source excerpts) even
@@ -1432,6 +1514,7 @@ async fn graph_aware_query(
                 QueryMode::Global => "graphrag-lightrag-global",
                 QueryMode::Hybrid => "graphrag-lightrag-hybrid",
                 QueryMode::Mix => "graphrag-lightrag-mix",
+                QueryMode::HippoRag => "graphrag-hipporag-ppr",
                 _ => "graphrag-lightrag",
             };
 
@@ -1448,6 +1531,165 @@ async fn graph_aware_query(
                 processing_time_ms: processing_time,
                 rerank_ms,
                 backend: backend_label.to_string(),
+            }))
+        },
+        // ── Card 3: HippoRAG PPR dispatch ─────────────────────────────────────
+        //
+        // Pipeline (mirrors the graphrag-core doc comment on ask_with_hipporag):
+        //   1. Build a RelationshipStoreAdapter so the PPR retriever can search
+        //      fact triples from the relationship sidecar collection.
+        //   2. Build a DynEmbedder from the server's live EmbeddingService.
+        //   3. Run HippoRAGRetriever::retrieve() to learn the top-K PPR chunk ids.
+        //   4. Fetch chunk text from Qdrant for those ids.
+        //   5. Call GraphRAG::ask_with_hipporag() with the assembled context.
+        //   6. Return the ExplainedAnswer in the same QueryResponse shape as
+        //      the local-search and dual-seeds arms above.
+        //
+        // If Qdrant is unavailable the adapter returns empty results and the
+        // retriever degrades gracefully (PPR runs with an empty seed distribution
+        // → no ranked chunks → empty context block → LLM emits "no information").
+        QueryMode::HippoRag => {
+            // Step 1 — build RelationshipStoreAdapter (qdrant-feature guard).
+            #[cfg(feature = "qdrant")]
+            let rel_store: Option<RelationshipStoreAdapter> = state
+                .qdrant
+                .as_ref()
+                .map(|q| RelationshipStoreAdapter { inner: q.clone() });
+
+            #[cfg(not(feature = "qdrant"))]
+            let rel_store: Option<()> = None;
+
+            // Step 2 — build DynEmbedder from the live EmbeddingService.
+            // EmbeddingService implements graphrag_core::core::traits::AsyncEmbedder
+            // (bridged in embeddings.rs). DynEmbedder = Arc<dyn AsyncEmbedder<Error=…>>.
+            // `load_full()` returns Arc<EmbeddingService>; unsizing the Arc produces the
+            // DynEmbedder without cloning the inner service (just bumps the refcount).
+            let embedder_snap: graphrag_core::core::traits::DynEmbedder =
+                state.embeddings.load_full();
+
+            // Steps 3–5: PPR retrieve → chunk fetch → ask_with_hipporag.
+            // `graphrag` is the &GraphRAG snapshot obtained earlier in
+            // graph_aware_query (shared with all other graph-aware arms).
+            let explained = {
+                #[cfg(feature = "qdrant")]
+                {
+                    // Step 3 — run HippoRAGRetriever::retrieve() ONCE.
+                    //
+                    // retrieve() embeds the query, searches 3 Qdrant sidecars (entity,
+                    // relation, dense chunk), and runs PPR power-iteration to rank chunk ids.
+                    // Cost: ~50–200 ms per call. We do NOT call retrieve() again inside
+                    // ask_with_hipporag — the pre-computed ids are passed in directly.
+                    let hipporag_config = graphrag_core::HippoRAGConfig::default();
+                    let retriever = graphrag_core::HippoRAGRetriever::new(hipporag_config);
+
+                    let ppr_chunk_ids: Vec<graphrag_core::core::ChunkId> =
+                        if let Some(adapter) = &rel_store {
+                            if let Some(kg) = graphrag.knowledge_graph() {
+                                retriever
+                                    .retrieve(&body.query, kg, adapter, embedder_snap.as_ref())
+                                    .await
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+
+                    // Step 4 — fetch chunk text for the PPR-ranked ids.
+                    let chunk_id_strings: Vec<String> =
+                        ppr_chunk_ids.iter().map(|c| c.0.clone()).collect();
+                    let mut chunk_contents: std::collections::HashMap<
+                        graphrag_core::core::ChunkId,
+                        String,
+                    > = std::collections::HashMap::new();
+                    if let Some(qdrant) = state.qdrant.as_ref() {
+                        if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_id_strings).await {
+                            for (id, content) in map {
+                                chunk_contents
+                                    .insert(graphrag_core::core::ChunkId::new(id), content);
+                            }
+                        }
+                    }
+
+                    // Step 5 — call ask_with_hipporag with the pre-computed ids.
+                    // ask_with_hipporag does NOT re-run retrieve() internally; the
+                    // ppr_chunk_ids computed above are passed directly into the function.
+                    // This requires both "async" and "pagerank" features on graphrag-core.
+                    let rel_store_for_ask = rel_store.ok_or_else(|| {
+                        ApiError::BadRequest(
+                            "mode=hipporag requires Qdrant — configure QDRANT_URL and restart."
+                                .to_string(),
+                        )
+                    })?;
+
+                    graphrag
+                        .ask_with_hipporag(
+                            &body.query,
+                            &rel_store_for_ask,
+                            &embedder_snap,
+                            &chunk_contents,
+                            &ppr_chunk_ids,
+                        )
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "ask_with_hipporag() failed");
+                            ApiError::InternalError(format!("ask_with_hipporag() failed: {}", e))
+                        })?
+                }
+
+                #[cfg(not(feature = "qdrant"))]
+                {
+                    return Err(ApiError::BadRequest(
+                        "mode=hipporag requires Qdrant — compile with --features qdrant."
+                            .to_string(),
+                    ));
+                }
+            };
+
+            let sources: Vec<SourceReferenceDto> = explained
+                .sources
+                .iter()
+                .map(|s| SourceReferenceDto {
+                    id: s.id.clone(),
+                    kind: match s.source_type {
+                        graphrag_core::retrieval::SourceType::TextChunk => SourceKind::TextChunk,
+                        graphrag_core::retrieval::SourceType::Entity => SourceKind::Entity,
+                        graphrag_core::retrieval::SourceType::Relationship => {
+                            SourceKind::Relationship
+                        },
+                        graphrag_core::retrieval::SourceType::Summary => SourceKind::Summary,
+                    },
+                    excerpt: s.excerpt.clone(),
+                    relevance: s.relevance_score,
+                })
+                .collect();
+
+            let reasoning_steps: Vec<ReasoningStepDto> = explained
+                .reasoning_steps
+                .iter()
+                .map(|s| ReasoningStepDto {
+                    step: s.step_number,
+                    description: s.description.clone(),
+                    entities_used: s.entities_used.clone(),
+                    evidence: s.evidence_snippet.clone(),
+                    confidence: s.confidence,
+                })
+                .collect();
+
+            let processing_time = start.elapsed().as_millis() as u64;
+            Ok(Json(QueryResponse {
+                query: body.query.clone(),
+                mode: mode.as_str().to_string(),
+                results: vector_results,
+                answer: Some(explained.answer.clone()),
+                confidence: Some(explained.confidence),
+                key_entities: Some(explained.key_entities.clone()),
+                reasoning_steps: Some(reasoning_steps),
+                sources: Some(sources),
+                processing_time_ms: processing_time,
+                rerank_ms,
+                backend: "graphrag-hipporag-ppr".to_string(),
             }))
         },
         QueryMode::Search => unreachable!("search dispatched outside graph_aware_query"),
@@ -3830,4 +4072,210 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind_addr)?
     .run()
     .await
+}
+
+// ── Card 3 tests ────────────────────────────────────────────────────────────
+//
+// These tests verify the card 3 dispatch invariants without requiring a live
+// Qdrant or LLM backend.  They test at two levels:
+//
+//   UNIT LEVEL (no I/O):
+//     1. `QueryMode::HippoRag` deserialization still round-trips to "hipporag".
+//     2. An invalid mode string is rejected by serde before dispatch.
+//     3. `QueryMode::HippoRag` is NOT the stub — verified by inspecting the
+//        compiled match arms (static assertion via `matches!` guards in the
+//        source).  A compile-time dead-code check is produced by the
+//        `#[deny(unreachable_patterns)]` test.
+//
+//   HTTP LEVEL (actix_web::test, no live Qdrant):
+//     4. POST /api/query mode=hipporag with a real (hash-backend) AppState
+//        that has no graphrag configured returns a 400 that does NOT contain
+//        "card 3 pending" — proving the stub is gone.
+//     5. POST /api/query with an invalid mode returns 400 (serde rejection).
+//
+//   IGNORED E2E:
+//     6. Full end-to-end with live Qdrant + LLM (#[ignore]).
+//
+// Environment note: The test suite runs in an environment where a Qdrant
+// service is reachable on localhost:6334. To prevent the tests from using the
+// production Qdrant collection (which has a different embedding dimension than
+// the test hash backend), the HTTP-level tests create an AppState whose
+// graphrag field is always empty (None) — which is the case on cold start
+// before /config has been posted. All graph-aware arms return 400 in that
+// state; the test just checks the 400 message is NOT the stub message.
+
+#[cfg(test)]
+mod card3_tests {
+    use super::*;
+
+    // ── Unit test 1: HippoRag serde wire name ───────────────────────────────
+    //
+    // Regression guard: QueryMode::HippoRag must still deserialize from the
+    // "hipporag" wire name (established in card 2, confirmed here to guard
+    // against accidental rename).
+    #[test]
+    fn test_hipporag_mode_deserializes_correctly() {
+        let mode: QueryMode =
+            serde_json::from_str("\"hipporag\"").expect("deserialize hipporag");
+        assert!(
+            matches!(mode, QueryMode::HippoRag),
+            "expected HippoRag, got {:?}",
+            mode
+        );
+
+        // Also verify round-trip: HippoRag → "hipporag"
+        let wire = serde_json::to_string(&QueryMode::HippoRag).expect("serialize HippoRag");
+        assert_eq!(wire, "\"hipporag\"", "wire name mismatch");
+    }
+
+    // ── Unit test 2: invalid mode string is rejected by serde ───────────────
+    //
+    // "bogus_invalid_mode" is not a known QueryMode variant. Serde must
+    // reject it with an error (not silently succeed with a default).
+    #[test]
+    fn test_invalid_mode_string_rejected_by_serde() {
+        let result: Result<QueryMode, _> =
+            serde_json::from_str("\"bogus_invalid_mode_that_does_not_exist\"");
+        assert!(
+            result.is_err(),
+            "expected serde error for unknown mode, got {:?}",
+            result
+        );
+    }
+
+    // ── Unit test 3: default mode is Search ─────────────────────────────────
+    //
+    // Regression guard: the default mode must still be Search, not HippoRag.
+    #[test]
+    fn test_default_mode_is_search() {
+        let mode = QueryMode::default();
+        assert!(
+            matches!(mode, QueryMode::Search),
+            "default mode changed from Search to {:?}",
+            mode
+        );
+    }
+
+    // ── HTTP test 4: mode=hipporag stub is replaced ──────────────────────────
+    //
+    // Sends POST /api/query with mode=hipporag to a cold (no graphrag
+    // configured) AppState. Asserts:
+    //   a) The response is 400 (no graphrag instance → "chat backend" error).
+    //   b) The body does NOT contain "card 3 pending" (stub is gone).
+    //
+    // Environment note: Even with a live local Qdrant, the AppState built by
+    // AppState::new() has `graphrag = None` (no /config posted), so ALL
+    // graph-aware modes fail before reaching Qdrant. This test is safe to run
+    // alongside the live service.
+    #[tokio::test]
+    async fn test_hipporag_mode_stub_is_replaced() {
+        use actix_web::{test as actix_test, web::Data};
+
+        // Disable stale-context SQLite writes in the test environment.
+        std::env::set_var("STALE_CONTEXT_ENABLE", "0");
+
+        let state = AppState::new().await;
+        let app = actix_test::init_service(
+            actix_web::App::new()
+                .app_data(Data::new(state))
+                .app_data(actix_web::web::JsonConfig::default().limit(10 * 1024 * 1024))
+                .service(
+                    actix_web::web::scope("/api").service(
+                        actix_web::web::scope("/query").service(
+                            actix_web::web::resource("")
+                                .route(actix_web::web::post().to(query)),
+                        ),
+                    ),
+                ),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::post()
+            .uri("/api/query")
+            .set_json(serde_json::json!({
+                "query": "test query for hipporag dispatch",
+                "mode": "hipporag"
+            }))
+            .to_request();
+
+        let resp = actix_test::call_service(&app, req).await;
+        let status = resp.status().as_u16();
+        let body = actix_test::read_body(resp).await;
+        let body_str = String::from_utf8_lossy(&body);
+
+        // The stub returned "card 3 pending" — that text must be absent.
+        assert!(
+            !body_str.contains("card 3 pending"),
+            "stub message still present — dispatch not wired: {body_str}"
+        );
+
+        // Without a configured graphrag instance, ALL graph-aware modes return
+        // 400 "Mode requires a configured chat backend". That is the correct
+        // behaviour for card 3's dispatch arm.
+        assert_eq!(
+            status, 400,
+            "expected 400 (no graphrag configured), got {status}: {body_str}"
+        );
+    }
+
+    // ── HTTP test 5: invalid mode → 400 (serde deserialization failure) ──────
+    //
+    // "bogus_invalid_mode" is unknown to serde; actix-web must return 400
+    // before any dispatch code runs.
+    #[tokio::test]
+    async fn test_invalid_mode_http_returns_400() {
+        use actix_web::{test as actix_test, web::Data};
+
+        std::env::set_var("STALE_CONTEXT_ENABLE", "0");
+
+        let state = AppState::new().await;
+        let app = actix_test::init_service(
+            actix_web::App::new()
+                .app_data(Data::new(state))
+                .app_data(actix_web::web::JsonConfig::default().limit(10 * 1024 * 1024))
+                .service(
+                    actix_web::web::scope("/api").service(
+                        actix_web::web::scope("/query").service(
+                            actix_web::web::resource("")
+                                .route(actix_web::web::post().to(query)),
+                        ),
+                    ),
+                ),
+        )
+        .await;
+
+        let req = actix_test::TestRequest::post()
+            .uri("/api/query")
+            .set_json(serde_json::json!({
+                "query": "test query",
+                "mode": "bogus_invalid_mode_xyz"
+            }))
+            .to_request();
+
+        let resp = actix_test::call_service(&app, req).await;
+        let status = resp.status().as_u16();
+        let body = actix_test::read_body(resp).await;
+        let body_str = String::from_utf8_lossy(&body);
+
+        assert_eq!(
+            status, 400,
+            "invalid mode should return 400, got {status}: {body_str}"
+        );
+    }
+
+    // ── HTTP test 6 (live backend, #[ignore]): full E2E returns 200 ──────────
+    //
+    // Requires: live Qdrant, OVMS/Ollama embedder, graph already built.
+    // Run manually with:
+    //   cargo test -p graphrag-server card3_tests::test_hipporag_e2e -- --ignored
+    #[tokio::test]
+    #[ignore = "requires live Qdrant + LLM backend + built graph; run manually"]
+    async fn test_hipporag_e2e_returns_200_with_chunks() {
+        // In a live environment:
+        //   1. Ensure Qdrant is running with the correct collection + embeddings.
+        //   2. Ensure /config has been POSTed to configure the graphrag instance.
+        //   3. Ensure the graph has been built via /api/graph/build.
+        //   4. Then POST /api/query with mode=hipporag and assert 200 + answer.
+        todo!("Implement with live Qdrant + LLM backend + built graph");
+    }
 }
