@@ -1596,25 +1596,91 @@ async fn graph_aware_query(
                             Vec::new()
                         };
 
-                    // Step 4 — fetch chunk text for the PPR-ranked ids.
-                    let chunk_id_strings: Vec<String> =
-                        ppr_chunk_ids.iter().map(|c| c.0.clone()).collect();
+                    // Step 4 — fetch chunk text via direct dense search.
+                    //
+                    // WHY we do NOT use ppr_chunk_ids here:
+                    //   RelationshipStoreAdapter::search() (lines above) routes ALL THREE
+                    //   VectorStore::search() calls in HippoRAGRetriever::retrieve() to the
+                    //   relationship sidecar collection and returns synthetic "rel-N" IDs.
+                    //   The third call (dense chunk pass → passage_scores) should return real
+                    //   chunk point IDs from the main collection, but the single-backend adapter
+                    //   cannot distinguish the three calls — it always returns "rel-0", "rel-1",
+                    //   etc.  Feeding those synthetic IDs into fetch_chunks_by_ids() against the
+                    //   main collection returns zero matches, leaving chunk_contents empty and
+                    //   causing ask_with_hipporag to emit the "no information" refusal every time.
+                    //
+                    // FIX: bypass the broken PPR chunk-ID output for the text-fetch step.
+                    //   Run a direct dense search on the main collection (the same operation
+                    //   Mix mode performs at line ~1419 above).  This yields real Qdrant point
+                    //   IDs that exist in the main collection, so fetch_chunks_by_ids() returns
+                    //   actual text.  We then pass these real IDs as the effective ppr_chunk_ids
+                    //   to ask_with_hipporag so its entity-mention walk can find entities that
+                    //   mention those chunks and populate the ENTITIES / RELATIONSHIPS / SOURCE
+                    //   TEXT blocks with real content.
+                    //
+                    //   If the direct dense search fails (Qdrant unreachable, embedding error),
+                    //   we fall back to the original ppr_chunk_ids to preserve the existing
+                    //   degraded-but-functional behaviour rather than making things worse.
                     let mut chunk_contents: std::collections::HashMap<
                         graphrag_core::core::ChunkId,
                         String,
                     > = std::collections::HashMap::new();
+                    let mut dense_chunk_ids: Vec<graphrag_core::core::ChunkId> = Vec::new();
+
                     if let Some(qdrant) = state.qdrant.as_ref() {
-                        if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_id_strings).await {
-                            for (id, content) in map {
-                                chunk_contents
-                                    .insert(graphrag_core::core::ChunkId::new(id), content);
+                        match embedder_snap.embed(&body.query).await {
+                            Ok(query_emb) => {
+                                match version_aware_search(
+                                    qdrant.as_ref(),
+                                    query_emb,
+                                    body.top_k.max(10),
+                                    &vfilter,
+                                )
+                                .await
+                                {
+                                    Ok(hits) => {
+                                        for hit in &hits {
+                                            chunk_contents.insert(
+                                                graphrag_core::core::ChunkId::new(hit.id.clone()),
+                                                hit.metadata.text.clone(),
+                                            );
+                                        }
+                                        dense_chunk_ids = hits
+                                            .into_iter()
+                                            .map(|h| graphrag_core::core::ChunkId::new(h.id))
+                                            .collect();
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "hipporag direct dense search failed; \
+                                             falling back to PPR chunk ids (chunk_contents may be empty)"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "hipporag query embedding failed; \
+                                     falling back to PPR chunk ids (chunk_contents may be empty)"
+                                );
                             }
                         }
                     }
 
+                    // Prefer real dense-search chunk IDs; fall back to PPR output only when
+                    // the dense search failed (so we don't regress on the degraded path).
+                    let effective_chunk_ids: Vec<graphrag_core::core::ChunkId> =
+                        if dense_chunk_ids.is_empty() {
+                            ppr_chunk_ids
+                        } else {
+                            dense_chunk_ids
+                        };
+
                     // Step 5 — call ask_with_hipporag with the pre-computed ids.
                     // ask_with_hipporag does NOT re-run retrieve() internally; the
-                    // ppr_chunk_ids computed above are passed directly into the function.
+                    // effective_chunk_ids computed above are passed directly into the function.
                     // This requires both "async" and "pagerank" features on graphrag-core.
                     let rel_store_for_ask = rel_store.ok_or_else(|| {
                         ApiError::BadRequest(
@@ -1629,7 +1695,7 @@ async fn graph_aware_query(
                             &rel_store_for_ask,
                             &embedder_snap,
                             &chunk_contents,
-                            &ppr_chunk_ids,
+                            &effective_chunk_ids,
                         )
                         .await
                         .map_err(|e| {
