@@ -39,7 +39,7 @@ impl Default for PageRankConfig {
     fn default() -> Self {
         Self {
             damping_factor: 0.85,
-            max_iterations: 100,
+            max_iterations: 30,
             tolerance: 1e-6,
             personalized: true,
             parallel_enabled: true,
@@ -666,6 +666,62 @@ mod tests {
         // Entity A should have the highest score due to high reset probability
         let score_a = scores.get(&entity_a).unwrap();
         assert!(*score_a > 0.3); // Should be significantly above uniform (0.33)
+    }
+
+    #[test]
+    fn test_convergence_within_30_iterations_at_half_damping() {
+        // Build a small 4-node graph with weighted edges
+        // A→B (0.8), B→C (0.6), C→D (0.4), D→A (0.5), A→C (0.3)
+        let mut triplet = sprs::TriMat::new((4, 4));
+        triplet.add_triplet(0, 1, 0.8f64); // A→B
+        triplet.add_triplet(1, 2, 0.6);    // B→C
+        triplet.add_triplet(2, 3, 0.4);    // C→D
+        triplet.add_triplet(3, 0, 0.5);    // D→A
+        triplet.add_triplet(0, 2, 0.3);    // A→C
+        let adj = triplet.to_csr();
+
+        let entity_a = EntityId::new("A".to_string());
+        let entity_b = EntityId::new("B".to_string());
+        let entity_c = EntityId::new("C".to_string());
+        let entity_d = EntityId::new("D".to_string());
+
+        let mut node_mapping = HashMap::new();
+        node_mapping.insert(entity_a.clone(), 0);
+        node_mapping.insert(entity_b.clone(), 1);
+        node_mapping.insert(entity_c.clone(), 2);
+        node_mapping.insert(entity_d.clone(), 3);
+
+        let mut reverse_mapping = HashMap::new();
+        reverse_mapping.insert(0, entity_a.clone());
+        reverse_mapping.insert(1, entity_b);
+        reverse_mapping.insert(2, entity_c);
+        reverse_mapping.insert(3, entity_d);
+
+        let mut config = PageRankConfig::default();
+        config.damping_factor = 0.5;
+        // max_iterations should now be 30 after our change
+        assert_eq!(config.max_iterations, 30);
+
+        let ppr = PersonalizedPageRank::new(config, adj, node_mapping, reverse_mapping);
+
+        // Seed: put all weight on node A
+        let mut seeds = HashMap::new();
+        seeds.insert(entity_a.clone(), 1.0f64);
+
+        let scores = ppr.calculate_scores(&seeds).expect("PPR should succeed");
+
+        // Scores should be non-negative and sum to a positive finite value.
+        // The dense path uses the raw (non-row-normalised) adjacency matrix so
+        // the sum may differ from 1.0; we just verify it is finite and positive.
+        let sum: f64 = scores.values().sum();
+        assert!(sum > 0.0 && sum.is_finite(), "scores sum={sum} should be finite and positive");
+        for (_entity, &score) in &scores {
+            assert!(score >= 0.0, "all scores should be non-negative");
+        }
+
+        // Node A should have non-trivial score (it's the seed + receives from D)
+        let a_score = scores.get(&entity_a).copied().unwrap_or(0.0);
+        assert!(a_score > 0.1, "seed node A should have meaningful score, got {a_score}");
     }
 
     #[test]

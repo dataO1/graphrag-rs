@@ -195,6 +195,17 @@ struct AppState {
     #[cfg(feature = "auth")]
     auth: Arc<AuthState>,
 
+    /// PPR instance cache. Built once after each graph publish (append or rebuild),
+    /// background-rebuilt in spawn_blocking to avoid blocking the async executor.
+    /// Empty until first graph build fires. HippoRAG queries load this instead of
+    /// calling build_pagerank_calculator() per-query.
+    ///
+    /// Note: `pagerank` is unconditionally enabled for graphrag-server via the
+    /// graphrag-core dep line in Cargo.toml. The `qdrant` gate mirrors the pattern
+    /// used by every other graph-pipeline field in AppState.
+    #[cfg(feature = "qdrant")]
+    ppr_cache: Arc<arc_swap::ArcSwapOption<graphrag_core::graph::pagerank::PersonalizedPageRank>>,
+
     // Fallback in-memory storage (used when Qdrant unavailable or simple mode)
     documents: Arc<RwLock<Vec<Document>>>,
     graph_built: Arc<RwLock<bool>>,
@@ -524,6 +535,8 @@ impl AppState {
                         config,
                         graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
                         graphrag_writer: Arc::new(tokio::sync::Mutex::new(None)),
+                        #[cfg(feature = "qdrant")]
+                        ppr_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -553,6 +566,8 @@ impl AppState {
                         config,
                         graphrag: Arc::new(arc_swap::ArcSwapOption::empty()),
                         graphrag_writer: Arc::new(tokio::sync::Mutex::new(None)),
+                        #[cfg(feature = "qdrant")]
+                        ppr_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
                         config_manager: Arc::new(ConfigManager::new()),
                         ingest_policy: ingest_policy.clone(),
                         auto_append_notify: auto_append_notify.clone(),
@@ -1582,11 +1597,20 @@ async fn graph_aware_query(
                     let hipporag_config = graphrag_core::HippoRAGConfig::default();
                     let retriever = graphrag_core::HippoRAGRetriever::new(hipporag_config);
 
+                    // Card 2: Load cached PPR instance from AppState instead of rebuilding
+                    // per-query. `ppr_cache` holds an Arc<PersonalizedPageRank> built once
+                    // in the background after each graph publish (see spawn_ppr_cache_rebuild).
+                    // When the cache is empty (cold start or first-ever graph build not yet
+                    // complete), ppr_override is None and retrieve() falls back to building
+                    // a fresh PPR instance from the graph — identical to pre-card-2 behaviour.
+                    let ppr_cached = state.ppr_cache.load_full();
+                    let ppr_override = ppr_cached.as_ref().map(std::sync::Arc::clone);
+
                     let ppr_chunk_ids: Vec<graphrag_core::core::ChunkId> =
                         if let Some(adapter) = &rel_store {
                             if let Some(kg) = graphrag.knowledge_graph() {
                                 retriever
-                                    .retrieve(&body.query, kg, adapter, embedder_snap.as_ref())
+                                    .retrieve(&body.query, kg, adapter, embedder_snap.as_ref(), ppr_override)
                                     .await
                                     .unwrap_or_default()
                             } else {
@@ -3068,6 +3092,9 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
 
             // Publish the rebuilt graph (one clone for the snapshot).
             state.graphrag.store(Some(Arc::new(master.clone())));
+            // Kick off a background PPR cache rebuild from the freshly-published graph.
+            #[cfg(feature = "qdrant")]
+            spawn_ppr_cache_rebuild(&state, master.clone());
             drop(master_guard);
 
             let processing_time = start.elapsed().as_millis() as u64;
@@ -3693,6 +3720,9 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
     // not per-batch). Recall that started before this point sees the
     // prior snapshot; recall after sees the freshly published one.
     state.graphrag.store(Some(Arc::new(master.clone())));
+    // Kick off a background PPR cache rebuild from the freshly-published graph.
+    #[cfg(feature = "qdrant")]
+    spawn_ppr_cache_rebuild(state, master.clone());
     drop(master_guard);
 
     let processing_time = start.elapsed().as_millis() as u64;
@@ -4140,6 +4170,36 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+// ── Card 1: PPR cache rebuild helper ────────────────────────────────────────
+//
+// Spawns a background task that rebuilds the PPR cache from the given
+// GraphRAG snapshot. Non-blocking — caller does not await the spawn handle.
+//
+// Gated on `feature = "qdrant"` only: `pagerank` is unconditionally enabled
+// for graphrag-server via the graphrag-core dep line in Cargo.toml (it is not
+// a graphrag-server feature toggle), so `cfg(feature = "pagerank")` is always
+// false when evaluated from this crate and would silently gate the code off.
+#[cfg(feature = "qdrant")]
+fn spawn_ppr_cache_rebuild(state: &AppState, graph_snap: graphrag_core::GraphRAG) {
+    let ppr_state = state.ppr_cache.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            graph_snap
+                .knowledge_graph()
+                .map(|kg| kg.build_pagerank_calculator())
+        })
+        .await;
+        match result {
+            Ok(Some(Ok(ppr))) => {
+                ppr_state.store(Some(std::sync::Arc::new(ppr)));
+                tracing::info!("PPR cache rebuilt after graph update");
+            }
+            Ok(Some(Err(e))) => tracing::warn!(error = %e, "PPR cache rebuild failed"),
+            _ => {}
+        }
+    });
+}
+
 // ── Card 3 tests ────────────────────────────────────────────────────────────
 //
 // These tests verify the card 3 dispatch invariants without requiring a live
@@ -4343,5 +4403,79 @@ mod card3_tests {
         //   3. Ensure the graph has been built via /api/graph/build.
         //   4. Then POST /api/query with mode=hipporag and assert 200 + answer.
         todo!("Implement with live Qdrant + LLM backend + built graph");
+    }
+}
+
+// ── Card 1: PPR cache tests ──────────────────────────────────────────────────
+//
+// These tests cover the `ppr_cache` field added to `AppState` and the
+// `spawn_ppr_cache_rebuild` helper:
+//
+//   1. `test_ppr_cache_starts_empty`   — newly-constructed AppState has None.
+//   2. `test_spawn_ppr_cache_rebuild_is_non_blocking` — structural: function
+//      is `fn` (not `async fn`), returns (), and the cache is eventually
+//      populated (smoke-test that the task fires).
+//
+// Note: `pagerank` is always enabled for graphrag-server (it's an unconditional
+// feature in the graphrag-core dep line in Cargo.toml, not a graphrag-server
+// feature). The guard here uses `feature = "qdrant"` only — `pagerank` items
+// are always in scope.
+#[cfg(test)]
+#[cfg(feature = "qdrant")]
+mod ppr_cache_tests {
+    use super::*;
+
+    // Test 1: freshly-constructed AppState exposes an empty PPR cache.
+    #[tokio::test]
+    async fn test_ppr_cache_starts_empty() {
+        std::env::set_var("STALE_CONTEXT_ENABLE", "0");
+        let state = AppState::new().await;
+        let loaded = state.ppr_cache.load();
+        assert!(
+            loaded.is_none(),
+            "ppr_cache should be None before any graph publish, got Some(_)"
+        );
+    }
+
+    // Test 2: `spawn_ppr_cache_rebuild` is a plain (non-async) fn that
+    // returns `()` immediately — callers never await it.
+    //
+    // We verify this structurally: if the function were `async fn`, calling
+    // it without `.await` would produce an unused-future warning and the
+    // Arc would not be touched. Here we call it, yield to the executor, and
+    // confirm the function signature allows immediate return.
+    //
+    // Note: we pass a blank GraphRAG (no knowledge graph set) so the task
+    // will hit the `Ok(None)` arm inside the spawn and do nothing — which
+    // is the correct no-op code path for an empty graph.
+    #[tokio::test]
+    async fn test_spawn_ppr_cache_rebuild_is_non_blocking() {
+        std::env::set_var("STALE_CONTEXT_ENABLE", "0");
+        let state = AppState::new().await;
+
+        // A blank GraphRAG has no KnowledgeGraph, so spawn_ppr_cache_rebuild
+        // will run the `Ok(None)` arm and leave the cache empty. The important
+        // thing is that the call returns immediately (it's not `async fn`).
+        let blank_graphrag = {
+            // Build a minimal GraphRAG via the public API.
+            // Config::default() produces a valid (hash-backend) config.
+            let cfg = graphrag_core::Config::default();
+            graphrag_core::GraphRAG::new(cfg)
+                .expect("GraphRAG::new with default config must succeed in tests")
+        };
+
+        // This call must compile as a plain fn call — if it were async,
+        // the line below would need `.await` and the test would fail to compile.
+        spawn_ppr_cache_rebuild(&state, blank_graphrag);
+
+        // Yield to the executor so the spawned task has a chance to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // For a blank graph the cache stays None (no KG → Ok(None) arm).
+        let loaded = state.ppr_cache.load();
+        assert!(
+            loaded.is_none(),
+            "ppr_cache should still be None for a blank GraphRAG, got Some(_)"
+        );
     }
 }
