@@ -364,6 +364,8 @@ pub async fn set_config(
     // at the end of its cycle.
     let mut master = state.graphrag_writer.lock().await;
     state.graphrag.store(Some(std::sync::Arc::new(graphrag.clone())));
+    #[cfg(feature = "qdrant")]
+    crate::spawn_ppr_cache_rebuild(&*state, graphrag.clone());
     *master = Some(graphrag);
     drop(master);
 

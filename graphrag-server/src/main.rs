@@ -4180,7 +4180,7 @@ async fn main() -> std::io::Result<()> {
 // a graphrag-server feature toggle), so `cfg(feature = "pagerank")` is always
 // false when evaluated from this crate and would silently gate the code off.
 #[cfg(feature = "qdrant")]
-fn spawn_ppr_cache_rebuild(state: &AppState, graph_snap: graphrag_core::GraphRAG) {
+pub(crate) fn spawn_ppr_cache_rebuild(state: &AppState, graph_snap: graphrag_core::GraphRAG) {
     let ppr_state = state.ppr_cache.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
@@ -4269,15 +4269,13 @@ mod card3_tests {
         );
     }
 
-    // ── Unit test 3: default mode is Search ─────────────────────────────────
-    //
-    // Regression guard: the default mode must still be Search, not HippoRag.
+    // ── Unit test 3: default mode is HippoRag ───────────────────────────────
     #[test]
-    fn test_default_mode_is_search() {
+    fn test_default_mode_is_hipporag() {
         let mode = QueryMode::default();
         assert!(
-            matches!(mode, QueryMode::Search),
-            "default mode changed from Search to {:?}",
+            matches!(mode, QueryMode::HippoRag),
+            "default mode changed from HippoRag to {:?}",
             mode
         );
     }

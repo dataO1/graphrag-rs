@@ -59,7 +59,7 @@ pub enum QueryMode {
 
 impl Default for QueryMode {
     fn default() -> Self {
-        QueryMode::Search
+        QueryMode::HippoRag
     }
 }
 
