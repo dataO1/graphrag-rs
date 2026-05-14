@@ -197,19 +197,25 @@ impl HippoRAGRetriever {
         // Step 1: Embed query
         let query_vec = embedder.embed(query).await?;
 
-        // Step 2: Top-K entity sidecar hits
-        // Currently used only to drive entity weight seeding; the hit ids are
-        // resolved to entities in the graph via entity_to_passages_typed in step 4.
-        let _entity_hits = vector_store
-            .search(&query_vec, self.config.top_k_results)
-            .await?;
+        // Steps 2, 3, 5 (search phase): fire all three vector-store searches concurrently.
+        //
+        // `VectorStore: Send + Sync` guarantees a single `&dyn VectorStore` reference
+        // can be shared safely across all three `tokio::join!` arms with no signature
+        // changes.  Ordering within `tokio::join!` is deterministic (arm 0 is polled
+        // first), so the ScriptedVectorStore mock in tests still consumes responses in
+        // the expected entity → relation → dense order.
 
+        // Step 2: Top-K entity sidecar hits
         // Step 3: Top-K relation sidecar hits → Fact triples
-        // Each relation hit's metadata carries source_entity, relation_label, target_entity.
-        // The metadata keys mirror the graphrag-server PersistedRelationship payload layout.
-        let relation_hits = vector_store
-            .search(&query_vec, self.config.top_k_facts)
-            .await?;
+        //   (metadata keys: source, relation_type/predicate, target)
+        // Step 5: Top-K dense chunk hits → passage_scores
+        let (entity_res, relation_res, dense_res) = tokio::join!(
+            vector_store.search(&query_vec, self.config.top_k_results),
+            vector_store.search(&query_vec, self.config.top_k_facts),
+            vector_store.search(&query_vec, self.config.top_k_dense),
+        );
+        let _entity_hits = entity_res?;
+        let relation_hits = relation_res?;
 
         let top_k_facts: Vec<Fact> = relation_hits
             .into_iter()
@@ -261,13 +267,11 @@ impl HippoRAGRetriever {
                 })
                 .collect();
 
-        // Step 5: Top-K dense chunk hits → passage_scores (HashMap<ChunkId, f32>)
+        // Step 5: Materialise dense hits (fetched concurrently above in tokio::join!)
         //
         // Primary type: ChunkId → f32  (used for combined scoring in step 7).
         // Legacy type:  EntityId → f32  (used by calculate_passage_weights helper).
-        let dense_hits = vector_store
-            .search(&query_vec, self.config.top_k_dense)
-            .await?;
+        let dense_hits = dense_res?;
 
         let passage_scores_typed: HashMap<ChunkId, f32> = dense_hits
             .into_iter()

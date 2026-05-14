@@ -37,22 +37,18 @@ use std::fmt;
 ///   fetches top-K entity + relation sidecar hits, runs PPR over the
 ///   entity graph, and returns the highest-ranked chunk ids as seeds.
 ///   Best for multi-hop questions where the query phrasing is abstract
-///   but the answer is entity-specific. Slower than default (+50–200 ms)
-///   — prefer when default returns 0-or-few hits or bridging across notes
-///   is required. Dispatches to `GraphRAG::ask_with_hipporag` in
-///   graphrag-core. Server wiring is completed in card 3.
+/// HippoRAG Personalised PageRank retrieval (default). Full multi-hop
+/// synthesis across the knowledge graph. ~6s.
+///
+/// `Search` returns fast keyword-matched excerpts directly, without
+/// synthesis. ~50ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
+    /// Fast vector-keyword excerpt lookup. No LLM call.
     Search,
-    Local,
-    Global,
-    Hybrid,
-    Mix,
-    /// HippoRAG Personalised PageRank retrieval. See enum doc for details.
-    ///
-    /// Wire name: `"hipporag"` (explicit rename overrides the default
-    /// `snake_case` transform, which would produce `"hippo_rag"`).
+    /// HippoRAG Personalised PageRank retrieval. Full multi-hop synthesis
+    /// across the knowledge graph. Wire name: `"hipporag"`.
     #[serde(rename = "hipporag")]
     HippoRag,
 }
@@ -67,10 +63,6 @@ impl QueryMode {
     pub fn as_str(self) -> &'static str {
         match self {
             QueryMode::Search => "search",
-            QueryMode::Local => "local",
-            QueryMode::Global => "global",
-            QueryMode::Hybrid => "hybrid",
-            QueryMode::Mix => "mix",
             QueryMode::HippoRag => "hipporag",
         }
     }
@@ -101,6 +93,24 @@ mod tests {
     fn test_query_mode_hipporag_as_str() {
         assert_eq!(QueryMode::HippoRag.as_str(), "hipporag");
     }
+
+    /// Removed modes (Local, Global, Hybrid, Mix) must fail serde
+    /// deserialization. Valid modes (Search, HippoRag) must succeed.
+    #[test]
+    fn test_removed_modes_deserialize_as_error() {
+        for removed in &["local", "global", "hybrid", "mix"] {
+            let json = format!("\"{}\"", removed);
+            let result: Result<QueryMode, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_err(),
+                "removed mode '{}' must fail deserialization",
+                removed
+            );
+        }
+        // Valid modes still work.
+        assert!(serde_json::from_str::<QueryMode>("\"search\"").is_ok());
+        assert!(serde_json::from_str::<QueryMode>("\"hipporag\"").is_ok());
+    }
 }
 
 /// Query request
@@ -116,8 +126,9 @@ pub struct QueryRequest {
     #[schemars(example = "example_top_k")]
     pub top_k: usize,
 
-    /// Retrieval mode. Defaults to `search` for back-compat.
-    /// See [QueryMode] for the full menu and their tradeoffs.
+    /// Retrieval mode. Defaults to `hipporag` (full multi-hop synthesis).
+    /// Set to `search` for fast vector excerpts without LLM.
+    /// See [QueryMode] for details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<QueryMode>,
 

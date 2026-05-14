@@ -783,11 +783,8 @@ async fn root(state: Data<AppState>) -> impl Responder {
             "query": {
                 "endpoint": "POST /api/query",
                 "modes": {
-                    "search": "vector similarity over Qdrant (default; fast; no LLM)",
-                    "local": "LightRAG `local`: low-level keywords → entity-vector seeds → entity-centric retrieval",
-                    "global": "LightRAG `global`: high-level keywords → relationship-vector seeds → theme-centric retrieval",
-                    "hybrid": "LightRAG `hybrid`: both keyword sets merged; best general default",
-                    "mix": "LightRAG `mix`: hybrid + chunk-vector seeds; strongest recall"
+                    "hipporag": "full multi-hop synthesis via HippoRAG PPR (default; ~6s)",
+                    "search": "fast vector-keyword excerpts, no LLM (~50ms)"
                 }
             },
             "documents": {
@@ -884,7 +881,7 @@ async fn health(state: Data<AppState>) -> Result<Json<HealthResponse>, ApiError>
 #[api_operation(
     tag = "query",
     summary = "Query the knowledge graph",
-    description = "Search documents (mode=search, default) or ask the graph-aware engine for an LLM-composed answer (mode=ask|explain|reason).",
+    description = "Query the knowledge graph. mode=hipporag (default): full multi-hop synthesis via HippoRAG PPR (~6s). mode=search: fast vector-keyword excerpts, no LLM (~50ms).",
     error_code = 400,
     error_code = 500
 )]
@@ -1244,310 +1241,6 @@ async fn graph_aware_query(
     let graphrag = graphrag.as_ref();
 
     match mode {
-        QueryMode::Local => {
-            // Microsoft GraphRAG `local_search` shape:
-            //   1. Embed the user query through the EmbeddingService
-            //      (same one the document path uses).
-            //   2. Vector-search the entity sidecar collection for
-            //      top-K seed entities.
-            //   3. Hand those entity ids to graphrag-core, which
-            //      expands to 1-hop neighbors, gathers mentioning
-            //      chunks, and feeds the assembly to the chat backend.
-            //
-            // If Qdrant or the entity sidecar is unavailable (cold
-            // start, no build has run yet), top_k_ids is empty —
-            // graphrag-core will return "no relevant information"
-            // rather than fabricating an answer.
-            let mut seed_ids: Vec<graphrag_core::core::EntityId> = Vec::new();
-
-            #[cfg(feature = "qdrant")]
-            if let Some(qdrant) = state.qdrant.as_ref() {
-                match state.embeddings.load_full().generate_single(&body.query).await {
-                    Ok(query_embedding) => {
-                        match qdrant.search_entities(query_embedding, body.top_k.max(5)).await {
-                            Ok(hits) => {
-                                seed_ids = hits
-                                    .into_iter()
-                                    .map(|(id, _)| graphrag_core::core::EntityId::new(id))
-                                    .collect();
-                            },
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "search_entities failed; mode=local will run with no seeds"
-                                );
-                            },
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "query embedding failed; mode=local will run with no seeds"
-                        );
-                    },
-                }
-            }
-
-            let max_neighbors_per_seed = 5usize;
-
-            // Phase 6: pre-fetch chunk contents from qdrant for the
-            // mention chunk ids the entity walk would touch. Replaces
-            // the in-memory `kg.chunks().find(...)` lookup that's gone.
-            let chunk_ids_needed: Vec<String> = graphrag
-                .collect_chunk_ids_for_seed_entities(&seed_ids, max_neighbors_per_seed)
-                .into_iter()
-                .map(|c| c.0)
-                .collect();
-            let mut chunk_contents: std::collections::HashMap<graphrag_core::core::ChunkId, String> =
-                std::collections::HashMap::new();
-            #[cfg(feature = "qdrant")]
-            if let Some(qdrant) = state.qdrant.as_ref() {
-                if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_ids_needed).await {
-                    for (id, content) in map {
-                        chunk_contents.insert(graphrag_core::core::ChunkId::new(id), content);
-                    }
-                }
-            }
-
-            let explained = graphrag
-                .ask_with_seed_entities(&body.query, &seed_ids, max_neighbors_per_seed, &chunk_contents)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "ask_with_seed_entities() failed");
-                    ApiError::InternalError(format!(
-                        "ask_with_seed_entities() failed: {}",
-                        e
-                    ))
-                })?;
-
-            let sources: Vec<SourceReferenceDto> = explained
-                .sources
-                .iter()
-                .map(|s| SourceReferenceDto {
-                    id: s.id.clone(),
-                    kind: match s.source_type {
-                        graphrag_core::retrieval::SourceType::TextChunk => SourceKind::TextChunk,
-                        graphrag_core::retrieval::SourceType::Entity => SourceKind::Entity,
-                        graphrag_core::retrieval::SourceType::Relationship => {
-                            SourceKind::Relationship
-                        },
-                        graphrag_core::retrieval::SourceType::Summary => SourceKind::Summary,
-                    },
-                    excerpt: s.excerpt.clone(),
-                    relevance: s.relevance_score,
-                })
-                .collect();
-            let reasoning_steps: Vec<ReasoningStepDto> = explained
-                .reasoning_steps
-                .iter()
-                .map(|s| ReasoningStepDto {
-                    step: s.step_number,
-                    description: s.description.clone(),
-                    entities_used: s.entities_used.clone(),
-                    evidence: s.evidence_snippet.clone(),
-                    confidence: s.confidence,
-                })
-                .collect();
-            let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
-                query: body.query.clone(),
-                mode: mode.as_str().to_string(),
-                results: vector_results,
-                answer: Some(explained.answer.clone()),
-                confidence: Some(explained.confidence),
-                key_entities: Some(explained.key_entities.clone()),
-                reasoning_steps: Some(reasoning_steps),
-                sources: Some(sources),
-                processing_time_ms: processing_time,
-                rerank_ms,
-                backend: "graphrag-local-search".to_string(),
-            }))
-        },
-        QueryMode::Global | QueryMode::Hybrid | QueryMode::Mix => {
-            // LightRAG dual-level retrieval (arXiv:2410.05779).
-            //
-            // Pipeline:
-            //   1. One LLM call extracts {low_level_keywords, high_level_keywords}
-            //      from the user query.
-            //   2. Each non-empty keyword set is joined into a single
-            //      embed string, embedded once via OVMS/EmbeddingService,
-            //      and used to vector-search the appropriate sidecar:
-            //        - low-level  → graphrag-entities sidecar       (entity seeds)
-            //        - high-level → graphrag-relationships sidecar  (relation seeds)
-            //   3. For mode=mix, ALSO chunk-vector search with the
-            //      original query → top-K chunk seeds.
-            //   4. Hand the assembled `DualSeeds` to graphrag-core's
-            //      ask_with_dual_seeds, which expands every seed
-            //      (entities + relation endpoints), gathers mentioning
-            //      chunks, and asks the chat backend for a synthesized
-            //      answer.
-            //
-            // Mode-to-stream mapping:
-            //   - global : relations only       (high-level keywords)
-            //   - hybrid : entities + relations (both keyword sets)
-            //   - mix    : entities + relations + chunk-vector
-            let kw = graphrag.extract_query_keywords(&body.query).await.map_err(|e| {
-                tracing::error!(error = %e, "extract_query_keywords() failed");
-                ApiError::InternalError(format!("extract_query_keywords() failed: {}", e))
-            })?;
-
-            let mut seeds = graphrag_core::DualSeeds::default();
-
-            #[cfg(feature = "qdrant")]
-            if let Some(qdrant) = state.qdrant.as_ref() {
-                // Low-level → entity sidecar (skip for global, which is
-                // relation-only by definition).
-                if !matches!(mode, QueryMode::Global) && !kw.low_level.is_empty() {
-                    let low_text = kw.low_level.join(" ");
-                    if let Ok(emb) = state.embeddings.load_full().generate_single(&low_text).await {
-                        if let Ok(hits) = qdrant.search_entities(emb, body.top_k.max(5)).await {
-                            seeds.entities = hits
-                                .into_iter()
-                                .map(|(id, _)| graphrag_core::core::EntityId::new(id))
-                                .collect();
-                        }
-                    }
-                }
-                // High-level → relationship sidecar (driven by both
-                // global and hybrid).
-                if !kw.high_level.is_empty() {
-                    let high_text = kw.high_level.join(" ");
-                    if let Ok(emb) = state.embeddings.load_full().generate_single(&high_text).await {
-                        if let Ok(hits) =
-                            qdrant.search_relationships(emb, body.top_k.max(5)).await
-                        {
-                            seeds.relations = hits
-                                .into_iter()
-                                .map(|((s, t, r), _)| {
-                                    (
-                                        graphrag_core::core::EntityId::new(s),
-                                        graphrag_core::core::EntityId::new(t),
-                                        r,
-                                    )
-                                })
-                                .collect();
-                        }
-                    }
-                }
-                // Mix mode also pulls a fresh chunk-vector pass.
-                if matches!(mode, QueryMode::Mix) {
-                    if let Ok(emb) = state.embeddings.load_full().generate_single(&body.query).await {
-                        if let Ok(hits) = version_aware_search(
-                            qdrant.as_ref(),
-                            emb,
-                            body.top_k.max(5),
-                            &vfilter,
-                        )
-                        .await
-                        {
-                            // Caller-side chunk ids — Qdrant point ids
-                            // for chunks ARE the document ids (one
-                            // chunk per doc today; the mapping holds
-                            // even if that changes).
-                            seeds.chunks = hits
-                                .into_iter()
-                                .map(|r| graphrag_core::core::ChunkId::new(r.id))
-                                .collect();
-                        }
-                    }
-                }
-            }
-
-            let max_neighbors_per_seed = 5usize;
-
-            // Phase 6: pre-fetch chunk contents from qdrant for the
-            // mention + chunk-seed ids the dual-seed walk would touch.
-            let chunk_ids_needed: Vec<String> = graphrag
-                .collect_chunk_ids_for_dual_seeds(&seeds, max_neighbors_per_seed)
-                .into_iter()
-                .map(|c| c.0)
-                .collect();
-            let mut chunk_contents: std::collections::HashMap<graphrag_core::core::ChunkId, String> =
-                std::collections::HashMap::new();
-            #[cfg(feature = "qdrant")]
-            if let Some(qdrant) = state.qdrant.as_ref() {
-                if let Ok(map) = qdrant.fetch_chunks_by_ids(&chunk_ids_needed).await {
-                    for (id, content) in map {
-                        chunk_contents.insert(graphrag_core::core::ChunkId::new(id), content);
-                    }
-                }
-            }
-
-            let explained = graphrag
-                .ask_with_dual_seeds(&body.query, &seeds, max_neighbors_per_seed, &chunk_contents)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "ask_with_dual_seeds() failed");
-                    ApiError::InternalError(format!("ask_with_dual_seeds() failed: {}", e))
-                })?;
-
-            // Prepend a reasoning step that documents the keyword
-            // extraction itself so callers can audit which keywords
-            // drove retrieval.
-            let mut reasoning_steps: Vec<ReasoningStepDto> = vec![ReasoningStepDto {
-                step: 0,
-                description: format!(
-                    "LightRAG dual-keyword extraction: low_level={:?}, high_level={:?}",
-                    kw.low_level, kw.high_level
-                ),
-                entities_used: vec![],
-                evidence: None,
-                confidence: 1.0,
-            }];
-            reasoning_steps.extend(
-                explained
-                    .reasoning_steps
-                    .iter()
-                    .map(|s| ReasoningStepDto {
-                        step: s.step_number,
-                        description: s.description.clone(),
-                        entities_used: s.entities_used.clone(),
-                        evidence: s.evidence_snippet.clone(),
-                        confidence: s.confidence,
-                    }),
-            );
-
-            let sources: Vec<SourceReferenceDto> = explained
-                .sources
-                .iter()
-                .map(|s| SourceReferenceDto {
-                    id: s.id.clone(),
-                    kind: match s.source_type {
-                        graphrag_core::retrieval::SourceType::TextChunk => SourceKind::TextChunk,
-                        graphrag_core::retrieval::SourceType::Entity => SourceKind::Entity,
-                        graphrag_core::retrieval::SourceType::Relationship => {
-                            SourceKind::Relationship
-                        },
-                        graphrag_core::retrieval::SourceType::Summary => SourceKind::Summary,
-                    },
-                    excerpt: s.excerpt.clone(),
-                    relevance: s.relevance_score,
-                })
-                .collect();
-
-            let backend_label = match mode {
-                QueryMode::Global => "graphrag-lightrag-global",
-                QueryMode::Hybrid => "graphrag-lightrag-hybrid",
-                QueryMode::Mix => "graphrag-lightrag-mix",
-                QueryMode::HippoRag => "graphrag-hipporag-ppr",
-                _ => "graphrag-lightrag",
-            };
-
-            let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
-                query: body.query.clone(),
-                mode: mode.as_str().to_string(),
-                results: vector_results,
-                answer: Some(explained.answer.clone()),
-                confidence: Some(explained.confidence),
-                key_entities: Some(explained.key_entities.clone()),
-                reasoning_steps: Some(reasoning_steps),
-                sources: Some(sources),
-                processing_time_ms: processing_time,
-                rerank_ms,
-                backend: backend_label.to_string(),
-            }))
-        },
         // ── Card 3: HippoRAG PPR dispatch ─────────────────────────────────────
         //
         // Pipeline (mirrors the graphrag-core doc comment on ask_with_hipporag):
@@ -1558,7 +1251,7 @@ async fn graph_aware_query(
         //   4. Fetch chunk text from Qdrant for those ids.
         //   5. Call GraphRAG::ask_with_hipporag() with the assembled context.
         //   6. Return the ExplainedAnswer in the same QueryResponse shape as
-        //      the local-search and dual-seeds arms above.
+        //      the search arm.
         //
         // If Qdrant is unavailable the adapter returns empty results and the
         // retriever degrades gracefully (PPR runs with an empty seed distribution
@@ -1606,7 +1299,37 @@ async fn graph_aware_query(
                     let ppr_cached = state.ppr_cache.load_full();
                     let ppr_override = ppr_cached.as_ref().map(std::sync::Arc::clone);
 
-                    let ppr_chunk_ids: Vec<graphrag_core::core::ChunkId> =
+                    // Steps 3 & 4 run concurrently via tokio::join!.
+                    //
+                    // Future A — PPR retrieve(): embeds the query, searches the three Qdrant
+                    //   sidecars, and runs PPR power-iteration to rank chunk ids.
+                    //
+                    // Future B — direct dense search on the main collection: embeds the query
+                    //   independently (double-embed is acceptable; both futures run concurrently
+                    //   so there is no net additional latency vs. the old sequential approach).
+                    //
+                    // WHY a separate dense search for chunk text (see full comment below):
+                    //   RelationshipStoreAdapter routes ALL three VectorStore::search() calls
+                    //   inside retrieve() to the relationship sidecar and returns synthetic
+                    //   "rel-N" IDs. fetch_chunks_by_ids() against the main collection never
+                    //   matches those, so chunk_contents would always be empty. The fix is to
+                    //   run a direct dense search here to obtain real Qdrant point IDs.
+                    //
+                    // FIX: bypass the broken PPR chunk-ID output for the text-fetch step.
+                    //   Run a direct dense search on the main collection (the same operation
+                    //   the dense-search step above).  This yields real Qdrant point
+                    //   IDs that exist in the main collection, so fetch_chunks_by_ids() returns
+                    //   actual text.  We then pass these real IDs as the effective ppr_chunk_ids
+                    //   to ask_with_hipporag so its entity-mention walk can find entities that
+                    //   mention those chunks and populate the ENTITIES / RELATIONSHIPS / SOURCE
+                    //   TEXT blocks with real content.
+                    //
+                    //   If the direct dense search fails (Qdrant unreachable, embedding error),
+                    //   we fall back to the original ppr_chunk_ids to preserve the existing
+                    //   degraded-but-functional behaviour rather than making things worse.
+
+                    // Future A: PPR retrieve
+                    let ppr_fut = async {
                         if let Some(adapter) = &rel_store {
                             if let Some(kg) = graphrag.knowledge_graph() {
                                 retriever
@@ -1618,80 +1341,65 @@ async fn graph_aware_query(
                             }
                         } else {
                             Vec::new()
-                        };
+                        }
+                    };
 
-                    // Step 4 — fetch chunk text via direct dense search.
-                    //
-                    // WHY we do NOT use ppr_chunk_ids here:
-                    //   RelationshipStoreAdapter::search() (lines above) routes ALL THREE
-                    //   VectorStore::search() calls in HippoRAGRetriever::retrieve() to the
-                    //   relationship sidecar collection and returns synthetic "rel-N" IDs.
-                    //   The third call (dense chunk pass → passage_scores) should return real
-                    //   chunk point IDs from the main collection, but the single-backend adapter
-                    //   cannot distinguish the three calls — it always returns "rel-0", "rel-1",
-                    //   etc.  Feeding those synthetic IDs into fetch_chunks_by_ids() against the
-                    //   main collection returns zero matches, leaving chunk_contents empty and
-                    //   causing ask_with_hipporag to emit the "no information" refusal every time.
-                    //
-                    // FIX: bypass the broken PPR chunk-ID output for the text-fetch step.
-                    //   Run a direct dense search on the main collection (the same operation
-                    //   Mix mode performs at line ~1419 above).  This yields real Qdrant point
-                    //   IDs that exist in the main collection, so fetch_chunks_by_ids() returns
-                    //   actual text.  We then pass these real IDs as the effective ppr_chunk_ids
-                    //   to ask_with_hipporag so its entity-mention walk can find entities that
-                    //   mention those chunks and populate the ENTITIES / RELATIONSHIPS / SOURCE
-                    //   TEXT blocks with real content.
-                    //
-                    //   If the direct dense search fails (Qdrant unreachable, embedding error),
-                    //   we fall back to the original ppr_chunk_ids to preserve the existing
-                    //   degraded-but-functional behaviour rather than making things worse.
-                    let mut chunk_contents: std::collections::HashMap<
-                        graphrag_core::core::ChunkId,
-                        String,
-                    > = std::collections::HashMap::new();
-                    let mut dense_chunk_ids: Vec<graphrag_core::core::ChunkId> = Vec::new();
+                    // Future B: direct dense search for real chunk IDs and text
+                    let dense_fut = async {
+                        let mut chunk_contents: std::collections::HashMap<
+                            graphrag_core::core::ChunkId,
+                            String,
+                        > = std::collections::HashMap::new();
+                        let mut dense_chunk_ids: Vec<graphrag_core::core::ChunkId> = Vec::new();
 
-                    if let Some(qdrant) = state.qdrant.as_ref() {
-                        match embedder_snap.embed(&body.query).await {
-                            Ok(query_emb) => {
-                                match version_aware_search(
-                                    qdrant.as_ref(),
-                                    query_emb,
-                                    body.top_k.max(10),
-                                    &vfilter,
-                                )
-                                .await
-                                {
-                                    Ok(hits) => {
-                                        for hit in &hits {
-                                            chunk_contents.insert(
-                                                graphrag_core::core::ChunkId::new(hit.id.clone()),
-                                                hit.metadata.text.clone(),
+                        if let Some(qdrant) = state.qdrant.as_ref() {
+                            match embedder_snap.embed(&body.query).await {
+                                Ok(query_emb) => {
+                                    match version_aware_search(
+                                        qdrant.as_ref(),
+                                        query_emb,
+                                        body.top_k.max(10),
+                                        &vfilter,
+                                    )
+                                    .await
+                                    {
+                                        Ok(hits) => {
+                                            for hit in &hits {
+                                                chunk_contents.insert(
+                                                    graphrag_core::core::ChunkId::new(hit.id.clone()),
+                                                    hit.metadata.text.clone(),
+                                                );
+                                            }
+                                            dense_chunk_ids = hits
+                                                .into_iter()
+                                                .map(|h| graphrag_core::core::ChunkId::new(h.id))
+                                                .collect();
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "hipporag direct dense search failed; \
+                                                 falling back to PPR chunk ids (chunk_contents may be empty)"
                                             );
                                         }
-                                        dense_chunk_ids = hits
-                                            .into_iter()
-                                            .map(|h| graphrag_core::core::ChunkId::new(h.id))
-                                            .collect();
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "hipporag direct dense search failed; \
-                                             falling back to PPR chunk ids (chunk_contents may be empty)"
-                                        );
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "hipporag query embedding failed; \
-                                     falling back to PPR chunk ids (chunk_contents may be empty)"
-                                );
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "hipporag query embedding failed; \
+                                         falling back to PPR chunk ids (chunk_contents may be empty)"
+                                    );
+                                }
                             }
                         }
-                    }
+
+                        (chunk_contents, dense_chunk_ids)
+                    };
+
+                    // Fire both futures concurrently.
+                    let (ppr_chunk_ids, (chunk_contents, dense_chunk_ids)) =
+                        tokio::join!(ppr_fut, dense_fut);
 
                     // Prefer real dense-search chunk IDs; fall back to PPR output only when
                     // the dense search failed (so we don't regress on the degraded path).
