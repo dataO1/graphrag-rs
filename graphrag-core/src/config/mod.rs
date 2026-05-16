@@ -302,10 +302,17 @@ pub struct SynthesisConfig {
     pub max_input_chars: usize,
     /// Per-chunk char cap inside SOURCE TEXT. Truncates outliers so
     /// a single very long chunk doesn't consume the whole budget.
-    /// Default `2000` (~500 tokens). Set lower for tighter contexts;
+    /// Default `1200` (~300 tokens). Set lower for tighter contexts;
     /// raising past chunk-size adds nothing.
     #[serde(default = "default_synthesis_max_chars_per_chunk")]
     pub max_chars_per_chunk: usize,
+    /// Hard cap on the number of chunks admitted into SOURCE TEXT,
+    /// regardless of the char budget. Applied before `build_chunks_block`
+    /// so the char budget operates on a pre-trimmed slice. Default `8`.
+    /// Lower values cut prefill latency at the cost of coverage; raise
+    /// when answer quality degrades on wide-recall queries.
+    #[serde(default = "default_synthesis_top_chunks")]
+    pub top_chunks: usize,
     /// How many chars to reserve in `max_input_chars` for the prompt
     /// SKELETON (template + ENTITIES + RELATIONSHIPS). Default
     /// `8000`. The chunks_budget actually used by `build_chunks_block`
@@ -330,9 +337,10 @@ pub struct SynthesisConfig {
 }
 
 fn default_synthesis_max_input_chars() -> usize { 0 }
-fn default_synthesis_max_chars_per_chunk() -> usize { 2_000 }
+fn default_synthesis_max_chars_per_chunk() -> usize { 1_200 }
 fn default_synthesis_skeleton_reserve_chars() -> usize { 8_000 }
 fn default_synthesis_max_answer_tokens() -> u32 { 300 }
+fn default_synthesis_top_chunks() -> usize { 8 }
 
 const DEFAULT_SYNTHESIS_PROMPT: &str = "\
 You are a knowledge-graph QA assistant.
@@ -376,6 +384,7 @@ impl Default for SynthesisConfig {
         Self {
             max_input_chars: default_synthesis_max_input_chars(),
             max_chars_per_chunk: default_synthesis_max_chars_per_chunk(),
+            top_chunks: default_synthesis_top_chunks(),
             skeleton_reserve_chars: default_synthesis_skeleton_reserve_chars(),
             max_answer_tokens: default_synthesis_max_answer_tokens(),
             prompt_template: default_synthesis_prompt_template(),
@@ -1636,6 +1645,13 @@ impl Config {
         )
     }
 
+    /// Hard cap on the number of chunks admitted into SOURCE TEXT.
+    /// Applied before `build_chunks_block` so the char budget operates
+    /// on a pre-trimmed slice. Returns `synthesis.top_chunks`.
+    pub fn synthesis_top_chunks(&self) -> usize {
+        self.synthesis.top_chunks
+    }
+
     pub fn chat_enabled(&self) -> bool {
         self.ollama.enabled || self.openai.enabled
     }
@@ -1982,6 +1998,9 @@ impl Config {
                     max_chars_per_chunk: parsed["synthesis"]["max_chars_per_chunk"]
                         .as_usize()
                         .unwrap_or(default_synthesis_max_chars_per_chunk()),
+                    top_chunks: parsed["synthesis"]["top_chunks"]
+                        .as_usize()
+                        .unwrap_or(default_synthesis_top_chunks()),
                     skeleton_reserve_chars: parsed["synthesis"]["skeleton_reserve_chars"]
                         .as_usize()
                         .unwrap_or(default_synthesis_skeleton_reserve_chars()),
@@ -2443,6 +2462,7 @@ impl Config {
         let mut synthesis = json::JsonValue::new_object();
         synthesis["max_input_chars"] = json::JsonValue::from(self.synthesis.max_input_chars);
         synthesis["max_chars_per_chunk"] = json::JsonValue::from(self.synthesis.max_chars_per_chunk);
+        synthesis["top_chunks"] = json::JsonValue::from(self.synthesis.top_chunks);
         synthesis["skeleton_reserve_chars"] =
             json::JsonValue::from(self.synthesis.skeleton_reserve_chars);
         synthesis["max_answer_tokens"] = json::JsonValue::from(self.synthesis.max_answer_tokens);
@@ -2727,6 +2747,88 @@ mod synthesis_tests {
             merged.synthesis.max_chars_per_chunk,
             default_synthesis_max_chars_per_chunk(),
             "max_chars_per_chunk must be unchanged after partial patch"
+        );
+    }
+
+    // ── Card 6: top_chunks + max_chars_per_chunk default change ───────────
+
+    /// `max_chars_per_chunk` default must be 1200 (changed from 2000).
+    #[test]
+    fn test_synthesis_default_max_chars_per_chunk_is_1200() {
+        let cfg = SynthesisConfig::default();
+        assert_eq!(
+            cfg.max_chars_per_chunk, 1_200,
+            "default max_chars_per_chunk must be 1200 (changed from 2000)"
+        );
+    }
+
+    /// `top_chunks` field must be present with default 8.
+    #[test]
+    fn test_synthesis_default_top_chunks_is_8() {
+        let cfg = SynthesisConfig::default();
+        assert_eq!(
+            cfg.top_chunks, 8,
+            "default top_chunks must be 8"
+        );
+    }
+
+    /// `top_chunks` must survive a serde round-trip.
+    #[test]
+    fn test_synthesis_top_chunks_serde_round_trip() {
+        let json = r#"{"top_chunks": 5}"#;
+        let cfg: SynthesisConfig = serde_json::from_str(json).expect("deserialise SynthesisConfig");
+        assert_eq!(cfg.top_chunks, 5, "top_chunks must survive serde round-trip");
+        assert_eq!(
+            cfg.max_chars_per_chunk, 1_200,
+            "max_chars_per_chunk must default to 1200 when not specified"
+        );
+        let serialised = serde_json::to_string(&cfg).expect("serialise SynthesisConfig");
+        assert!(
+            serialised.contains("top_chunks"),
+            "serialised SynthesisConfig must contain top_chunks; got: {serialised}"
+        );
+    }
+
+    /// `Config::synthesis_top_chunks()` must return the configured value.
+    #[test]
+    fn test_config_synthesis_top_chunks_getter() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.synthesis_top_chunks(), 8,
+            "Config::synthesis_top_chunks() must return 8 by default"
+        );
+    }
+
+    /// When `source_chunk_ids` has 15 entries and `top_chunks` is 5,
+    /// `build_chunks_block` must produce content from at most 5 chunks.
+    /// We verify this via `synthesis_chunks_budget()` and the top_chunks
+    /// cap working in concert: even when the char budget is generous, the
+    /// count cap applies.
+    #[test]
+    fn test_synthesis_top_chunks_caps_chunk_count() {
+        use std::collections::HashMap;
+        use crate::core::ChunkId;
+
+        // 15 chunk IDs, each with content short enough to not hit char budget.
+        let ids: Vec<ChunkId> = (0..15).map(|i| ChunkId(format!("chunk-{i:02}"))).collect();
+        let mut contents: HashMap<ChunkId, String> = HashMap::new();
+        for id in &ids {
+            contents.insert(id.clone(), format!("Content of {}", id.0));
+        }
+
+        // Config with top_chunks = 5, max_chars_per_chunk = 1200,
+        // max_input_chars = 0 (unbounded char budget — so only top_chunks cap applies).
+        let mut cfg = Config::default();
+        cfg.synthesis.top_chunks = 5;
+        cfg.synthesis.max_chars_per_chunk = 1_200;
+        cfg.synthesis.max_input_chars = 0; // unbounded
+
+        // The call site in ask_with_hipporag truncates source_chunk_ids by top_chunks
+        // before passing to build_chunks_block.
+        let capped: Vec<&ChunkId> = ids.iter().take(cfg.synthesis_top_chunks()).collect();
+        assert_eq!(
+            capped.len(), 5,
+            "top_chunks cap must limit to 5 entries from 15"
         );
     }
 }

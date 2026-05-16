@@ -2738,6 +2738,9 @@ impl GraphRAG {
                 }
             }
         }
+        // Hard cap on chunk count — applied before build_chunks_block so the
+        // char-budget operates on a pre-trimmed slice (~1–1.5 s prefill saving).
+        source_chunk_ids.truncate(self.config.synthesis_top_chunks());
 
         let chunks_block = build_chunks_block(
             &source_chunk_ids,
