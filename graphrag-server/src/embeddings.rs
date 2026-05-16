@@ -726,7 +726,7 @@ impl EmbeddingService {
         if let Some(client) = &self.query_openai_client {
             if client.base_url != self.openai_client.as_ref().map(|c| c.base_url.as_str()).unwrap_or("") {
                 let embeddings = self
-                    .generate_with_openai(&client.http, &client.base_url, &client.model, &client.api_key, &[text])
+                    .generate_with_openai(client, &[text])
                     .await?;
                 return embeddings
                     .into_iter()
