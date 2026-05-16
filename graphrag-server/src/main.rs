@@ -1238,11 +1238,12 @@ async fn graph_aware_query(
         }
     };
 
-    // Phase H: optionally rerank the vector hits before they go into
-    // the synthesis prompt and the response. Reordering happens in
-    // place; on failure, the original ordering is preserved.
-    let mut vector_results = vector_results;
-    let rerank_ms = maybe_rerank(state, &body.query, &mut vector_results).await;
+    // Card 5: reranker intentionally omitted here. For HippoRAG mode the
+    // PPR graph signal supersedes cross-encoder rerank (literature consensus:
+    // HippoRAG / GraphRAG / PathRAG / G-RAG all omit rerank after graph
+    // retrieval). Reranking after PPR yields no quality improvement and costs
+    // 1–3 s per query. Search mode retains its reranker (see the `query`
+    // handler, ~line 966). `rerank_ms` is set to None in the HippoRAG response.
 
     // Stale-context: lease the vector hits for this session so the
     // SSE stream can scope events. graphrag_aware_query may take
@@ -1465,7 +1466,9 @@ async fn graph_aware_query(
                 reasoning_steps: Some(reasoning_steps),
                 sources: Some(sources),
                 processing_time_ms: processing_time,
-                rerank_ms,
+                // Card 5: HippoRAG uses graph/PPR signal; cross-encoder rerank
+                // is skipped. `rerank_ms` is always None for this mode.
+                rerank_ms: None,
                 backend: "graphrag-hipporag-ppr".to_string(),
             }))
         },
@@ -4286,6 +4289,164 @@ mod card4_tests {
         todo!(
             "Inject a counting DynEmbedder into AppState, POST /api/query with mode=hipporag, \
              assert embed_query was called exactly once across the full request lifecycle."
+        );
+    }
+}
+
+// ── Card 5: drop reranker for HippoRAG mode ──────────────────────────────────
+//
+// Graph signal supersedes cross-encoder rerank for multi-hop recall.
+// HippoRAG / GraphRAG / PathRAG / G-RAG literature consensus: reranking
+// after PPR yields no improvement and costs 1-3s per query.
+//
+// Search mode retains `maybe_rerank` — the reranker is still exercised for
+// pure vector-search paths where there is no graph signal.
+//
+// Acceptance-criteria tests:
+//   1. Static-analysis test: verify that `graph_aware_query` does NOT call
+//      `maybe_rerank` in the pre-dispatch block (the block between the
+//      vector-results build and `match mode {`). This gives a compile-time
+//      proof without requiring a trait-object reranker in AppState.
+//   2. Structural test: `rerank_ms` in the HippoRAG response arm is set to
+//      `None` (literal), not the return value of `maybe_rerank(…)`.
+//
+// A full E2E counting-reranker test would require a trait-object slot for
+// AppState::reranker. Marked #[ignore] with manual-run instructions below.
+//
+// Run static-analysis tests:
+//   cargo test -p graphrag-server --features 'qdrant,openai' --bins card5_tests
+#[cfg(test)]
+mod card5_tests {
+    // ── Static test 1: graph_aware_query body omits maybe_rerank ───────────────
+    //
+    // Uses include_str! to read the source at compile time. Scans the entire
+    // body of `graph_aware_query` (from the function signature to the closing
+    // brace just before `maybe_rerank`'s own definition) and asserts that
+    // `maybe_rerank` does not appear there.
+    //
+    // Boundary strategy: the function begins with the unique string
+    // `"async fn graph_aware_query("`. The function ends with the closing brace
+    // just before the doc-comment for `maybe_rerank` itself
+    // (`"/// Phase H: optional cross-encoder rerank."`). We scan between these
+    // two anchors — a region that includes the pre-dispatch block AND the
+    // HippoRAG arm but excludes the `maybe_rerank` definition.
+    //
+    // This test is RED before the Card 5 implementation (the pre-dispatch block
+    // contains a `maybe_rerank(...)` call) and GREEN after (call removed).
+    #[test]
+    fn test_hipporag_arm_does_not_reference_maybe_rerank() {
+        let src = include_str!("main.rs");
+
+        // ── Locate graph_aware_query body ────────────────────────────────────
+        let fn_start_marker = "async fn graph_aware_query(";
+        let fn_end_marker = "/// Phase H: optional cross-encoder rerank.";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn graph_aware_query(' function definition");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect(
+                "source must contain '/// Phase H: optional cross-encoder rerank.' \
+                 doc-comment after graph_aware_query",
+            )
+            + fn_start;
+
+        let graph_aware_body = &src[fn_start..fn_end];
+
+        // ── A: pre-dispatch block ────────────────────────────────────────────
+        // Confirm the region from the function start to `match mode {` is free
+        // of `maybe_rerank`. After Card 5, the call must have been removed.
+        let match_mode_marker = "match mode {";
+        let match_mode_pos = graph_aware_body
+            .find(match_mode_marker)
+            .expect("graph_aware_query body must contain 'match mode {'");
+
+        let pre_dispatch_block = &graph_aware_body[..match_mode_pos];
+
+        assert!(
+            !pre_dispatch_block.contains("maybe_rerank"),
+            "Card 5: graph_aware_query pre-dispatch block must NOT call maybe_rerank.\n\
+             Found 'maybe_rerank' between the function start and 'match mode {{'.\n\
+             Remove the pre-dispatch reranker call (Option A implemented)."
+        );
+
+        // ── B: HippoRAG arm ─────────────────────────────────────────────────
+        let hipporag_arm_marker = "QueryMode::HippoRag => {";
+        let search_arm_marker = "QueryMode::Search => unreachable!";
+
+        let hipporag_arm_pos = graph_aware_body
+            .find(hipporag_arm_marker)
+            .expect("graph_aware_query body must contain 'QueryMode::HippoRag => {' match arm");
+        let search_arm_pos = graph_aware_body[hipporag_arm_pos..]
+            .find(search_arm_marker)
+            .expect(
+                "graph_aware_query body must contain 'QueryMode::Search => unreachable!' \
+                 after HippoRag arm",
+            )
+            + hipporag_arm_pos;
+
+        let hipporag_arm = &graph_aware_body[hipporag_arm_pos..search_arm_pos];
+
+        assert!(
+            !hipporag_arm.contains("maybe_rerank"),
+            "Card 5: QueryMode::HippoRag arm must NOT contain a call to maybe_rerank.\n\
+             Found 'maybe_rerank' inside the HippoRag match arm — remove it."
+        );
+    }
+
+    // ── Static test 2: rerank_ms in HippoRAG response arm is None ───────────
+    //
+    // Confirms the HippoRAG QueryResponse builder passes `rerank_ms: None`
+    // (a literal None), not the return value of maybe_rerank(…).
+    //
+    // Strategy: extract the HippoRAG arm text and assert it contains
+    // `rerank_ms: None` within the response builder.
+    #[test]
+    fn test_hipporag_response_has_rerank_ms_none() {
+        let src = include_str!("main.rs");
+
+        let hipporag_arm_marker = "QueryMode::HippoRag => {";
+        let search_arm_marker = "QueryMode::Search => unreachable!";
+
+        let hipporag_arm_pos = src
+            .find(hipporag_arm_marker)
+            .expect("source must contain 'QueryMode::HippoRag => {' match arm");
+        let search_arm_pos = src[hipporag_arm_pos..]
+            .find(search_arm_marker)
+            .expect("source must contain 'QueryMode::Search => unreachable!' after HippoRag arm")
+            + hipporag_arm_pos;
+
+        let hipporag_arm = &src[hipporag_arm_pos..search_arm_pos];
+
+        assert!(
+            hipporag_arm.contains("rerank_ms: None"),
+            "Card 5: QueryMode::HippoRag response builder must set 'rerank_ms: None'.\n\
+             Currently it passes the return value of maybe_rerank — fix by setting None directly."
+        );
+    }
+
+    // ── E2E placeholder: counting reranker for HippoRAG vs Search ────────────
+    //
+    // This test requires a trait-object slot for AppState::reranker so a
+    // counting mock can be injected. Currently AppState holds a concrete
+    // arc_swap::ArcSwap<Option<RerankerService>>.
+    //
+    // Manual verification path:
+    //   1. Add a DynReranker trait-object slot to AppState (future card).
+    //   2. Implement a CountingReranker mock that atomically counts rerank() calls.
+    //   3. POST /api/query mode=hipporag → assert counter == 0.
+    //   4. POST /api/query mode=search   → assert counter >= 1.
+    //
+    // Run when ready:
+    //   cargo test -p graphrag-server card5_tests::test_rerank_skipped_for_hipporag_mode -- --ignored
+    #[tokio::test]
+    #[ignore = "requires trait-object reranker slot in AppState + live Qdrant; use static-analysis tests above as proxy"]
+    async fn test_rerank_skipped_for_hipporag_mode() {
+        todo!(
+            "Inject a CountingReranker mock into AppState, \
+             POST /api/query with mode=hipporag (assert counter==0), \
+             POST /api/query with mode=search (assert counter>=1)."
         );
     }
 }
