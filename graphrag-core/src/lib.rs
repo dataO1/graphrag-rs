@@ -3084,7 +3084,7 @@ mod card2_tests {
             ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
 
         let result = retriever
-            .retrieve("Who does Alice know?", &graph, &store, &embedder, None)
+            .retrieve("Who does Alice know?", &graph, &store, &embedder, None, None)
             .await
             .expect("retrieve() must not error on valid fixture");
 
@@ -3133,7 +3133,7 @@ mod card2_tests {
             ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
 
         let result = retriever
-            .retrieve("Alice", &graph, &store, &embedder, None)
+            .retrieve("Alice", &graph, &store, &embedder, None, None)
             .await;
 
         assert!(result.is_ok(), "retrieve() must not error with zero dense hits");
@@ -3374,7 +3374,7 @@ mod card3_regression_tests {
         let retriever = HippoRAGRetriever::new(hipporag_config);
 
         let ppr_chunk_ids = retriever
-            .retrieve("Who does Alice know?", &graph, &store, embedder.as_ref(), None)
+            .retrieve("Who does Alice know?", &graph, &store, embedder.as_ref(), None, None)
             .await
             .expect("retrieve() must succeed");
 
@@ -3872,7 +3872,7 @@ mod card8_tests {
         let retriever = HippoRAGRetriever::new(hipporag_config);
 
         let ppr_chunk_ids = retriever
-            .retrieve("Who does Alice know?", &kg, &store, embedder.as_ref(), None)
+            .retrieve("Who does Alice know?", &kg, &store, embedder.as_ref(), None, None)
             .await
             .expect("retrieve() must succeed");
 

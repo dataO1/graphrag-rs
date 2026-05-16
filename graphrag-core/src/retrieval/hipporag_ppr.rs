@@ -193,9 +193,14 @@ impl HippoRAGRetriever {
         vector_store: &dyn VectorStore,
         embedder: &dyn crate::core::traits::AsyncEmbedder<Error = GraphRAGError>,
         ppr_override: Option<std::sync::Arc<crate::graph::pagerank::PersonalizedPageRank>>,
+        pre_embedded: Option<&[f32]>,
     ) -> Result<Vec<ChunkId>> {
-        // Step 1: Embed query via the dedicated query backend (NPU when configured).
-        let query_vec = embedder.embed_query(query).await?;
+        // Step 1: Embed query via the dedicated query backend (NPU when configured),
+        // or use the caller-supplied pre-computed embedding to skip the embed call.
+        let query_vec = match pre_embedded {
+            Some(v) => v.to_vec(),
+            None => embedder.embed_query(query).await?,
+        };
 
         // Steps 2, 3, 5 (search phase): fire all three vector-store searches concurrently.
         //
@@ -622,6 +627,39 @@ mod tests {
         vec: Vec<f32>,
     }
 
+    /// A counting embedder: returns a fixed vector AND tracks how many times
+    /// `embed_query` was called. Used by `test_retrieve_with_pre_embedded_skips_embed`.
+    struct CountingEmbedder {
+        vec: Vec<f32>,
+        embed_query_calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl AsyncEmbedder for CountingEmbedder {
+        type Error = GraphRAGError;
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(self.vec.clone())
+        }
+
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            *self.embed_query_calls.lock().unwrap() += 1;
+            Ok(self.vec.clone())
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.vec.clone()).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            self.vec.len()
+        }
+
+        async fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
     #[async_trait]
     impl AsyncEmbedder for ConstEmbedder {
         type Error = GraphRAGError;
@@ -793,7 +831,7 @@ mod tests {
 
         let store = ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
         let result = retriever
-            .retrieve("alice journal entry", &graph, &store, &embedder, None)
+            .retrieve("alice journal entry", &graph, &store, &embedder, None, None)
             .await
             .unwrap();
 
@@ -844,7 +882,7 @@ mod tests {
             ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
 
         let result = retriever
-            .retrieve("alice", &graph, &store, &embedder, None)
+            .retrieve("alice", &graph, &store, &embedder, None, None)
             .await;
 
         // Must not panic or return Err
@@ -936,7 +974,7 @@ mod tests {
 
         // --- None-path: retrieve() calls build_pagerank_calculator() internally ---
         let result_none = retriever
-            .retrieve("alice knows bob", &kg, &make_store(), &embedder, None)
+            .retrieve("alice knows bob", &kg, &make_store(), &embedder, None, None)
             .await;
         assert!(
             result_none.is_ok(),
@@ -954,6 +992,7 @@ mod tests {
                 &make_store(),
                 &embedder,
                 Some(std::sync::Arc::clone(&ppr_arc)),
+                None,
             )
             .await;
         assert!(
@@ -1008,7 +1047,7 @@ mod tests {
         // Call with ppr_override = None — must not panic.
         // Result may be Ok or Err; both are acceptable. Panic is not.
         let result = retriever
-            .retrieve("alice", &kg, &store, &embedder, None)
+            .retrieve("alice", &kg, &store, &embedder, None, None)
             .await;
 
         // Just verify no panic occurred (if Err, that is also acceptable).
@@ -1060,7 +1099,7 @@ mod tests {
 
         let store = ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
         let result = retriever
-            .retrieve("alice", &graph, &store, &embedder, None)
+            .retrieve("alice", &graph, &store, &embedder, None, None)
             .await
             .unwrap();
 
@@ -1157,6 +1196,137 @@ mod tests {
         assert!(
             doc1_weight > doc2_weight,
             "Higher score should have higher weight"
+        );
+    }
+
+    // ========================================================================
+    // Card 4 tests: pre_embedded parameter — TDD failing tests written first
+    // ========================================================================
+
+    /// Test that `retrieve()` does NOT call `embed_query` when `pre_embedded` is `Some`.
+    ///
+    /// Acceptance criterion (Card 4): passing a pre-computed embedding vector
+    /// through `pre_embedded` must skip the internal `embedder.embed_query(query)` call,
+    /// reducing HippoRAG query embed count from 3 to 1.
+    #[tokio::test]
+    async fn test_retrieve_with_pre_embedded_skips_embed() {
+        let graph = build_test_graph();
+        let config = HippoRAGConfig {
+            top_k_results: 2,
+            top_k_dense: 30,
+            normalize_scores: false,
+            ..Default::default()
+        };
+        let retriever = HippoRAGRetriever::new(config);
+
+        let call_count = Arc::new(Mutex::new(0usize));
+        let embedder = CountingEmbedder {
+            vec: vec![1.0, 0.0],
+            embed_query_calls: Arc::clone(&call_count),
+        };
+
+        // Pre-embedded vector — what `embed_query` would have returned.
+        let pre_vec: Vec<f32> = vec![1.0, 0.0];
+
+        // Dense hits: chunk-journal scores high so rank_passages has something to return.
+        let entity_hits = vec![VsSearchResult {
+            id: "alice".to_string(),
+            score: 0.95,
+            metadata: HashMap::new(),
+        }];
+        let mut rel_meta = HashMap::new();
+        rel_meta.insert("source".to_string(), "alice".to_string());
+        rel_meta.insert("relation_type".to_string(), "KNOWS".to_string());
+        rel_meta.insert("target".to_string(), "bob".to_string());
+        let relation_hits = vec![VsSearchResult {
+            id: "rel-1".to_string(),
+            score: 0.85,
+            metadata: rel_meta,
+        }];
+        let dense_hits = vec![VsSearchResult {
+            id: "chunk-journal".to_string(),
+            score: 0.92,
+            metadata: HashMap::new(),
+        }];
+
+        let store = ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
+
+        let result = retriever
+            .retrieve(
+                "alice journal entry",
+                &graph,
+                &store,
+                &embedder,
+                None,
+                Some(&pre_vec),
+            )
+            .await
+            .unwrap();
+
+        // embed_query must NOT have been called — the pre_embedded vector was used instead.
+        let calls = *call_count.lock().unwrap();
+        assert_eq!(
+            calls, 0,
+            "embed_query must be called 0 times when pre_embedded=Some; got {calls}"
+        );
+
+        // Result must be non-empty (pre_vec was used for the search vector).
+        assert!(
+            !result.is_empty(),
+            "retrieve() must return at least one ChunkId when pre_embedded=Some"
+        );
+    }
+
+    /// Test that `retrieve()` calls `embed_query` exactly once when `pre_embedded` is `None`.
+    ///
+    /// Regression guard: the `None` path must still embed the query internally.
+    #[tokio::test]
+    async fn test_retrieve_with_no_pre_embedded_calls_embed_query_once() {
+        let graph = build_test_graph();
+        let config = HippoRAGConfig {
+            top_k_results: 2,
+            top_k_dense: 30,
+            normalize_scores: false,
+            ..Default::default()
+        };
+        let retriever = HippoRAGRetriever::new(config);
+
+        let call_count = Arc::new(Mutex::new(0usize));
+        let embedder = CountingEmbedder {
+            vec: vec![1.0, 0.0],
+            embed_query_calls: Arc::clone(&call_count),
+        };
+
+        let entity_hits = vec![VsSearchResult {
+            id: "alice".to_string(),
+            score: 0.9,
+            metadata: HashMap::new(),
+        }];
+        let relation_hits: Vec<VsSearchResult> = vec![];
+        let dense_hits = vec![VsSearchResult {
+            id: "chunk-journal".to_string(),
+            score: 0.8,
+            metadata: HashMap::new(),
+        }];
+
+        let store = ScriptedVectorStore::new(vec![entity_hits, relation_hits, dense_hits]);
+
+        let _ = retriever
+            .retrieve(
+                "alice",
+                &graph,
+                &store,
+                &embedder,
+                None,
+                None,
+            )
+            .await;
+
+        // embed_query must have been called exactly once when pre_embedded=None.
+        let calls = *call_count.lock().unwrap();
+        assert_eq!(
+            calls, 1,
+            "embed_query must be called exactly 1 time when pre_embedded=None; got {calls}"
         );
     }
 
