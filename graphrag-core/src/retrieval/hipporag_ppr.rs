@@ -194,8 +194,8 @@ impl HippoRAGRetriever {
         embedder: &dyn crate::core::traits::AsyncEmbedder<Error = GraphRAGError>,
         ppr_override: Option<std::sync::Arc<crate::graph::pagerank::PersonalizedPageRank>>,
     ) -> Result<Vec<ChunkId>> {
-        // Step 1: Embed query
-        let query_vec = embedder.embed(query).await?;
+        // Step 1: Embed query via the dedicated query backend (NPU when configured).
+        let query_vec = embedder.embed_query(query).await?;
 
         // Steps 2, 3, 5 (search phase): fire all three vector-store searches concurrently.
         //

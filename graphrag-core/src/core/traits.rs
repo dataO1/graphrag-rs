@@ -148,6 +148,14 @@ pub trait AsyncEmbedder: Send + Sync {
     /// Generate embeddings for a single text
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
+    /// Generate embeddings for a user query. Defaults to `embed`; override
+    /// on implementations that have a dedicated low-latency query backend
+    /// (e.g. NPU-side OVMS at :9001) distinct from the bulk extraction
+    /// backend used by `embed`.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text).await
+    }
+
     /// Generate embeddings for multiple texts in batch
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
@@ -1467,3 +1475,92 @@ pub type BoxedAsyncRetriever = Box<
         > + Send
         + Sync,
 >;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::GraphRAGError;
+
+    /// Minimal embedder that only overrides `embed` and relies on the
+    /// default `embed_query` delegation.
+    struct EmbedOnlyEmbedder {
+        value: f32,
+    }
+
+    #[async_trait]
+    impl AsyncEmbedder for EmbedOnlyEmbedder {
+        type Error = GraphRAGError;
+
+        async fn embed(&self, _text: &str) -> crate::Result<Vec<f32>> {
+            Ok(vec![self.value])
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> crate::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![self.value]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            1
+        }
+
+        async fn is_ready(&self) -> bool {
+            true
+        }
+        // NOTE: `embed_query` is intentionally NOT overridden — we test the default impl.
+    }
+
+    /// Embedder that overrides both `embed` and `embed_query` to return
+    /// distinguishable vectors, confirming the override path works.
+    struct SplitEmbedder;
+
+    #[async_trait]
+    impl AsyncEmbedder for SplitEmbedder {
+        type Error = GraphRAGError;
+
+        async fn embed(&self, _text: &str) -> crate::Result<Vec<f32>> {
+            Ok(vec![0.0])
+        }
+
+        async fn embed_query(&self, _text: &str) -> crate::Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+
+        async fn embed_batch(&self, texts: &[&str]) -> crate::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            1
+        }
+
+        async fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// `embed_query` default impl delegates to `embed` when not overridden.
+    #[tokio::test]
+    async fn test_embed_query_defaults_to_embed() {
+        let embedder = EmbedOnlyEmbedder { value: 0.42 };
+        let via_embed = embedder.embed("hello").await.unwrap();
+        let via_query = embedder.embed_query("hello").await.unwrap();
+        assert_eq!(
+            via_embed, via_query,
+            "embed_query default should delegate to embed and return identical results"
+        );
+    }
+
+    /// When `embed_query` is overridden, the override is used (not the default).
+    #[tokio::test]
+    async fn test_embed_query_override_takes_precedence() {
+        let embedder = SplitEmbedder;
+        let via_embed = embedder.embed("hello").await.unwrap();
+        let via_query = embedder.embed_query("hello").await.unwrap();
+        assert_ne!(
+            via_embed, via_query,
+            "overridden embed_query should not delegate to embed"
+        );
+        assert_eq!(via_embed, vec![0.0_f32]);
+        assert_eq!(via_query, vec![1.0_f32]);
+    }
+}

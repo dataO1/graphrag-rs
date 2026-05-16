@@ -1356,7 +1356,7 @@ async fn graph_aware_query(
                         let mut dense_chunk_ids: Vec<graphrag_core::core::ChunkId> = Vec::new();
 
                         if let Some(qdrant) = state.qdrant.as_ref() {
-                            match embedder_snap.embed(&body.query).await {
+                            match embedder_snap.embed_query(&body.query).await {
                                 Ok(query_emb) => {
                                     match version_aware_search(
                                         qdrant.as_ref(),

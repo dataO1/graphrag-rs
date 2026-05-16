@@ -128,9 +128,11 @@ impl HybridRetriever {
         self.embedder = provider;
     }
 
-    /// Embed a single text via the active embedder.
+    /// Embed a query text via the active embedder's query path. Routes to
+    /// the dedicated low-latency backend (e.g. NPU OVMS at :9001) when the
+    /// embedder has one configured; falls back to the main backend otherwise.
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        self.embedder.embed(text).await
+        self.embedder.embed_query(text).await
     }
 
     /// Initialize the hybrid retriever with a knowledge graph

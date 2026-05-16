@@ -971,6 +971,17 @@ impl graphrag_core::core::traits::AsyncEmbedder for EmbeddingService {
             })
     }
 
+    /// Route query embeddings to the dedicated query backend (NPU OVMS at
+    /// `:9001` when `config.query_api_endpoint` is set), bypassing the bulk
+    /// extraction backend (iGPU OVMS at `:9000`) used by `embed`.
+    async fn embed_query(&self, text: &str) -> graphrag_core::Result<Vec<f32>> {
+        self.generate_query_single(text)
+            .await
+            .map_err(|e| graphrag_core::core::GraphRAGError::Embedding {
+                message: format!("EmbeddingService::generate_query_single: {}", e),
+            })
+    }
+
     async fn embed_batch(&self, texts: &[&str]) -> graphrag_core::Result<Vec<Vec<f32>>> {
         self.generate(texts)
             .await
@@ -1003,6 +1014,7 @@ mod tests {
             model: None,
             fallback_to_hash: true,
             api_endpoint: None,
+            query_api_endpoint: None,
             api_key: None,
             cache_dir: None,
             batch_size: 32,
@@ -1043,5 +1055,40 @@ mod tests {
 
         // Stats should reflect the 2 hits from the second call.
         assert_eq!(service.get_stats().await.cache_hits, 2);
+    }
+
+    /// When `query_api_endpoint` is `None`, `AsyncEmbedder::embed_query` must
+    /// fall through to `generate_single` (i.e. the same hash-backend path as
+    /// `embed`). Both should return byte-identical vectors for the same input.
+    #[tokio::test]
+    async fn test_embed_query_no_query_endpoint_delegates_to_embed() {
+        use graphrag_core::core::traits::AsyncEmbedder as _;
+        let service = EmbeddingService::from_config(&hash_cfg(64)).await.unwrap();
+
+        let via_embed = service.embed("hello world").await.unwrap();
+        let via_query = service.embed_query("hello world").await.unwrap();
+
+        assert_eq!(
+            via_embed, via_query,
+            "embed_query should return the same vector as embed when query_api_endpoint is None"
+        );
+    }
+
+    /// When `query_api_endpoint` is set but `query_openai_client` is None
+    /// (because the hash backend ignores the endpoint), `embed_query` still
+    /// succeeds without panicking. This guards the code path where the
+    /// override is wired but the hash fallback is active.
+    #[tokio::test]
+    async fn test_embed_query_with_query_endpoint_set_hash_backend() {
+        use graphrag_core::core::traits::AsyncEmbedder as _;
+        let mut cfg = hash_cfg(64);
+        cfg.query_api_endpoint = Some("http://localhost:9001/v2".to_string());
+        let service = EmbeddingService::from_config(&cfg).await.unwrap();
+
+        // `query_openai_client` will be None (hash backend ignores the URL);
+        // the override must not panic and must produce a valid vector.
+        let result = service.embed_query("test query").await;
+        assert!(result.is_ok(), "embed_query should not fail with hash backend: {:?}", result);
+        assert_eq!(result.unwrap().len(), 64);
     }
 }
