@@ -138,6 +138,37 @@ impl ChatClient {
         self.gated(self.dispatch_generate_with_params(prompt, params)).await
     }
 
+    /// Same as [`Self::generate_with_params`] but merges per-call `extras`
+    /// (a JSON object) into the OpenAI request body. On the Ollama backend
+    /// `extras` is ignored — Ollama does not support arbitrary extra body
+    /// fields. Use this for vLLM-specific knobs such as `priority` that
+    /// have no Ollama equivalent.
+    pub async fn generate_with_extras(
+        &self,
+        prompt: &str,
+        params: OllamaGenerationParams,
+        extras: serde_json::Value,
+    ) -> Result<String> {
+        self.gated(self.dispatch_generate_with_extras(prompt, params, extras)).await
+    }
+
+    async fn dispatch_generate_with_extras(
+        &self,
+        prompt: &str,
+        params: OllamaGenerationParams,
+        extras: serde_json::Value,
+    ) -> Result<String> {
+        // Silence the unused-variable warning on builds without the openai feature:
+        // extras is intentionally ignored on the Ollama backend (no wire field).
+        let _ = &extras;
+        match &self.backend {
+            // Ollama has no extras mechanism — fall back to plain params.
+            Backend::Ollama(c) => c.generate_with_params(prompt, params).await,
+            #[cfg(feature = "openai")]
+            Backend::OpenAI(c) => c.generate_with_extras(prompt, params, extras).await,
+        }
+    }
+
     async fn dispatch_generate(&self, prompt: &str) -> Result<String> {
         match &self.backend {
             Backend::Ollama(c) => c.generate(prompt).await,

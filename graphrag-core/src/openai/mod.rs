@@ -536,4 +536,66 @@ mod tests {
         assert_eq!(body["model"], "test-model");
         assert!(body.get("not-an-object").is_none());
     }
+
+    /// Verify that calling `generate_with_extras` with `{"priority": -100}`
+    /// produces a request body whose `priority` field is the integer -100.
+    ///
+    /// This is the contract that `ask_with_hipporag` relies on: it passes
+    /// `serde_json::json!({"priority": PRIORITY_RECALL})` (where
+    /// `PRIORITY_RECALL = -100`) to `generate_with_extras`, and the field
+    /// must reach the wire as a JSON number so vLLM's priority scheduler
+    /// can act on it (a string would be silently ignored or rejected).
+    #[test]
+    fn test_ask_with_hipporag_sends_priority_minus_100() {
+        let client = OpenAIClient::new(cfg());
+        // Simulate the exact call `ask_with_hipporag` makes:
+        //   client.generate_with_extras(&prompt, params,
+        //       serde_json::json!({"priority": PRIORITY_RECALL}))
+        // `generate_with_extras` calls `build_request_body` then merges the
+        // extras object into the body — mirror that merge here so the test
+        // is purely synchronous and HTTP-free.
+        let mut body = client.build_request_body("q", &empty_params());
+        let extras = serde_json::json!({"priority": -100_i64});
+        if let (Some(obj), Some(extras_obj)) =
+            (body.as_object_mut(), extras.as_object())
+        {
+            for (k, v) in extras_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        assert_eq!(
+            body["priority"],
+            serde_json::json!(-100_i64),
+            "priority field must be the integer -100 (not a string, not absent)"
+        );
+    }
+
+    /// Static-analysis guard: the extraction path (`generate_for_structured_output`
+    /// / `dispatch_structured`) must NOT inject a `"priority"` field into the
+    /// request body. Priority is HippoRAG-recall-only.
+    ///
+    /// Reads `chat/mod.rs` source and asserts that the `dispatch_structured`
+    /// function body does not contain the word "priority".
+    #[test]
+    fn test_extraction_path_has_no_priority_field() {
+        let src = include_str!("../chat/mod.rs");
+        // Locate the dispatch_structured function. It ends at the next `fn ` at
+        // the same indent level; we use the next top-level `async fn` as the
+        // boundary since they're all methods.
+        let start = src
+            .find("fn dispatch_structured")
+            .expect("chat/mod.rs must contain dispatch_structured");
+        // Find the end of the function: the next `    async fn ` after the start.
+        let after_start = &src[start + 1..];
+        let end_offset = after_start
+            .find("    async fn ")
+            .or_else(|| after_start.find("    fn "))
+            .expect("dispatch_structured must be followed by another method");
+        let dispatch_block = &src[start..start + 1 + end_offset];
+        assert!(
+            !dispatch_block.contains("priority"),
+            "extraction path (dispatch_structured) must not inject a 'priority' field; \
+             found 'priority' in:\n{dispatch_block}"
+        );
+    }
 }

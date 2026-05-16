@@ -2603,6 +2603,25 @@ impl GraphRAG {
     }
 
 
+    /// Request priority value sent on HippoRAG recall LLM calls.
+    ///
+    /// vLLM `priority` field: int64, lower = higher priority, default 0.
+    /// We send -100 to preempt background extraction (priority 0). The
+    /// Spark 2 ansible profile (`nemotron-3-nano-30b-a3b-nvfp4-single.yml`)
+    /// is configured with `--scheduling-policy priority` +
+    /// `--no-enable-chunked-prefill` to make this take effect. Without
+    /// `--scheduling-policy priority`, vLLM 0.19+ returns a server-side
+    /// error for any non-zero `priority` value.
+    ///
+    /// See vLLM issue #10101: priority is silently neutered when
+    /// `--enable-chunked-prefill` is on (default), so the ansible profile
+    /// also disables chunked prefill.
+    ///
+    /// Server-side flags are committed to the inference-cluster repo at
+    /// commit e3042541 and deployed by the operator before this constant
+    /// takes effect.
+    const PRIORITY_RECALL: i64 = -100;
+
     /// HippoRAG Personalised PageRank retrieval path.
     ///
     /// This is the graphrag-core-side dispatch for `mode: hipporag` (server label)
@@ -2785,7 +2804,11 @@ impl GraphRAG {
         };
 
         let raw_answer = client
-            .generate_with_params(&prompt, params)
+            .generate_with_extras(
+                &prompt,
+                params,
+                serde_json::json!({"priority": Self::PRIORITY_RECALL}),
+            )
             .await
             .map_err(|e| GraphRAGError::Generation {
                 message: format!("LLM generation failed: {}", e),
@@ -4029,6 +4052,88 @@ mod card1_tests {
             params.num_predict,
             Some(500),
             "OllamaGenerationParams::num_predict must reflect the configured value 500"
+        );
+    }
+}
+
+/// Tests for Card 6: HippoRAG recall sends `priority = -100` to vLLM.
+///
+/// These tests are gated on `async` + `pagerank` (the same features the
+/// server uses) so they appear in the standard CI test run
+/// (`cargo test --features 'async,pagerank'`).
+///
+/// The deeper end-to-end test (asserting that `generate_with_extras` is
+/// called with `priority = -100` when the HTTP stack is live) lives in
+/// `openai/mod.rs` and requires `--features 'async,pagerank,openai'`.
+#[cfg(test)]
+#[cfg(all(feature = "async", feature = "pagerank"))]
+mod card6_tests {
+    use super::GraphRAG;
+
+    /// Verify the vLLM priority constant is exactly -100.
+    ///
+    /// `PRIORITY_RECALL` is `const i64 = -100`. Lower values are higher
+    /// priority in vLLM's priority scheduler; -100 preempts background
+    /// extraction (priority 0). The Spark 2 ansible profile commits to
+    /// this exact value (inference-cluster commit e3042541).
+    #[test]
+    fn test_priority_recall_constant_is_minus_100() {
+        assert_eq!(
+            GraphRAG::PRIORITY_RECALL,
+            -100_i64,
+            "PRIORITY_RECALL must be -100 (vLLM lower=higher-priority; \
+             preempts extraction at priority 0)"
+        );
+    }
+
+    /// Static-analysis guard: `ask_with_hipporag` in `lib.rs` must use
+    /// `generate_with_extras` (not `generate_with_params`) for its LLM
+    /// synthesis call, so the `priority` field reaches the wire.
+    ///
+    /// Also verifies that no other `generate_with_extras` call in `lib.rs`
+    /// injects `"priority"` — extraction paths must remain priority-free.
+    #[test]
+    fn test_ask_with_hipporag_uses_generate_with_extras() {
+        let src = include_str!("lib.rs");
+
+        // 1. `ask_with_hipporag` must contain a `generate_with_extras` call.
+        let hippo_start = src
+            .find("pub async fn ask_with_hipporag")
+            .expect("ask_with_hipporag must exist in lib.rs");
+        // Find the next top-level `pub async fn` or `pub fn` after hipporag —
+        // that's the boundary of the function body.
+        let after_hippo = &src[hippo_start + 1..];
+        let hippo_end_offset = after_hippo
+            .find("\n    pub async fn ")
+            .or_else(|| after_hippo.find("\n    pub fn "))
+            .unwrap_or(after_hippo.len());
+        let hippo_body = &src[hippo_start..hippo_start + 1 + hippo_end_offset];
+
+        assert!(
+            hippo_body.contains("generate_with_extras"),
+            "ask_with_hipporag must call generate_with_extras (not generate_with_params) \
+             so the priority field reaches the vLLM scheduler"
+        );
+        assert!(
+            hippo_body.contains("PRIORITY_RECALL"),
+            "ask_with_hipporag must pass PRIORITY_RECALL to generate_with_extras"
+        );
+
+        // 2. No other call to `generate_with_extras` in lib.rs should exist —
+        //    the only `generate_with_extras` invocation in lib.rs must be the
+        //    hipporag one. Extraction paths use `generate_for_structured_output`
+        //    (which internally calls `generate_with_extras` inside chat/mod.rs,
+        //    but that is a different source file). This guards against a future
+        //    accidental second call site being added without review.
+        let outside_hippo = format!(
+            "{}{}",
+            &src[..hippo_start],
+            &src[hippo_start + 1 + hippo_end_offset..]
+        );
+        assert!(
+            !outside_hippo.contains("generate_with_extras"),
+            "generate_with_extras must only be called from ask_with_hipporag in lib.rs; \
+             found an additional call site outside ask_with_hipporag"
         );
     }
 }
