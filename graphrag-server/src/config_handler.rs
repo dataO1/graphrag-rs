@@ -403,4 +403,41 @@ mod tests {
         let result = manager.set_from_json(&json).await;
         assert!(result.is_err());
     }
+
+    /// POST `{"synthesis": {"max_answer_tokens": 500}}` then GET must return 500.
+    ///
+    /// This is the server-level round-trip test required by Card 1.
+    #[tokio::test]
+    async fn test_synthesis_max_answer_tokens_round_trip() {
+        let manager = ConfigManager::new();
+
+        // First set a valid base config so validation passes.
+        let base_json = ConfigManager::default_config_json();
+        manager
+            .set_from_json(&base_json)
+            .await
+            .expect("base config must be valid");
+
+        // Now patch just the synthesis.max_answer_tokens field.
+        let patch = serde_json::json!({ "synthesis": { "max_answer_tokens": 500 } });
+        let patch_json = serde_json::to_string(&patch).unwrap();
+        manager
+            .set_from_json(&patch_json)
+            .await
+            .expect("patch must succeed");
+
+        // Round-trip through to_json → parse → check field.
+        let serialised = manager.to_json().await.expect("to_json must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialised).expect("to_json must produce valid JSON");
+
+        let got = parsed["synthesis"]["max_answer_tokens"]
+            .as_u64()
+            .expect("synthesis.max_answer_tokens must be present in serialised config");
+
+        assert_eq!(
+            got, 500,
+            "GET /config must reflect the POSTed synthesis.max_answer_tokens=500"
+        );
+    }
 }

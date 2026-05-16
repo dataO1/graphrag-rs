@@ -312,11 +312,19 @@ pub struct SynthesisConfig {
     /// is `max_input_chars - skeleton_reserve_chars`.
     #[serde(default = "default_synthesis_skeleton_reserve_chars")]
     pub skeleton_reserve_chars: usize,
+    /// Maximum tokens the LLM may generate for the final ANSWER in
+    /// `ask_with_hipporag`. The old hardcoded value was 800, which
+    /// forced a minimum KV-cache decode floor on every query. Default
+    /// `300` — sufficient for 3–6 sentence answers while cutting
+    /// decode latency by ~60 % compared to 800.
+    #[serde(default = "default_synthesis_max_answer_tokens")]
+    pub max_answer_tokens: u32,
 }
 
 fn default_synthesis_max_input_chars() -> usize { 0 }
 fn default_synthesis_max_chars_per_chunk() -> usize { 2_000 }
 fn default_synthesis_skeleton_reserve_chars() -> usize { 8_000 }
+fn default_synthesis_max_answer_tokens() -> u32 { 300 }
 
 impl Default for SynthesisConfig {
     fn default() -> Self {
@@ -324,6 +332,7 @@ impl Default for SynthesisConfig {
             max_input_chars: default_synthesis_max_input_chars(),
             max_chars_per_chunk: default_synthesis_max_chars_per_chunk(),
             skeleton_reserve_chars: default_synthesis_skeleton_reserve_chars(),
+            max_answer_tokens: default_synthesis_max_answer_tokens(),
         }
     }
 }
@@ -1924,6 +1933,9 @@ impl Config {
                 skeleton_reserve_chars: parsed["synthesis"]["skeleton_reserve_chars"]
                     .as_usize()
                     .unwrap_or(default_synthesis_skeleton_reserve_chars()),
+                max_answer_tokens: parsed["synthesis"]["max_answer_tokens"]
+                    .as_u32()
+                    .unwrap_or(default_synthesis_max_answer_tokens()),
             },
             gliner: GlinerConfig {
                 enabled: parsed["gliner"]["enabled"].as_bool().unwrap_or(false),
@@ -2373,6 +2385,15 @@ impl Config {
         parallel["parallel_vector_ops"] = json::JsonValue::from(self.parallel.parallel_vector_ops);
         config_json["parallel"] = parallel;
 
+        // Synthesis
+        let mut synthesis = json::JsonValue::new_object();
+        synthesis["max_input_chars"] = json::JsonValue::from(self.synthesis.max_input_chars);
+        synthesis["max_chars_per_chunk"] = json::JsonValue::from(self.synthesis.max_chars_per_chunk);
+        synthesis["skeleton_reserve_chars"] =
+            json::JsonValue::from(self.synthesis.skeleton_reserve_chars);
+        synthesis["max_answer_tokens"] = json::JsonValue::from(self.synthesis.max_answer_tokens);
+        config_json["synthesis"] = synthesis;
+
         // Enhancements
         let mut enhancements = json::JsonValue::new_object();
         enhancements["enabled"] = json::JsonValue::from(self.enhancements.enabled);
@@ -2495,5 +2516,98 @@ impl Config {
         let content = json::stringify_pretty(config_json, 2);
         fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::*;
+
+    /// `SynthesisConfig::default()` must expose `max_answer_tokens = 300`.
+    ///
+    /// This test will FAIL until the field is added to the struct.
+    #[test]
+    fn test_synthesis_config_default_max_answer_tokens() {
+        let cfg = SynthesisConfig::default();
+        assert_eq!(
+            cfg.max_answer_tokens, 300,
+            "default max_answer_tokens must be 300 (not the old hardcoded 800)"
+        );
+    }
+
+    /// An override via JSON merge-deserialise must survive a serde round-trip.
+    ///
+    /// This exercises the `#[serde(default = …)]` annotation and confirms the
+    /// field round-trips through the same `serde_json` path that
+    /// `ConfigManager::set_from_json` / `to_json` uses.
+    #[test]
+    fn test_synthesis_config_serde_round_trip() {
+        let json = r#"{"max_answer_tokens": 500}"#;
+        let cfg: SynthesisConfig = serde_json::from_str(json).expect("deserialise SynthesisConfig");
+        assert_eq!(
+            cfg.max_answer_tokens, 500,
+            "max_answer_tokens must survive a serde round-trip"
+        );
+
+        // Serialize back and confirm the field is present.
+        let serialised = serde_json::to_string(&cfg).expect("serialise SynthesisConfig");
+        assert!(
+            serialised.contains("max_answer_tokens"),
+            "serialised SynthesisConfig must contain max_answer_tokens; got: {serialised}"
+        );
+    }
+
+    /// `Config::default()` must carry the synthesis default through.
+    #[test]
+    fn test_top_level_config_default_synthesis() {
+        let config = Config::default();
+        assert_eq!(
+            config.synthesis.max_answer_tokens, 300,
+            "Config::default() synthesis.max_answer_tokens must be 300"
+        );
+    }
+
+    /// A partial JSON POST of `{"synthesis": {"max_answer_tokens": 500}}` must
+    /// produce a `Config` with that value while leaving other synthesis fields
+    /// at their defaults.  This is the same serde path used by
+    /// `ConfigManager::set_from_json`.
+    #[test]
+    fn test_max_answer_tokens_from_config_partial_patch() {
+        // Simulate what ConfigManager::set_from_json does: start from defaults,
+        // deep-merge a partial patch, then deserialise.
+        let base = Config::default();
+        let mut base_val =
+            serde_json::to_value(&base).expect("serialise base Config");
+
+        let patch = serde_json::json!({
+            "synthesis": { "max_answer_tokens": 500 }
+        });
+
+        // Inline the same deep_merge_in_place logic from config_handler.rs.
+        fn deep_merge(base: &mut serde_json::Value, patch: serde_json::Value) {
+            match (base, patch) {
+                (serde_json::Value::Object(b), serde_json::Value::Object(p)) => {
+                    for (k, v) in p {
+                        deep_merge(b.entry(k).or_insert(serde_json::Value::Null), v);
+                    }
+                }
+                (b, p) => *b = p,
+            }
+        }
+        deep_merge(&mut base_val, patch);
+
+        let merged: Config =
+            serde_json::from_value(base_val).expect("deserialise merged Config");
+
+        assert_eq!(
+            merged.synthesis.max_answer_tokens, 500,
+            "patched synthesis.max_answer_tokens must be 500"
+        );
+        // Other synthesis fields must remain at their defaults.
+        assert_eq!(
+            merged.synthesis.max_chars_per_chunk,
+            default_synthesis_max_chars_per_chunk(),
+            "max_chars_per_chunk must be unchanged after partial patch"
+        );
     }
 }

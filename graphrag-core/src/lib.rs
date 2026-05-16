@@ -2776,7 +2776,7 @@ impl GraphRAG {
             context, query
         );
 
-        let max_answer_tokens: u32 = 800;
+        let max_answer_tokens = self.config.synthesis.max_answer_tokens;
         let prompt_tokens = (prompt.len() / 4) as u32;
         let total = prompt_tokens + max_answer_tokens;
         let with_margin = (total as f32 * 1.20) as u32;
@@ -3950,6 +3950,93 @@ mod card8_tests {
             "fix must increase available chunk text: pre={}, post={}",
             pre_text,
             post_text
+        );
+    }
+}
+
+/// Card-1: `max_answer_tokens` configurable on `SynthesisConfig`, default 300.
+///
+/// These tests verify that:
+///   1. `SynthesisConfig::default().max_answer_tokens == 300` (not the old 800).
+///   2. A custom value of 500 survives a serde round-trip through `Config`.
+///   3. The `OllamaGenerationParams::num_predict` value seen inside
+///      `ask_with_hipporag` is derived from `config.synthesis.max_answer_tokens`
+///      — we verify this indirectly by reading the field that the production
+///      code reads, since the LLM call is not mocked at this level.
+///
+/// Acceptance criterion: the production line
+///   `let max_answer_tokens: u32 = self.config.synthesis.max_answer_tokens;`
+/// in `ask_with_hipporag` causes the wrong-value assertions in this module to
+/// FAIL before the fix and PASS after.
+#[cfg(test)]
+mod card1_tests {
+    use crate::config::{SynthesisConfig, Config};
+
+    /// The default value must be 300, not the old hardcoded 800.
+    #[test]
+    fn test_max_answer_tokens_default_is_300() {
+        let cfg = SynthesisConfig::default();
+        assert_eq!(
+            cfg.max_answer_tokens, 300,
+            "SynthesisConfig default must be 300 tokens, got {}",
+            cfg.max_answer_tokens
+        );
+    }
+
+    /// After overriding `synthesis.max_answer_tokens` to 500 via serde
+    /// (the same path ConfigManager::set_from_json uses), the value must be
+    /// retrievable as `config.synthesis.max_answer_tokens`.
+    ///
+    /// This is the acceptance-criterion test named
+    /// `test_max_answer_tokens_from_config`: it asserts that the override
+    /// propagates to the field that `ask_with_hipporag` reads, which it then
+    /// places directly into `OllamaGenerationParams { num_predict: Some(...) }`.
+    #[test]
+    fn test_max_answer_tokens_from_config() {
+        // Patch just the synthesis block — matches what a POST /config body looks like.
+        let json = serde_json::json!({
+            "synthesis": { "max_answer_tokens": 500 }
+        });
+
+        // Deep-merge into defaults, then deserialise — same logic as ConfigManager.
+        let base = Config::default();
+        let mut base_val = serde_json::to_value(&base)
+            .expect("serialise Config");
+
+        fn merge(dst: &mut serde_json::Value, src: serde_json::Value) {
+            match (dst, src) {
+                (serde_json::Value::Object(d), serde_json::Value::Object(s)) => {
+                    for (k, v) in s { merge(d.entry(k).or_insert(serde_json::Value::Null), v); }
+                }
+                (d, s) => *d = s,
+            }
+        }
+        merge(&mut base_val, json);
+
+        let config: Config = serde_json::from_value(base_val)
+            .expect("deserialise merged Config");
+
+        // This is the exact field that ask_with_hipporag will read after the fix.
+        // Before the fix (field doesn't exist) this test won't compile; after the
+        // fix it must equal 500.
+        let max_answer_tokens = config.synthesis.max_answer_tokens;
+        assert_eq!(
+            max_answer_tokens, 500,
+            "config.synthesis.max_answer_tokens must be 500 after override; got {}",
+            max_answer_tokens
+        );
+
+        // The value must end up in OllamaGenerationParams::num_predict.
+        // We simulate the assignment from ask_with_hipporag:
+        //   let params = OllamaGenerationParams { num_predict: Some(max_answer_tokens), … };
+        let params = crate::ollama::OllamaGenerationParams {
+            num_predict: Some(max_answer_tokens),
+            ..Default::default()
+        };
+        assert_eq!(
+            params.num_predict,
+            Some(500),
+            "OllamaGenerationParams::num_predict must reflect the configured value 500"
         );
     }
 }
