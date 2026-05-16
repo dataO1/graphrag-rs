@@ -2758,23 +2758,12 @@ impl GraphRAG {
                 .to_string(),
         })?;
 
-        let prompt = format!(
-            "You are a knowledgeable assistant answering questions grounded in a knowledge graph.\n\n\
-             IMPORTANT INSTRUCTIONS:\n\
-             - Answer ONLY using the provided entities, relationships, and source text below\n\
-             - Synthesize across all three sections; relationships in particular often supply \
-               the connective tissue\n\
-             - Provide direct, conversational, natural responses\n\
-             - Do NOT show your reasoning process or use <think> tags\n\
-             - If the context lacks sufficient information, clearly state: \
-               \"I don't have enough information to answer this question.\"\n\
-             - Aim for a complete answer (3-6 sentences)\n\n\
-             CONTEXT:\n\
-             {}\n\n\
-             QUESTION: {}\n\n\
-             ANSWER (direct response only, no reasoning):",
-            context, query
-        );
+        let prompt = self
+            .config
+            .synthesis
+            .prompt_template
+            .replace("{{context}}", &context)
+            .replace("{{query}}", query);
 
         let max_answer_tokens = self.config.synthesis.max_answer_tokens;
         let prompt_tokens = (prompt.len() / 4) as u32;

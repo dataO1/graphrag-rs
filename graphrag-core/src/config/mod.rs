@@ -294,7 +294,7 @@ impl From<LlmConcurrencyConfig> for crate::llm_concurrency::AdaptiveConfig {
 /// `0` reaches graphrag-core only when the probe failed AND no user
 /// override was set; in that case [`Config::synthesis_chunks_budget`]
 /// returns `None` (unbounded — old behavior, may overflow).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SynthesisConfig {
     /// Total INPUT prompt cap, in chars. `0` = "auto-detect from
     /// upstream", resolved server-side at /config init. Default `0`.
@@ -319,12 +319,57 @@ pub struct SynthesisConfig {
     /// decode latency by ~60 % compared to 800.
     #[serde(default = "default_synthesis_max_answer_tokens")]
     pub max_answer_tokens: u32,
+    /// Jinja-style prompt template for the final synthesis call in
+    /// `ask_with_hipporag`. Must contain at least one of `{{context}}`
+    /// or `{{query}}` (missing BOTH is rejected at load time).
+    /// Use `{{context}}` and `{{query}}` as placeholders — they are
+    /// substituted with `.replace()` so they don't collide with
+    /// Rust's `format!` macro syntax.
+    #[serde(default = "default_synthesis_prompt_template")]
+    pub prompt_template: String,
 }
 
 fn default_synthesis_max_input_chars() -> usize { 0 }
 fn default_synthesis_max_chars_per_chunk() -> usize { 2_000 }
 fn default_synthesis_skeleton_reserve_chars() -> usize { 8_000 }
 fn default_synthesis_max_answer_tokens() -> u32 { 300 }
+
+const DEFAULT_SYNTHESIS_PROMPT: &str = "\
+You are a knowledge-graph QA assistant.
+
+Use only the entities, relationships, and source text below.
+Synthesize across all three sections — relationships often supply
+the connective tissue between entities.
+Write a single direct paragraph, four sentences or fewer.
+Lead with the entity-to-entity bridge that answers the question.
+If the context is insufficient, reply exactly:
+\"I don't have enough information to answer this question.\"
+
+CONTEXT:
+{{context}}
+
+QUESTION: {{query}}
+
+ANSWER:";
+
+pub fn default_synthesis_prompt_template() -> String {
+    DEFAULT_SYNTHESIS_PROMPT.to_string()
+}
+
+/// Validate that a synthesis prompt template contains at least one of
+/// `{{context}}` or `{{query}}`. Returns `Err` only when BOTH are absent
+/// (i.e. the template would produce an empty / garbage prompt at recall time).
+pub fn validate_synthesis_prompt_template(template: &str) -> Result<()> {
+    if !template.contains("{{context}}") && !template.contains("{{query}}") {
+        return Err(crate::core::GraphRAGError::Config {
+            message: "synthesis.prompt_template must contain at least one of \
+                      `{{context}}` or `{{query}}`; the configured template \
+                      contains neither placeholder"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
 
 impl Default for SynthesisConfig {
     fn default() -> Self {
@@ -333,6 +378,7 @@ impl Default for SynthesisConfig {
             max_chars_per_chunk: default_synthesis_max_chars_per_chunk(),
             skeleton_reserve_chars: default_synthesis_skeleton_reserve_chars(),
             max_answer_tokens: default_synthesis_max_answer_tokens(),
+            prompt_template: default_synthesis_prompt_template(),
         }
     }
 }
@@ -1923,19 +1969,27 @@ impl Config {
                     .as_u64()
                     .unwrap_or(default_llm_shrink_cooldown_ms()),
             },
-            synthesis: SynthesisConfig {
-                max_input_chars: parsed["synthesis"]["max_input_chars"]
-                    .as_usize()
-                    .unwrap_or(default_synthesis_max_input_chars()),
-                max_chars_per_chunk: parsed["synthesis"]["max_chars_per_chunk"]
-                    .as_usize()
-                    .unwrap_or(default_synthesis_max_chars_per_chunk()),
-                skeleton_reserve_chars: parsed["synthesis"]["skeleton_reserve_chars"]
-                    .as_usize()
-                    .unwrap_or(default_synthesis_skeleton_reserve_chars()),
-                max_answer_tokens: parsed["synthesis"]["max_answer_tokens"]
-                    .as_u32()
-                    .unwrap_or(default_synthesis_max_answer_tokens()),
+            synthesis: {
+                let prompt_template = parsed["synthesis"]["prompt_template"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(default_synthesis_prompt_template);
+                validate_synthesis_prompt_template(&prompt_template)?;
+                SynthesisConfig {
+                    max_input_chars: parsed["synthesis"]["max_input_chars"]
+                        .as_usize()
+                        .unwrap_or(default_synthesis_max_input_chars()),
+                    max_chars_per_chunk: parsed["synthesis"]["max_chars_per_chunk"]
+                        .as_usize()
+                        .unwrap_or(default_synthesis_max_chars_per_chunk()),
+                    skeleton_reserve_chars: parsed["synthesis"]["skeleton_reserve_chars"]
+                        .as_usize()
+                        .unwrap_or(default_synthesis_skeleton_reserve_chars()),
+                    max_answer_tokens: parsed["synthesis"]["max_answer_tokens"]
+                        .as_u32()
+                        .unwrap_or(default_synthesis_max_answer_tokens()),
+                    prompt_template,
+                }
             },
             gliner: GlinerConfig {
                 enabled: parsed["gliner"]["enabled"].as_bool().unwrap_or(false),
@@ -2392,6 +2446,8 @@ impl Config {
         synthesis["skeleton_reserve_chars"] =
             json::JsonValue::from(self.synthesis.skeleton_reserve_chars);
         synthesis["max_answer_tokens"] = json::JsonValue::from(self.synthesis.max_answer_tokens);
+        synthesis["prompt_template"] =
+            json::JsonValue::from(self.synthesis.prompt_template.as_str());
         config_json["synthesis"] = synthesis;
 
         // Enhancements
@@ -2555,6 +2611,69 @@ mod synthesis_tests {
             serialised.contains("max_answer_tokens"),
             "serialised SynthesisConfig must contain max_answer_tokens; got: {serialised}"
         );
+    }
+
+    // ── Card 2: prompt_template tests (RED phase) ──────────────────────────
+
+    /// The default synthesis prompt template must contain the researcher-rewrite
+    /// sentinel substrings — a full-string match would be brittle to whitespace.
+    #[test]
+    fn test_default_prompt_is_researcher_rewrite() {
+        let tmpl = default_synthesis_prompt_template();
+        assert!(
+            tmpl.contains("Write a single direct paragraph, four sentences or fewer."),
+            "default prompt must contain the paragraph-length instruction; got:\n{tmpl}"
+        );
+        assert!(
+            tmpl.contains("Lead with the entity-to-entity bridge"),
+            "default prompt must contain the entity-bridge instruction; got:\n{tmpl}"
+        );
+    }
+
+    /// A custom template with both placeholders must be substituted correctly.
+    #[test]
+    fn test_prompt_template_substitution() {
+        let tmpl = "CTX={{context}} Q={{query}}".to_string();
+        let result = tmpl
+            .replace("{{context}}", "my context")
+            .replace("{{query}}", "my question");
+        assert_eq!(result, "CTX=my context Q=my question");
+
+        // Also verify that SynthesisConfig carries the field and that the
+        // configured template is used directly.
+        let cfg = SynthesisConfig {
+            prompt_template: tmpl.clone(),
+            ..SynthesisConfig::default()
+        };
+        let rendered = cfg
+            .prompt_template
+            .replace("{{context}}", "ctx")
+            .replace("{{query}}", "q");
+        assert_eq!(rendered, "CTX=ctx Q=q");
+    }
+
+    /// `from_file`-style deserialization must REJECT a template that is missing
+    /// BOTH `{{context}}` AND `{{query}}`.  Missing only one is acceptable.
+    #[test]
+    fn test_prompt_template_missing_placeholder_errors() {
+        // Missing BOTH → validator must reject.
+        let err = validate_synthesis_prompt_template("no placeholders at all");
+        assert!(
+            err.is_err(),
+            "template missing both placeholders must be rejected"
+        );
+
+        // Missing only {{context}} → acceptable.
+        let ok1 = validate_synthesis_prompt_template("only {{query}} present");
+        assert!(ok1.is_ok(), "template missing only {{context}} must be accepted");
+
+        // Missing only {{query}} → acceptable.
+        let ok2 = validate_synthesis_prompt_template("only {{context}} present");
+        assert!(ok2.is_ok(), "template missing only {{query}} must be accepted");
+
+        // Both present → acceptable.
+        let ok3 = validate_synthesis_prompt_template("{{context}} and {{query}}");
+        assert!(ok3.is_ok(), "template with both placeholders must be accepted");
     }
 
     /// `Config::default()` must carry the synthesis default through.
