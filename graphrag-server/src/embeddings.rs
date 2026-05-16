@@ -42,6 +42,12 @@ pub struct EmbeddingService {
     ollama_client: Option<Arc<Ollama>>,
     #[cfg(feature = "openai")]
     openai_client: Option<Arc<OpenAIClient>>,
+    /// Separate client for query-time embeddings when
+    /// `config.query_api_endpoint` is set. Points at a
+    /// low-latency backend (e.g. NPU) while `openai_client`
+    /// handles bulk extraction.
+    #[cfg(feature = "openai")]
+    query_openai_client: Option<Arc<OpenAIClient>>,
     fallback_generator: Arc<RwLock<EmbeddingGenerator>>,
     stats: Arc<RwLock<EmbeddingStats>>,
     /// Process-lifetime text→vector cache. Used exclusively by
@@ -177,6 +183,76 @@ impl EmbeddingService {
             warn!("backend=openai but openai feature not compiled in — falling through to hash");
         }
 
+        // Second OpenAI-compat client for query embeddings when
+        // `query_api_endpoint` is set and differs from `api_endpoint`.
+        // Reuses the same http client (connection pool) but targets
+        // a different URL. Falls back to `openai_client` if the probe
+        // fails or if `query_api_endpoint` equals `api_endpoint`.
+        #[cfg(feature = "openai")]
+        let query_openai_client = if cfg.backend == "openai" {
+            if let Some(query_ep) = cfg.query_api_endpoint.as_deref() {
+                if query_ep.is_empty() || query_ep == cfg.api_endpoint.as_deref().unwrap_or("") {
+                    // Same endpoint — reuse the main client (no second probe).
+                    openai_client.clone()
+                } else {
+                    let model = cfg.model.clone().unwrap_or_default();
+                    let api_key = cfg.api_key.clone().unwrap_or_default();
+                    let probe_url = format!("{}/models", query_ep.trim_end_matches('/'));
+                    let mut req = openai_client.as_ref()
+                        .map(|c| c.http.get(&probe_url))
+                        .unwrap_or_else(|| {
+                            // Edge case: main client failed to build but we
+                            // have a query endpoint. Build a minimal client.
+                            reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(60))
+                                .build()
+                                .unwrap()
+                                .get(&probe_url)
+                        });
+                    if !api_key.is_empty() {
+                        req = req.bearer_auth(&api_key);
+                    }
+                    match req.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            let http = openai_client.as_ref()
+                                .map(|c| c.http.clone())
+                                .unwrap_or_else(|| {
+                                    reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(60))
+                                        .build()
+                                        .unwrap()
+                                });
+                            Some(Arc::new(OpenAIClient {
+                                http,
+                                base_url: query_ep.to_string(),
+                                model,
+                                api_key,
+                            }))
+                        },
+                        Ok(resp) => {
+                            warn!(
+                                "Query embedding endpoint /models returned {} at {}; falling back to main endpoint",
+                                resp.status(), query_ep
+                            );
+                            openai_client.clone()
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Query embedding endpoint probe failed at {}: {}; falling back to main endpoint",
+                                query_ep, e
+                            );
+                            openai_client.clone()
+                        },
+                    }
+                }
+            } else {
+                // No query_api_endpoint set — reuse the main client.
+                openai_client.clone()
+            }
+        } else {
+            None
+        };
+
         // Ollama backend. `api_endpoint` may be either "host:port",
         // "http://host:port", or unset (defaults to localhost:11434) —
         // `parse_ollama_endpoint` handles all three.
@@ -227,6 +303,8 @@ impl EmbeddingService {
             ollama_client,
             #[cfg(feature = "openai")]
             openai_client,
+            #[cfg(feature = "openai")]
+            query_openai_client,
             fallback_generator,
             stats: Arc::new(RwLock::new(EmbeddingStats::default())),
             text_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -635,6 +713,35 @@ impl EmbeddingService {
             .into_iter()
             .next()
             .ok_or_else(|| EmbeddingError::GenerationFailed("No embedding generated".to_string()))
+    }
+
+    /// Generate a single query embedding. When `config.query_api_endpoint`
+    /// is set, routes through the dedicated query backend (e.g. NPU).
+    /// Otherwise falls through to [`Self::generate_single`].
+    ///
+    /// The query path never uses the text cache — query inputs are rarely
+    /// repeated and we don't want to bloat the cache.
+    #[cfg(feature = "openai")]
+    pub async fn generate_query_single(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if let Some(client) = &self.query_openai_client {
+            if client.base_url != self.openai_client.as_ref().map(|c| c.base_url.as_str()).unwrap_or("") {
+                let embeddings = self
+                    .generate_with_openai(&client.http, &client.base_url, &client.model, &client.api_key, &[text])
+                    .await?;
+                return embeddings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| EmbeddingError::GenerationFailed("No query embedding generated".to_string()));
+            }
+        }
+        // Fall through to the shared path.
+        self.generate_single(text).await
+    }
+
+    /// Stub for non-openai builds — always delegates to generate_single.
+    #[cfg(not(feature = "openai"))]
+    pub async fn generate_query_single(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.generate_single(text).await
     }
 
     /// Cached batch embed. Probes [`Self::text_cache`] for each input;

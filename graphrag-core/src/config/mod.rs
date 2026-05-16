@@ -1187,6 +1187,16 @@ pub struct EmbeddingConfig {
     /// API endpoint for embeddings (if using external service)
     pub api_endpoint: Option<String>,
 
+    /// Optional separate API endpoint for query-time embeddings only.
+    /// When set, `EmbeddingService::generate_query_single` routes to this
+    /// endpoint instead of `api_endpoint`. Extraction and persistence
+    /// embeddings still use `api_endpoint`. Enables split embedding
+    /// infrastructure: bulk extraction on a batched backend (e.g. iGPU),
+    /// interactive query embeddings on a low-latency backend (e.g. NPU).
+    /// When None (default), queries share `api_endpoint`.
+    #[serde(default)]
+    pub query_api_endpoint: Option<String>,
+
     /// API key for external embedding service
     /// Can also be set via environment variables (OPENAI_API_KEY, VOYAGE_API_KEY, etc.)
     pub api_key: Option<String>,
@@ -1474,6 +1484,7 @@ impl Default for Config {
                 model: Some("sentence-transformers/all-MiniLM-L6-v2".to_string()),
                 fallback_to_hash: true,
                 api_endpoint: None,
+                query_api_endpoint: None,
                 api_key: None,
                 cache_dir: None,
                 batch_size: default_batch_size(),
@@ -1695,6 +1706,9 @@ impl Config {
                     .as_bool()
                     .unwrap_or(true),
                 api_endpoint: parsed["embeddings"]["api_endpoint"]
+                    .as_str()
+                    .map(|s| s.to_string()),
+                query_api_endpoint: parsed["embeddings"]["query_api_endpoint"]
                     .as_str()
                     .map(|s| s.to_string()),
                 api_key: parsed["embeddings"]["api_key"]

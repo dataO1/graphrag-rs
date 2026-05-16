@@ -341,6 +341,9 @@ fn overlay_embedding_env_vars(emb: &mut graphrag_core::config::EmbeddingConfig) 
             if let Ok(u) = std::env::var("OPENAI_URL") {
                 emb.api_endpoint = Some(u);
             }
+            if let Ok(u) = std::env::var("OPENAI_QUERY_URL") {
+                emb.query_api_endpoint = Some(u);
+            }
             if let Ok(m) = std::env::var("OPENAI_EMBEDDING_MODEL") {
                 emb.model = Some(m);
             }
@@ -917,7 +920,7 @@ async fn query(
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
         // Real vector search with Qdrant using real embeddings
-        let query_embedding = match state.embeddings.load_full().generate_single(&body.query).await {
+        let query_embedding = match state.embeddings.load_full().generate_query_single(&body.query).await {
             Ok(embedding) => embedding,
             Err(e) => {
                 tracing::error!("Failed to generate query embedding: {}", e);
@@ -1154,7 +1157,7 @@ async fn graph_aware_query(
     let vector_results: Vec<QueryResult> = {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &state.qdrant {
-            match state.embeddings.load_full().generate_single(&body.query).await {
+            match state.embeddings.load_full().generate_query_single(&body.query).await {
                 Ok(embedding) => match version_aware_search(
                     qdrant.as_ref(),
                     embedding,
