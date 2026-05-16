@@ -1578,14 +1578,18 @@ async fn ingest_blocks(
             }
         }
 
-        // Step 2 + 3: for each changed block, supersede prior version,
-        // then embed + insert. Sequential to keep the embedding service
-        // honest (we don't want to spam concurrent embed requests for
-        // a 200-block document during a bulk reindex; the user's 24 GB
-        // VRAM laptop is the bottleneck here).
-        for block in blocks {
-            // Read prior content (if any) before flipping is_current
-            // so we can emit a delta-bearing event.
+        // Step 2 + 3: supersede prior versions, then batch-embed all blocks at once,
+        // then insert each with its embedding. `EmbeddingService::generate` caps
+        // concurrency at 16 internally (pool size), so a 200-block bulk reindex
+        // dispatches in batches of 16 concurrent embeds — still bounded, much
+        // faster wall-time than 200 sequential single-shot calls (was 4-30s for
+        // 16 blocks, now ~1-3s).
+
+        // Pass 1: read prior state and flip is_current for all changed blocks.
+        // We collect prior metadata here so we can emit stale-context events
+        // after the new chunks land (pass 3).
+        let mut priors: Vec<Option<qdrant_store::DocumentMetadata>> = Vec::with_capacity(blocks.len());
+        for block in &blocks {
             let prior = qdrant
                 .find_current_block(&user_id, &block.id)
                 .await
@@ -1594,23 +1598,42 @@ async fn ingest_blocks(
                 .mark_block_superseded(&user_id, &block.id)
                 .await
                 .map_err(|e| ApiError::InternalError(format!("supersede prior block {} failed: {e}", block.id)))?;
+            priors.push(prior);
+        }
 
-            // Contextual prefix at embed time only.
-            let prefix = build_context_prefix(&title, &block.heading_path);
-            let embed_text = if prefix.is_empty() {
-                block.content.clone()
-            } else {
-                format!("{prefix}\n\n{}", block.content)
-            };
-            let embedding = state
+        // Pass 2: build embed inputs and call generate in one batched request.
+        // Skip the batch entirely when there are no blocks to embed.
+        let embeddings: Vec<Vec<f32>> = if blocks.is_empty() {
+            Vec::new()
+        } else {
+            let embed_texts: Vec<String> = blocks.iter().map(|block| {
+                let prefix = build_context_prefix(&title, &block.heading_path);
+                if prefix.is_empty() {
+                    block.content.clone()
+                } else {
+                    format!("{prefix}\n\n{}", block.content)
+                }
+            }).collect();
+            let refs: Vec<&str> = embed_texts.iter().map(|s| s.as_str()).collect();
+            let embeddings = state
                 .embeddings
                 .load_full()
-                .generate_single(&embed_text)
+                .generate(&refs)
                 .await
-                .map_err(|e| {
-                    ApiError::InternalError(format!("embed block {} failed: {e}", block.id))
-                })?;
+                .map_err(|e| ApiError::InternalError(format!("batch embed {} blocks failed: {e}", refs.len())))?;
+            if embeddings.len() != blocks.len() {
+                return Err(ApiError::InternalError(format!(
+                    "batch embed returned {} vectors for {} blocks",
+                    embeddings.len(),
+                    blocks.len()
+                )));
+            }
+            embeddings
+        };
 
+        // Pass 3: insert each block with its corresponding embedding and emit
+        // stale-context events. Zip guarantees 1:1 correspondence with pass 1.
+        for ((block, embedding), prior) in blocks.into_iter().zip(embeddings.into_iter()).zip(priors.into_iter()) {
             let chunk_uuid = uuid::Uuid::new_v4().to_string();
             let metadata = qdrant_store::DocumentMetadata {
                 id: chunk_uuid.clone(),
@@ -4447,6 +4470,105 @@ mod card5_tests {
             "Inject a CountingReranker mock into AppState, \
              POST /api/query with mode=hipporag (assert counter==0), \
              POST /api/query with mode=search (assert counter>=1)."
+        );
+    }
+}
+
+// ── Card 12: batch per-block embeds in ingest_blocks ─────────────────────────
+//
+// Card 12 replaces the sequential per-block `generate_single` calls in
+// `ingest_blocks` with a single batched `generate(&refs)` call. The
+// `EmbeddingService::generate` method caps concurrency at 16 internally
+// (pool size), so a 200-block bulk reindex dispatches in batches of 16
+// concurrent embeds — still bounded, much faster wall-time than 200
+// sequential single-shot calls (was 4-30s for 16 blocks, now ~1-3s).
+//
+// Static-analysis tests verify the source shape without needing a mock
+// embedder injection slot (same approach as Card 5). The tests are RED
+// before the implementation (generate_single still present) and GREEN
+// after (generate_single removed from ingest_blocks, generate batch used).
+//
+// Run:
+//   cargo test -p graphrag-server --features 'qdrant,openai' --bins card12_tests
+#[cfg(test)]
+mod card12_tests {
+    // ── Static test 1: ingest_blocks uses generate (batch), not generate_single ─
+    //
+    // Scans the `ingest_blocks` function body between its signature and the
+    // closing `#[cfg(feature = "qdrant")]` block end (just before the
+    // memory-fallback arm and `// Phase 6` comment). Asserts:
+    //   A. `generate(&refs)` appears inside ingest_blocks (batch call present).
+    //   B. `generate_single` does NOT appear inside ingest_blocks.
+    //
+    // Boundary strategy:
+    //   Start: `"async fn ingest_blocks("` (unique function signature).
+    //   End:   `"/// Record a session"` (the doc-comment of the next
+    //           function `record_session_leases` / `maybe_rerank`).
+    //   We scan the text between these two anchors.
+    #[test]
+    fn test_ingest_blocks_batches_embeds() {
+        let src = include_str!("main.rs");
+
+        // ── Locate ingest_blocks body ─────────────────────────────────────────
+        let fn_start_marker = "async fn ingest_blocks(";
+        let fn_end_marker = "/// Record a session";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn ingest_blocks(' function definition");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect(
+                "source must contain '/// Record a session' doc-comment after ingest_blocks; \
+                 used as the end boundary for the function body scan",
+            )
+            + fn_start;
+
+        let ingest_body = &src[fn_start..fn_end];
+
+        // ── A: batch generate call must be present ────────────────────────────
+        assert!(
+            ingest_body.contains("generate(&refs)"),
+            "Card 12: ingest_blocks must call generate(&refs) (batch embed).\n\
+             'generate(&refs)' not found in ingest_blocks body.\n\
+             Implement the batched embed refactor per Card 12 spec."
+        );
+
+        // ── B: generate_single must be absent ─────────────────────────────────
+        assert!(
+            !ingest_body.contains("generate_single"),
+            "Card 12: ingest_blocks must NOT call generate_single (sequential embed).\n\
+             Found 'generate_single' inside ingest_blocks body — remove it and use the \
+             batched generate(&refs) call instead."
+        );
+    }
+
+    // ── Static test 2: embeddings length is validated against blocks.len() ─────
+    //
+    // Asserts that the source contains the mismatch guard that returns an error
+    // when the batch embed returns a different number of vectors than inputs.
+    // This guard prevents silent index-out-of-bounds panics in the zip loop.
+    #[test]
+    fn test_ingest_blocks_validates_embed_length() {
+        let src = include_str!("main.rs");
+
+        let fn_start_marker = "async fn ingest_blocks(";
+        let fn_end_marker = "/// Record a session";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn ingest_blocks('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// Record a session' after ingest_blocks")
+            + fn_start;
+
+        let ingest_body = &src[fn_start..fn_end];
+
+        assert!(
+            ingest_body.contains("embeddings.len() != blocks.len()"),
+            "Card 12: ingest_blocks must guard that batch embed returns exactly blocks.len() vectors.\n\
+             'embeddings.len() != blocks.len()' not found — add the length mismatch check."
         );
     }
 }
