@@ -1151,6 +1151,22 @@ async fn graph_aware_query(
     mode: QueryMode,
     start: std::time::Instant,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    // ── Card 13: phase-by-phase performance instrumentation ───────────────────
+    //
+    // Each major phase is wrapped in an Instant::now() / elapsed pair.  At the
+    // end of the HippoRAG arm we emit a single structured summary line so ops
+    // can grep one line per request for the full latency breakdown.
+    //
+    // Variables are set to 0 by default and overwritten inside the HippoRAG arm.
+    // The mode=search path is NOT instrumented (already confirmed fast at 1.1 s).
+    let mut embed_elapsed_ms: u128 = 0;
+    let mut vsearch_elapsed_ms: u128 = 0;
+    let mut leases_elapsed_ms: u128 = 0;
+    let mut sem_elapsed_ms: u128 = 0;
+    let mut retrieve_elapsed_ms: u128 = 0;
+    let mut ask_elapsed_ms: u128 = 0;
+    let mut pack_elapsed_ms: u128 = 0;
+
     // Pre-compute vector hits (best-effort; failures don't block the
     // graph path because `answer` is the primary signal here).
     //
@@ -1174,19 +1190,34 @@ async fn graph_aware_query(
     let vector_results: Vec<QueryResult> = {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &state.qdrant {
-            match state.embeddings.load_full().generate_query_single(&body.query).await {
+            let embed_t0 = std::time::Instant::now();
+            let embed_result = state.embeddings.load_full().generate_query_single(&body.query).await;
+            embed_elapsed_ms = embed_t0.elapsed().as_millis();
+            tracing::info!(
+                recall_phase = "embed",
+                duration_ms = embed_elapsed_ms,
+                "phase done"
+            );
+            match embed_result {
                 Ok(embedding) => {
                     // Retain a clone of the embedding for the HippoRAG arm BEFORE
                     // consuming it via version_aware_search (which takes ownership).
                     query_embedding = Some(embedding.clone());
-                    match version_aware_search(
+                    let vsearch_t0 = std::time::Instant::now();
+                    let vsearch_result = version_aware_search(
                         qdrant.as_ref(),
                         embedding,
                         body.top_k,
                         &vfilter,
                     )
-                    .await
-                    {
+                    .await;
+                    vsearch_elapsed_ms = vsearch_t0.elapsed().as_millis();
+                    tracing::info!(
+                        recall_phase = "vector_search",
+                        duration_ms = vsearch_elapsed_ms,
+                        "phase done"
+                    );
+                    match vsearch_result {
                         Ok(results) => {
                             // Build the raw_chunk_texts map and dense_chunk_ids BEFORE
                             // the truncation step so we preserve full chunk content.
@@ -1249,19 +1280,41 @@ async fn graph_aware_query(
     // SSE stream can scope events. graphrag_aware_query may take
     // longer than the search-only path, but the lease write is
     // off the critical path (cheap SQLite write).
+    let leases_t0 = std::time::Instant::now();
     record_session_leases(state, body.session_id.as_deref(), &vector_results).await;
+    leases_elapsed_ms = leases_t0.elapsed().as_millis();
+    tracing::info!(
+        recall_phase = "record_session_leases",
+        duration_ms = leases_elapsed_ms,
+        "phase done"
+    );
 
     // Layer 3: recall is read-only on the in-memory graph. Concurrent
     // recalls share the read-lock; only `extend_graph` / `build_graph`
     // contend on the write-lock. Throughput is then bounded by the
     // semaphore (= chat-backend's concurrent slot count) rather than
     // by lock serialization.
+    let sem_t0 = std::time::Instant::now();
     let _recall_permit = state
         .recall_semaphore
         .clone()
         .acquire_owned()
         .await
         .map_err(|e| ApiError::InternalError(format!("recall semaphore closed: {e}")))?;
+    sem_elapsed_ms = sem_t0.elapsed().as_millis();
+    if sem_elapsed_ms > 100 {
+        tracing::info!(
+            recall_phase = "semaphore_acquire",
+            duration_ms = sem_elapsed_ms,
+            "semaphore wait exceeded 100ms — recall concurrency contention"
+        );
+    } else {
+        tracing::info!(
+            recall_phase = "semaphore_acquire",
+            duration_ms = sem_elapsed_ms,
+            "phase done"
+        );
+    }
 
     // Layer 4: wait-free pointer load. No blocking; if a writer is
     // mid-batch, recall sees the prior snapshot and proceeds.
@@ -1292,6 +1345,12 @@ async fn graph_aware_query(
         // retriever degrades gracefully (PPR runs with an empty seed distribution
         // → no ranked chunks → empty context block → LLM emits "no information").
         QueryMode::HippoRag => {
+            tracing::info!(
+                recall_phase = "hipporag_arm_entry",
+                duration_ms = start.elapsed().as_millis(),
+                "HippoRAG arm entered"
+            );
+
             // Step 1 — build RelationshipStoreAdapter (qdrant-feature guard).
             #[cfg(feature = "qdrant")]
             let rel_store: Option<RelationshipStoreAdapter> = state
@@ -1352,6 +1411,7 @@ async fn graph_aware_query(
                     // query embed calls from 3 → 1.
 
                     // Run PPR retrieve — pass pre_embedded to skip the internal embed_query.
+                    let retrieve_t0 = std::time::Instant::now();
                     let ppr_chunk_ids: Vec<graphrag_core::core::ChunkId> =
                         if let Some(adapter) = &rel_store {
                             if let Some(kg) = graphrag.knowledge_graph() {
@@ -1372,6 +1432,13 @@ async fn graph_aware_query(
                         } else {
                             Vec::new()
                         };
+                    retrieve_elapsed_ms = retrieve_t0.elapsed().as_millis();
+                    tracing::info!(
+                        recall_phase = "retrieve",
+                        duration_ms = retrieve_elapsed_ms,
+                        n_ppr_chunks = ppr_chunk_ids.len(),
+                        "phase done"
+                    );
 
                     // chunk_contents: reuse the raw (un-truncated) text captured by the
                     // up-front search. No second embed or second Qdrant call needed.
@@ -1401,7 +1468,8 @@ async fn graph_aware_query(
                         )
                     })?;
 
-                    graphrag
+                    let ask_t0 = std::time::Instant::now();
+                    let ask_result = graphrag
                         .ask_with_hipporag(
                             &body.query,
                             &rel_store_for_ask,
@@ -1413,7 +1481,14 @@ async fn graph_aware_query(
                         .map_err(|e| {
                             tracing::error!(error = %e, "ask_with_hipporag() failed");
                             ApiError::InternalError(format!("ask_with_hipporag() failed: {}", e))
-                        })?
+                        });
+                    ask_elapsed_ms = ask_t0.elapsed().as_millis();
+                    tracing::info!(
+                        recall_phase = "ask_with_hipporag",
+                        duration_ms = ask_elapsed_ms,
+                        "phase done"
+                    );
+                    ask_result?
                 }
 
                 #[cfg(not(feature = "qdrant"))]
@@ -1455,8 +1530,9 @@ async fn graph_aware_query(
                 })
                 .collect();
 
+            let pack_t0 = std::time::Instant::now();
             let processing_time = start.elapsed().as_millis() as u64;
-            Ok(Json(QueryResponse {
+            let response = Json(QueryResponse {
                 query: body.query.clone(),
                 mode: mode.as_str().to_string(),
                 results: vector_results,
@@ -1470,7 +1546,34 @@ async fn graph_aware_query(
                 // is skipped. `rerank_ms` is always None for this mode.
                 rerank_ms: None,
                 backend: "graphrag-hipporag-ppr".to_string(),
-            }))
+            });
+            pack_elapsed_ms = pack_t0.elapsed().as_millis();
+            tracing::info!(
+                recall_phase = "response_pack",
+                duration_ms = pack_elapsed_ms,
+                "phase done"
+            );
+
+            // ── Card 13: per-request latency summary ─────────────────────────────
+            //
+            // Single structured line emitted at INFO level after every HippoRAG
+            // recall.  All phase durations in milliseconds.  Grep for
+            // `recall_phase = "summary"` to get a per-request latency table.
+            tracing::info!(
+                recall_phase = "summary",
+                mode = "hipporag",
+                total_ms = processing_time,
+                embed_ms = embed_elapsed_ms,
+                vector_search_ms = vsearch_elapsed_ms,
+                leases_ms = leases_elapsed_ms,
+                semaphore_ms = sem_elapsed_ms,
+                retrieve_ms = retrieve_elapsed_ms,
+                ask_with_hipporag_ms = ask_elapsed_ms,
+                response_pack_ms = pack_elapsed_ms,
+                "recall summary"
+            );
+
+            Ok(response)
         },
         QueryMode::Search => unreachable!("search dispatched outside graph_aware_query"),
     }
@@ -4570,5 +4673,113 @@ mod card12_tests {
             "Card 12: ingest_blocks must guard that batch embed returns exactly blocks.len() vectors.\n\
              'embeddings.len() != blocks.len()' not found — add the length mismatch check."
         );
+    }
+}
+
+// ── Card 13: phase-by-phase recall instrumentation ────────────────────────────
+//
+// Static-analysis tests verify that `graph_aware_query` in `main.rs` and
+// `ask_with_hipporag` in `graphrag-core/src/lib.rs` contain the expected
+// structured `tracing::info!` summary fields.  These are compile-time text
+// pattern assertions — they fire without needing a live Qdrant or LLM backend.
+//
+// Strategy: extract the body of each instrumented function between known
+// anchor strings and assert the presence of every required field name in the
+// `recall_phase = "summary"` / `hipporag_phase = "summary"` log call.
+//
+// Run:
+//   cargo test -p graphrag-server --features 'qdrant,openai' --bins card13_tests
+#[cfg(test)]
+mod card13_tests {
+    // ── Test 1: graph_aware_query emits a recall summary with all required fields ─
+    //
+    // Checks the `tracing::info!` summary call at the end of the HippoRAG arm
+    // inside `graph_aware_query`.  The required fields are those specified in
+    // the Card 13 acceptance criteria:
+    //   total_ms, embed_ms, vector_search_ms, leases_ms, semaphore_ms,
+    //   retrieve_ms, ask_with_hipporag_ms, response_pack_ms
+    #[test]
+    fn test_recall_summary_log_fields_present() {
+        let src = include_str!("main.rs");
+
+        // Extract the HippoRAG arm (same boundary strategy as card5_tests).
+        let hipporag_arm_marker = "QueryMode::HippoRag => {";
+        let search_arm_marker = "QueryMode::Search => unreachable!";
+
+        let hipporag_arm_pos = src
+            .find(hipporag_arm_marker)
+            .expect("source must contain 'QueryMode::HippoRag => {' match arm");
+        let search_arm_pos = src[hipporag_arm_pos..]
+            .find(search_arm_marker)
+            .expect("source must contain 'QueryMode::Search => unreachable!' after HippoRag arm")
+            + hipporag_arm_pos;
+
+        let hipporag_arm = &src[hipporag_arm_pos..search_arm_pos];
+
+        // ── A: summary call site must be present ─────────────────────────────
+        assert!(
+            hipporag_arm.contains(r#"recall_phase = "summary""#),
+            "Card 13: HippoRAG arm must contain a recall_phase = \"summary\" tracing::info! call.\n\
+             Not found — add the structured summary log at the end of the arm."
+        );
+
+        // ── B: all required field names ───────────────────────────────────────
+        let required_fields = [
+            "total_ms",
+            "embed_ms",
+            "vector_search_ms",
+            "leases_ms",
+            "semaphore_ms",
+            "retrieve_ms",
+            "ask_with_hipporag_ms",
+            "response_pack_ms",
+        ];
+        for field in &required_fields {
+            assert!(
+                hipporag_arm.contains(field),
+                "Card 13: recall summary tracing::info! must contain field '{field}'.\n\
+                 Not found in HippoRAG arm — add it to the summary log call."
+            );
+        }
+    }
+
+    // ── Test 2: per-phase info! calls present in graph_aware_query ────────────
+    //
+    // Verifies that per-phase `tracing::info!(recall_phase = "<name>", ...)` calls
+    // exist for the major phases so streaming logs show live progress.
+    #[test]
+    fn test_recall_per_phase_info_calls_present() {
+        let src = include_str!("main.rs");
+
+        let fn_start_marker = "async fn graph_aware_query(";
+        let fn_end_marker = "QueryMode::Search => unreachable!";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn graph_aware_query('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain 'QueryMode::Search => unreachable!' after graph_aware_query")
+            + fn_start;
+
+        let fn_body = &src[fn_start..fn_end];
+
+        let expected_phases = [
+            r#"recall_phase = "embed""#,
+            r#"recall_phase = "vector_search""#,
+            r#"recall_phase = "record_session_leases""#,
+            r#"recall_phase = "semaphore_acquire""#,
+            r#"recall_phase = "retrieve""#,
+            r#"recall_phase = "ask_with_hipporag""#,
+            r#"recall_phase = "response_pack""#,
+        ];
+
+        for phase in &expected_phases {
+            assert!(
+                fn_body.contains(phase),
+                "Card 13: graph_aware_query must contain a per-phase log for {phase}.\n\
+                 Not found — add a tracing::info! with this recall_phase field."
+            );
+        }
     }
 }

@@ -2686,6 +2686,15 @@ impl GraphRAG {
         // (100–400 ms extra per query, contradicting the Phase 8 PRD budget).
         let ppr_chunk_ids: Vec<ChunkId> = ppr_chunk_ids.to_vec();
 
+        // ── Card 13: phase instrumentation ───────────────────────────────────
+        let ask_fn_t0 = std::time::Instant::now();
+        let mut entity_walk_elapsed_ms: u128 = 0;
+        let mut bridge_expand_elapsed_ms: u128 = 0;
+        let mut chunks_block_elapsed_ms: u128 = 0;
+        let mut prompt_build_elapsed_ms: u128 = 0;
+        let mut chat_call_elapsed_ms: u128 = 0;
+        let mut postprocess_elapsed_ms: u128 = 0;
+
         // ── Step 2: Gather entities that mention the PPR-ranked chunks ─────────
         //
         // Walk the entity graph to find entities whose mention set overlaps with
@@ -2696,20 +2705,32 @@ impl GraphRAG {
         let mut entity_set: HashMap<EntityId, Entity> = HashMap::new();
         let mut bridge_rels: Vec<(String, String, String)> = Vec::new();
 
+        let entity_walk_t0 = std::time::Instant::now();
         for entity in kg.entities() {
             let mentions_ppr_chunk = entity.mentions.iter().any(|m| ppr_chunk_set.contains(&m.chunk_id));
             if mentions_ppr_chunk {
                 entity_set.insert(entity.id.clone(), entity.clone());
             }
         }
+        let n_entities_selected = entity_set.len();
+        entity_walk_elapsed_ms = entity_walk_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "entity_walk",
+            duration_ms = entity_walk_elapsed_ms,
+            n_entities_selected = n_entities_selected,
+            "phase done"
+        );
 
         // For each entity in the set, collect 1-hop relationship bridges.
         // This mirrors the `ask_with_dual_seeds` expansion so the LLM sees the
         // same kind of relational context regardless of mode.
+        let bridge_expand_t0 = std::time::Instant::now();
+        let mut n_neighbors_expanded: usize = 0;
         for entity_id in entity_set.keys().cloned().collect::<Vec<_>>() {
             let src_name = entity_set[&entity_id].name.clone();
             for (neighbor, rel) in kg.get_neighbors(&entity_id).into_iter().take(5) {
                 bridge_rels.push((src_name.clone(), rel.relation_type.clone(), neighbor.name.clone()));
+                n_neighbors_expanded += 1;
                 if !entity_set.contains_key(&neighbor.id) {
                     entity_set.insert(neighbor.id.clone(), neighbor.clone());
                 }
@@ -2719,6 +2740,14 @@ impl GraphRAG {
         // Dedupe bridge_rels.
         let mut seen_rels: HashSet<(String, String, String)> = HashSet::new();
         bridge_rels.retain(|t| seen_rels.insert(t.clone()));
+        bridge_expand_elapsed_ms = bridge_expand_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "bridge_expand",
+            duration_ms = bridge_expand_elapsed_ms,
+            n_neighbors_expanded = n_neighbors_expanded,
+            n_bridge_rels_final = bridge_rels.len(),
+            "phase done"
+        );
 
         // ── Step 3: Assemble context block ────────────────────────────────────
         let entities_block = if entity_set.is_empty() {
@@ -2761,11 +2790,19 @@ impl GraphRAG {
         // char-budget operates on a pre-trimmed slice (~1–1.5 s prefill saving).
         source_chunk_ids.truncate(self.config.synthesis_top_chunks());
 
+        let chunks_block_t0 = std::time::Instant::now();
         let chunks_block = build_chunks_block(
             &source_chunk_ids,
             chunk_contents,
             self.config.synthesis_chunks_budget(),
             self.config.synthesis.max_chars_per_chunk,
+        );
+        chunks_block_elapsed_ms = chunks_block_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "chunks_block",
+            duration_ms = chunks_block_elapsed_ms,
+            n_source_chunks = source_chunk_ids.len(),
+            "phase done"
         );
 
         let context = format!(
@@ -2780,6 +2817,7 @@ impl GraphRAG {
                 .to_string(),
         })?;
 
+        let prompt_build_t0 = std::time::Instant::now();
         let prompt = self
             .config
             .synthesis
@@ -2802,7 +2840,16 @@ impl GraphRAG {
             keep_alive: self.config.ollama.keep_alive.clone(),
             ..Default::default()
         };
+        let prompt_len = prompt.len();
+        prompt_build_elapsed_ms = prompt_build_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "prompt_build",
+            duration_ms = prompt_build_elapsed_ms,
+            prompt_chars = prompt_len,
+            "phase done"
+        );
 
+        let chat_call_t0 = std::time::Instant::now();
         let raw_answer = client
             .generate_with_extras(
                 &prompt,
@@ -2813,6 +2860,14 @@ impl GraphRAG {
             .map_err(|e| GraphRAGError::Generation {
                 message: format!("LLM generation failed: {}", e),
             })?;
+        chat_call_elapsed_ms = chat_call_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "chat_call",
+            duration_ms = chat_call_elapsed_ms,
+            "phase done"
+        );
+
+        let postprocess_t0 = std::time::Instant::now();
         let answer = Self::remove_thinking_tags(&raw_answer).trim().to_string();
 
         // ── Step 5: Pack ExplainedAnswer ───────────────────────────────────────
@@ -2880,6 +2935,34 @@ impl GraphRAG {
                 confidence,
             },
         ];
+
+        postprocess_elapsed_ms = postprocess_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "postprocess",
+            duration_ms = postprocess_elapsed_ms,
+            "phase done"
+        );
+
+        // ── Card 13: per-request latency summary ──────────────────────────────
+        //
+        // Single structured line emitted after every ask_with_hipporag call.
+        // Grep for `hipporag_phase = "summary"` for per-request breakdown.
+        let total_ask_ms = ask_fn_t0.elapsed().as_millis();
+        tracing::info!(
+            hipporag_phase = "summary",
+            entity_walk_ms = entity_walk_elapsed_ms,
+            bridge_expand_ms = bridge_expand_elapsed_ms,
+            chunks_block_ms = chunks_block_elapsed_ms,
+            prompt_build_ms = prompt_build_elapsed_ms,
+            chat_call_ms = chat_call_elapsed_ms,
+            postprocess_ms = postprocess_elapsed_ms,
+            prompt_chars = prompt_len,
+            n_entities = entity_set.len(),
+            n_bridge_rels = bridge_rels.len(),
+            n_source_chunks = source_chunk_ids.len(),
+            total_ask_ms = total_ask_ms,
+            "ask_with_hipporag summary"
+        );
 
         Ok(retrieval::ExplainedAnswer {
             answer,
@@ -4135,5 +4218,102 @@ mod card6_tests {
             "generate_with_extras must only be called from ask_with_hipporag in lib.rs; \
              found an additional call site outside ask_with_hipporag"
         );
+    }
+}
+
+// ── Card 13: phase instrumentation in ask_with_hipporag ───────────────────────
+//
+// Static-analysis tests verify that `ask_with_hipporag` contains the expected
+// `hipporag_phase = "summary"` tracing::info! call with all required fields.
+// No live backend needed — pure source text pattern assertions.
+//
+// Run:
+//   cargo test -p graphrag-core --lib --features 'async,pagerank' card13_tests
+#[cfg(test)]
+#[cfg(all(feature = "async", feature = "pagerank"))]
+mod card13_tests {
+    // ── Test 1: ask_with_hipporag emits a summary with all required fields ─────
+    //
+    // Required fields per Card 13 spec:
+    //   entity_walk_ms, bridge_expand_ms, chunks_block_ms, prompt_build_ms,
+    //   chat_call_ms, postprocess_ms, prompt_chars, n_entities, n_bridge_rels,
+    //   n_source_chunks
+    #[test]
+    fn test_ask_with_hipporag_summary_log_fields_present() {
+        let src = include_str!("lib.rs");
+
+        // Extract ask_with_hipporag body using the same boundary strategy as
+        // the existing card-level tests in this file.
+        let hippo_start = src
+            .find("pub async fn ask_with_hipporag")
+            .expect("ask_with_hipporag must exist in lib.rs");
+        let after_hippo = &src[hippo_start + 1..];
+        let hippo_end_offset = after_hippo
+            .find("\n    pub async fn ")
+            .or_else(|| after_hippo.find("\n    pub fn "))
+            .unwrap_or(after_hippo.len());
+        let hippo_body = &src[hippo_start..hippo_start + 1 + hippo_end_offset];
+
+        // ── A: summary call site ──────────────────────────────────────────────
+        assert!(
+            hippo_body.contains(r#"hipporag_phase = "summary""#),
+            "Card 13: ask_with_hipporag must contain a hipporag_phase = \"summary\" \
+             tracing::info! call.\n\
+             Not found — add the structured summary log at the end of the function."
+        );
+
+        // ── B: all required field names ───────────────────────────────────────
+        let required_fields = [
+            "entity_walk_ms",
+            "bridge_expand_ms",
+            "chunks_block_ms",
+            "prompt_build_ms",
+            "chat_call_ms",
+            "postprocess_ms",
+            "prompt_chars",
+            "n_entities",
+            "n_bridge_rels",
+            "n_source_chunks",
+        ];
+        for field in &required_fields {
+            assert!(
+                hippo_body.contains(field),
+                "Card 13: ask_with_hipporag summary log must contain field '{field}'.\n\
+                 Not found — add it to the hipporag_phase = \"summary\" tracing::info! call."
+            );
+        }
+    }
+
+    // ── Test 2: per-phase info! calls present in ask_with_hipporag ────────────
+    #[test]
+    fn test_ask_with_hipporag_per_phase_info_calls_present() {
+        let src = include_str!("lib.rs");
+
+        let hippo_start = src
+            .find("pub async fn ask_with_hipporag")
+            .expect("ask_with_hipporag must exist in lib.rs");
+        let after_hippo = &src[hippo_start + 1..];
+        let hippo_end_offset = after_hippo
+            .find("\n    pub async fn ")
+            .or_else(|| after_hippo.find("\n    pub fn "))
+            .unwrap_or(after_hippo.len());
+        let hippo_body = &src[hippo_start..hippo_start + 1 + hippo_end_offset];
+
+        let expected_phases = [
+            r#"hipporag_phase = "entity_walk""#,
+            r#"hipporag_phase = "bridge_expand""#,
+            r#"hipporag_phase = "chunks_block""#,
+            r#"hipporag_phase = "prompt_build""#,
+            r#"hipporag_phase = "chat_call""#,
+            r#"hipporag_phase = "postprocess""#,
+        ];
+
+        for phase in &expected_phases {
+            assert!(
+                hippo_body.contains(phase),
+                "Card 13: ask_with_hipporag must contain a per-phase log for {phase}.\n\
+                 Not found — add a tracing::info! with this hipporag_phase field."
+            );
+        }
     }
 }
