@@ -440,6 +440,12 @@ impl Default for MultiModalScores {
     }
 }
 
+// ── PRPACK fidelity fixtures (auto-generated, cfg(test) only) ─────────────────
+#[cfg(test)]
+mod ppr_fixtures {
+    include!("../../../graphrag-core/tests/fixtures/ppr_fixtures.rs");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +677,101 @@ mod tests {
         let score_b = combined.get(&entity_b).unwrap();
         assert!(*score_a > 0.0);
         assert!(*score_b > 0.0);
+    }
+
+    // ── PRPACK numerical-fidelity tests (PRD ID-7) ──────────────────────────
+
+    /// Build a `PersonalizedPageRank` from a `ppr_fixtures::PprFixture`.
+    ///
+    /// Node IDs are `n0`, `n1`, … matching the fixture's integer indices.
+    fn ppr_from_fixture(fixture: &ppr_fixtures::PprFixture) -> PersonalizedPageRank {
+        let n = fixture.n;
+
+        // Build CSR adjacency matrix from fixture edges
+        let mut triplet = sprs::TriMat::new((n, n));
+        for &(src, dst, weight) in fixture.edges {
+            triplet.add_triplet(src, dst, weight);
+        }
+        let adjacency = triplet.to_csr();
+
+        // Build node mappings: index i → entity "ni"
+        let mut node_mapping = HashMap::new();
+        let mut reverse_mapping = HashMap::new();
+        for i in 0..n {
+            let id = EntityId::new(format!("n{i}"));
+            node_mapping.insert(id.clone(), i);
+            reverse_mapping.insert(i, id);
+        }
+
+        let mut config = PageRankConfig::default();
+        config.damping_factor = fixture.damping;
+
+        PersonalizedPageRank::new(config, adjacency, node_mapping, reverse_mapping)
+    }
+
+    /// Validate `calculate_scores` against igraph PRPACK ground truth for all
+    /// embedded fixtures (PRD ID-7).  Tolerance: relative L∞ ≤ 1e-5.
+    #[test]
+    fn test_pagerank_matches_prpack_on_fixtures() {
+        let tolerance = 1e-5_f64;
+
+        for fixture in ppr_fixtures::FIXTURES {
+            let ppr = ppr_from_fixture(fixture);
+
+            // Build reset map from fixture's sparse personalisation vector
+            let mut reset: HashMap<EntityId, f64> = HashMap::new();
+            for &(idx, weight) in fixture.reset {
+                reset.insert(EntityId::new(format!("n{idx}")), weight);
+            }
+
+            let scores = ppr
+                .calculate_scores(&reset)
+                .unwrap_or_else(|e| panic!("fixture '{}': calculate_scores failed: {e}", fixture.name));
+
+            assert_eq!(
+                scores.len(),
+                fixture.n,
+                "fixture '{}': expected {} scores, got {}",
+                fixture.name,
+                fixture.n,
+                scores.len()
+            );
+
+            let mut max_rel_err = 0.0_f64;
+
+            for i in 0..fixture.n {
+                let id = EntityId::new(format!("n{i}"));
+                let actual = scores
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| panic!("fixture '{}': missing score for node n{i}", fixture.name));
+                let expected = fixture.expected_scores[i];
+
+                // Relative error — denominator is max(expected, 1e-12) to handle
+                // near-zero expected scores without division by zero.
+                let rel_err = (actual - expected).abs() / expected.abs().max(1e-12);
+                max_rel_err = max_rel_err.max(rel_err);
+
+                assert!(
+                    rel_err < tolerance,
+                    "fixture '{}' node n{i}: expected {expected:.20e}, got {actual:.20e}, rel err {rel_err:.3e} ≥ {tolerance:.0e}",
+                    fixture.name
+                );
+            }
+
+            // Scores must be a probability distribution (sum ≈ 1, all non-negative)
+            let total: f64 = scores.values().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "fixture '{}': scores should sum to 1.0, got {total}",
+                fixture.name
+            );
+
+            // Log max rel error for audit (only visible with --nocapture)
+            eprintln!(
+                "[prpack_fidelity] fixture '{}' n={}: max rel err = {max_rel_err:.2e}",
+                fixture.name, fixture.n
+            );
+        }
     }
 }
