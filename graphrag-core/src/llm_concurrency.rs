@@ -137,6 +137,8 @@ impl AdaptiveSemaphore {
     /// releases the permit but does not adjust the cap (treat as
     /// telemetry-skipped — neither success nor failure).
     pub async fn acquire(self: &Arc<Self>) -> AdaptivePermit {
+        let acquire_t0 = Instant::now();
+        let mut waited = false;
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -144,12 +146,25 @@ impl AdaptiveSemaphore {
                 let mut state = self.state.lock().expect("poisoned");
                 if state.in_flight < state.permits_max {
                     state.in_flight += 1;
+                    let wait_ms = acquire_t0.elapsed().as_millis();
+                    // Card 14: log only when wait exceeded 100ms to avoid log spam.
+                    #[cfg(feature = "tracing")]
+                    if waited && wait_ms > 100 {
+                        tracing::info!(
+                            llm_concurrency_phase = "acquire_waited",
+                            wait_ms = wait_ms,
+                            cap = state.permits_max,
+                            in_flight = state.in_flight,
+                            "llm concurrency semaphore wait > 100ms"
+                        );
+                    }
                     return AdaptivePermit {
                         sem: Arc::clone(self),
                         released: false,
                     };
                 }
             }
+            waited = true;
             notified.await;
         }
     }
@@ -175,10 +190,11 @@ impl AdaptiveSemaphore {
             drop(state);
             #[cfg(feature = "tracing")]
             tracing::info!(
-                "llm.concurrency: {} → {} (grew: {} consecutive successes)",
-                prev,
-                new,
-                self.config.success_threshold,
+                llm_concurrency_phase = "grow",
+                from = prev,
+                to = new,
+                success_threshold_met = self.config.success_threshold,
+                "llm concurrency cap grew"
             );
             #[cfg(not(feature = "tracing"))]
             let _ = (prev, new);
@@ -207,9 +223,11 @@ impl AdaptiveSemaphore {
             drop(state);
             #[cfg(feature = "tracing")]
             tracing::warn!(
-                "llm.concurrency: {} → {} (shrunk: transport failure)",
-                prev,
-                new,
+                llm_concurrency_phase = "shrink",
+                from = prev,
+                to = new,
+                reason = "transport_failure",
+                "llm concurrency cap shrunk"
             );
             #[cfg(not(feature = "tracing"))]
             let _ = (prev, new);

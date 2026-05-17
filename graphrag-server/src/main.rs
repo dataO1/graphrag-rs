@@ -1159,6 +1159,20 @@ async fn graph_aware_query(
     //
     // Variables are set to 0 by default and overwritten inside the HippoRAG arm.
     // The mode=search path is NOT instrumented (already confirmed fast at 1.1 s).
+
+    // ── Card 14: per-request correlation ID ──────────────────────────────────
+    //
+    // Prefer the caller's session_id (first 8 chars) if present so all recall
+    // lines for a session can be correlated. Fall back to a fresh UUID slice.
+    let request_id: String = body
+        .session_id
+        .as_deref()
+        .and_then(|s| s.get(..8.min(s.len())).map(str::to_string))
+        .unwrap_or_else(|| {
+            let raw = uuid::Uuid::new_v4().to_string();
+            raw[..8].to_string()
+        });
+
     let mut embed_elapsed_ms: u128 = 0;
     let mut vsearch_elapsed_ms: u128 = 0;
     let mut leases_elapsed_ms: u128 = 0;
@@ -1294,24 +1308,43 @@ async fn graph_aware_query(
     // contend on the write-lock. Throughput is then bounded by the
     // semaphore (= chat-backend's concurrent slot count) rather than
     // by lock serialization.
+    //
+    // Card 14: try_acquire_owned first to detect semaphore exhaustion without
+    // blocking. When the semaphore is full, log the exhaustion event + wait time
+    // separately so ops can detect concurrency pressure.
     let sem_t0 = std::time::Instant::now();
-    let _recall_permit = state
-        .recall_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| ApiError::InternalError(format!("recall semaphore closed: {e}")))?;
+    let _recall_permit = {
+        let sem = state.recall_semaphore.clone();
+        match sem.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Semaphore is exhausted — all slots in use. Log the contention
+                // event and fall back to the blocking acquire.
+                tracing::info!(
+                    recall_semaphore_exhausted = true,
+                    request_id = %request_id,
+                    "recall semaphore fully exhausted — waiting for a slot"
+                );
+                sem.acquire_owned()
+                    .await
+                    .map_err(|e| ApiError::InternalError(format!("recall semaphore closed: {e}")))?
+            }
+        }
+    };
     sem_elapsed_ms = sem_t0.elapsed().as_millis();
     if sem_elapsed_ms > 100 {
         tracing::info!(
             recall_phase = "semaphore_acquire",
             duration_ms = sem_elapsed_ms,
+            recall_semaphore_wait_ms = sem_elapsed_ms,
+            request_id = %request_id,
             "semaphore wait exceeded 100ms — recall concurrency contention"
         );
     } else {
         tracing::info!(
             recall_phase = "semaphore_acquire",
             duration_ms = sem_elapsed_ms,
+            request_id = %request_id,
             "phase done"
         );
     }
@@ -1559,6 +1592,7 @@ async fn graph_aware_query(
             // Single structured line emitted at INFO level after every HippoRAG
             // recall.  All phase durations in milliseconds.  Grep for
             // `recall_phase = "summary"` to get a per-request latency table.
+            // Card 14 adds `request_id` for cross-signal correlation.
             tracing::info!(
                 recall_phase = "summary",
                 mode = "hipporag",
@@ -1570,6 +1604,7 @@ async fn graph_aware_query(
                 retrieve_ms = retrieve_elapsed_ms,
                 ask_with_hipporag_ms = ask_elapsed_ms,
                 response_pack_ms = pack_elapsed_ms,
+                request_id = %request_id,
                 "recall summary"
             );
 
@@ -1643,7 +1678,10 @@ async fn ingest_blocks(
     blocks: Vec<crate::models::BlockInput>,
     removed_block_ids: Vec<String>,
     _file_hash: Option<String>,
+    request_id: &str,
 ) -> Result<BlockIngestOutcome, ApiError> {
+    // ── Card 14: ingest_blocks phase-by-phase instrumentation ────────────────
+    let ingest_start = std::time::Instant::now();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let mut superseded: usize = 0;
     let mut added: usize = 0;
@@ -1654,6 +1692,7 @@ async fn ingest_blocks(
         // read the prior content first so the stale-context event
         // can carry the deleted text for the agent to reason about
         // ("the paragraph you cited has been removed").
+        let supersede_pass_t0 = std::time::Instant::now();
         for bid in &removed_block_ids {
             let prior = qdrant
                 .find_current_block(&user_id, bid)
@@ -1703,9 +1742,21 @@ async fn ingest_blocks(
                 .map_err(|e| ApiError::InternalError(format!("supersede prior block {} failed: {e}", block.id)))?;
             priors.push(prior);
         }
+        let supersede_pass_ms = supersede_pass_t0.elapsed().as_millis();
+        let n_blocks_superseded = superseded + priors.iter().filter(|p| p.is_some()).count();
+        tracing::info!(
+            ingest_phase = "supersede_pass",
+            duration_ms = supersede_pass_ms,
+            n_blocks_superseded = n_blocks_superseded,
+            request_id = request_id,
+            "phase done"
+        );
 
         // Pass 2: build embed inputs and call generate in one batched request.
         // Skip the batch entirely when there are no blocks to embed.
+        let batch_embed_t0 = std::time::Instant::now();
+        let n_blocks_to_embed = blocks.len();
+        let embed_pool_concurrency: usize = 16; // matches the pool size in EmbeddingService
         let embeddings: Vec<Vec<f32>> = if blocks.is_empty() {
             Vec::new()
         } else {
@@ -1733,9 +1784,20 @@ async fn ingest_blocks(
             }
             embeddings
         };
+        let batch_embed_ms = batch_embed_t0.elapsed().as_millis();
+        tracing::info!(
+            ingest_phase = "batch_embed",
+            duration_ms = batch_embed_ms,
+            n_blocks_embedded = n_blocks_to_embed,
+            embed_pool_concurrency = embed_pool_concurrency,
+            request_id = request_id,
+            "phase done"
+        );
 
         // Pass 3: insert each block with its corresponding embedding and emit
         // stale-context events. Zip guarantees 1:1 correspondence with pass 1.
+        let insert_emit_t0 = std::time::Instant::now();
+        let mut n_events_emitted: usize = 0;
         for ((block, embedding), prior) in blocks.into_iter().zip(embeddings.into_iter()).zip(priors.into_iter()) {
             let chunk_uuid = uuid::Uuid::new_v4().to_string();
             let metadata = qdrant_store::DocumentMetadata {
@@ -1791,7 +1853,31 @@ async fn ingest_blocks(
                 Some(block.content.as_str()),
             )
             .await;
+            n_events_emitted += 1;
         }
+        let insert_emit_ms = insert_emit_t0.elapsed().as_millis();
+        tracing::info!(
+            ingest_phase = "insert_emit",
+            duration_ms = insert_emit_ms,
+            n_blocks_inserted = added,
+            n_events_emitted = n_events_emitted,
+            request_id = request_id,
+            "phase done"
+        );
+
+        let total_ingest_ms = ingest_start.elapsed().as_millis();
+        tracing::info!(
+            ingest_phase = "summary",
+            total_ms = total_ingest_ms,
+            supersede_pass_ms = supersede_pass_ms,
+            batch_embed_ms = batch_embed_ms,
+            insert_emit_ms = insert_emit_ms,
+            n_blocks = n_blocks_to_embed,
+            n_superseded = superseded,
+            n_added = added,
+            request_id = request_id,
+            "ingest summary"
+        );
 
         // Phase 6: chunks now live exclusively in Qdrant (already
         // written above). The pipeline feed into the in-memory KG is
@@ -2087,6 +2173,8 @@ async fn ingest_one_text(
             }
         }
 
+        // ── Card 14: single_doc_embed phase ──────────────────────────────────
+        let single_doc_embed_t0 = std::time::Instant::now();
         let embedding = state
             .embeddings
             .load_full()
@@ -2096,6 +2184,12 @@ async fn ingest_one_text(
                 tracing::error!("Failed to generate document embedding: {}", e);
                 ApiError::InternalError(format!("Failed to generate embedding: {}", e))
             })?;
+        let single_doc_embed_ms = single_doc_embed_t0.elapsed().as_millis();
+        tracing::info!(
+            ingest_phase = "single_doc_embed",
+            duration_ms = single_doc_embed_ms,
+            "phase done"
+        );
 
         // Auto-derive source for path-form (user_id is the absolute
         // path string in that case) so every persisted point now
@@ -2127,10 +2221,18 @@ async fn ingest_one_text(
             custom: HashMap::new(),
         };
 
+        // ── Card 14: single_doc_persist phase ────────────────────────────────
+        let single_doc_persist_t0 = std::time::Instant::now();
         qdrant
             .add_document(&id, embedding, metadata)
             .await
             .map_err(|e| ApiError::InternalError(format!("Failed to add document to Qdrant: {}", e)))?;
+        let single_doc_persist_ms = single_doc_persist_t0.elapsed().as_millis();
+        tracing::info!(
+            ingest_phase = "single_doc_persist",
+            duration_ms = single_doc_persist_ms,
+            "phase done"
+        );
 
         if is_upsert {
             tracing::info!(
@@ -2249,6 +2351,12 @@ async fn add_document(
     state: Data<AppState>,
     body: Json<AddDocumentRequest>,
 ) -> Result<Json<DocumentOperationResponse>, ApiError> {
+    // ── Card 14: per-request correlation ID ──────────────────────────────────
+    let request_id: String = {
+        let raw = uuid::Uuid::new_v4().to_string();
+        raw[..8].to_string()
+    };
+
     // Variant arbitration. Exactly one body flavor must be set; both
     // zero and >1 are user errors.
     let n_set = (body.content.is_some() as u8)
@@ -2308,6 +2416,7 @@ async fn add_document(
                 blocks,
                 body.removed_block_ids.clone().unwrap_or_default(),
                 body.file_hash.clone(),
+                &request_id,
             )
             .await?;
             let backend = if state.has_qdrant() { "qdrant" } else { "memory" };
@@ -3129,6 +3238,11 @@ async fn stale_context_cleanup_loop(state: AppState, interval: std::time::Durati
 /// `BuildGraphResponse` so the HTTP route can serialize it directly
 /// and the coalescer can log a structured summary.
 async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiError> {
+    // ── Card 14: per-append-graph correlation ID ─────────────────────────────
+    let request_id: String = {
+        let raw = uuid::Uuid::new_v4().to_string();
+        raw[..8].to_string()
+    };
     let start = std::time::Instant::now();
 
     // Layer 4 (revised): mutate the writer-owned master in place across
@@ -3560,6 +3674,21 @@ async fn do_append_graph(state: &AppState) -> Result<BuildGraphResponse, ApiErro
         processing_time,
         last_total_entities,
         last_total_relationships,
+    );
+
+    // ── Card 14: extend_graph structured summary ──────────────────────────────
+    tracing::info!(
+        extend_graph_phase = "summary",
+        total_ms = processing_time,
+        n_chunks = total_chunks_processed,
+        n_batches = batch_idx,
+        n_entities_added = total_new_entities,
+        n_rels_added = total_new_relationships,
+        n_mentions_merged = total_mentions_merged,
+        total_entities = last_total_entities,
+        total_relationships = last_total_relationships,
+        request_id = %request_id,
+        "extend_graph summary"
     );
 
     Ok(BuildGraphResponse {
@@ -3998,17 +4127,34 @@ async fn main() -> std::io::Result<()> {
 #[cfg(feature = "qdrant")]
 pub(crate) fn spawn_ppr_cache_rebuild(state: &AppState, graph_snap: graphrag_core::GraphRAG) {
     let ppr_state = state.ppr_cache.clone();
+    // Capture the graph shape for the summary log (before moving graph_snap).
+    let n_entities_for_ppr = graph_snap
+        .knowledge_graph()
+        .map(|kg| kg.entities().count())
+        .unwrap_or(0);
+    let n_relationships_for_ppr = graph_snap
+        .knowledge_graph()
+        .map(|kg| kg.relationships().count())
+        .unwrap_or(0);
     tokio::spawn(async move {
+        let ppr_rebuild_t0 = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             graph_snap
                 .knowledge_graph()
                 .map(|kg| kg.build_pagerank_calculator())
         })
         .await;
+        let ppr_rebuild_ms = ppr_rebuild_t0.elapsed().as_millis();
         match result {
             Ok(Some(Ok(ppr))) => {
                 ppr_state.store(Some(std::sync::Arc::new(ppr)));
-                tracing::info!("PPR cache rebuilt after graph update");
+                tracing::info!(
+                    ppr_cache_phase = "rebuild",
+                    duration_ms = ppr_rebuild_ms,
+                    n_entities = n_entities_for_ppr,
+                    n_relationships = n_relationships_for_ppr,
+                    "PPR cache rebuilt after graph update"
+                );
             }
             Ok(Some(Err(e))) => tracing::warn!(error = %e, "PPR cache rebuild failed"),
             _ => {}
@@ -4779,6 +4925,255 @@ mod card13_tests {
                 fn_body.contains(phase),
                 "Card 13: graph_aware_query must contain a per-phase log for {phase}.\n\
                  Not found — add a tracing::info! with this recall_phase field."
+            );
+        }
+    }
+}
+
+// ── Card 14: cross-cutting performance instrumentation static tests ──────────
+//
+// These tests verify the Card 14 instrumentation landed in the correct places:
+//   1. ingest_blocks emits ingest_phase = "summary" with required fields.
+//   2. do_append_graph emits extend_graph_phase = "summary" with required fields.
+//   3. recall summary (graph_aware_query) carries request_id for correlation.
+//   4. ingest_blocks summary carries request_id for correlation.
+//   5. recall semaphore exhaustion detection code exists.
+//   6. spawn_ppr_cache_rebuild emits ppr_cache_phase = "rebuild" with timing.
+//
+// Run:
+//   cargo test -p graphrag-server --features 'qdrant,openai' --bins card14_tests
+#[cfg(test)]
+mod card14_tests {
+    // ── Test 1: ingest_blocks emits ingest_phase = "summary" with required fields ─
+    //
+    // Required fields per Card 14 spec:
+    //   total_ms, supersede_pass_ms, batch_embed_ms, insert_emit_ms,
+    //   n_blocks, n_superseded, n_added, request_id
+    #[test]
+    fn test_ingest_blocks_summary_log_fields_present() {
+        let src = include_str!("main.rs");
+
+        // Extract ingest_blocks body between its signature and the Record-a-session doc-comment.
+        let fn_start_marker = "async fn ingest_blocks(";
+        let fn_end_marker = "/// Record a session";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn ingest_blocks('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// Record a session' after ingest_blocks")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        // ── A: summary call site ──────────────────────────────────────────────
+        assert!(
+            body.contains(r#"ingest_phase = "summary""#),
+            "Card 14: ingest_blocks must contain ingest_phase = \"summary\" tracing::info! call.\n\
+             Not found — add the structured summary log at the end of the qdrant arm."
+        );
+
+        // ── B: all required summary field names ───────────────────────────────
+        let required_fields = [
+            "total_ms",
+            "supersede_pass_ms",
+            "batch_embed_ms",
+            "insert_emit_ms",
+            "n_blocks",
+            "n_superseded",
+            "n_added",
+            "request_id",
+        ];
+        for field in &required_fields {
+            assert!(
+                body.contains(field),
+                "Card 14: ingest_blocks summary tracing::info! must contain field '{field}'.\n\
+                 Not found — add it to the ingest_phase = \"summary\" log call."
+            );
+        }
+    }
+
+    // ── Test 2: do_append_graph emits extend_graph_phase = "summary" ──────────
+    //
+    // Required fields per Card 14 spec:
+    //   total_ms, n_chunks, n_entities_added, n_rels_added, request_id
+    #[test]
+    fn test_do_append_graph_extend_summary_log_fields_present() {
+        let src = include_str!("main.rs");
+
+        // Extract do_append_graph body between its signature and graph_stats fn.
+        let fn_start_marker = "async fn do_append_graph(state: &AppState)";
+        let fn_end_marker = "/// Get graph statistics";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn do_append_graph(state: &AppState)'");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// Get graph statistics' after do_append_graph")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        // ── A: summary call site ──────────────────────────────────────────────
+        assert!(
+            body.contains(r#"extend_graph_phase = "summary""#),
+            "Card 14: do_append_graph must contain extend_graph_phase = \"summary\" tracing::info! call.\n\
+             Not found — add the structured summary log."
+        );
+
+        // ── B: required summary field names ──────────────────────────────────
+        let required_fields = [
+            "total_ms",
+            "n_chunks",
+            "n_entities_added",
+            "n_rels_added",
+            "request_id",
+        ];
+        for field in &required_fields {
+            assert!(
+                body.contains(field),
+                "Card 14: do_append_graph extend_graph_phase summary must contain field '{field}'.\n\
+                 Not found — add it to the extend_graph_phase = \"summary\" log call."
+            );
+        }
+    }
+
+    // ── Test 3: recall summary carries request_id for correlation ─────────────
+    //
+    // Verifies that graph_aware_query's recall_phase = "summary" call includes
+    // a request_id field so recall + extraction events can be correlated.
+    #[test]
+    fn test_recall_summary_carries_request_id() {
+        let src = include_str!("main.rs");
+
+        // Extract the HippoRAG arm (same anchors as card13_tests::test_recall_summary_log_fields_present).
+        let hipporag_arm_marker = "QueryMode::HippoRag => {";
+        let search_arm_marker = "QueryMode::Search => unreachable!";
+
+        let hipporag_arm_pos = src
+            .find(hipporag_arm_marker)
+            .expect("source must contain 'QueryMode::HippoRag => {' match arm");
+        let search_arm_pos = src[hipporag_arm_pos..]
+            .find(search_arm_marker)
+            .expect("source must contain 'QueryMode::Search => unreachable!' after HippoRag arm")
+            + hipporag_arm_pos;
+
+        let hipporag_arm = &src[hipporag_arm_pos..search_arm_pos];
+
+        // The summary block must contain both recall_phase = "summary" and request_id.
+        assert!(
+            hipporag_arm.contains(r#"recall_phase = "summary""#),
+            "Card 14: HippoRAG arm must contain recall_phase = \"summary\" tracing::info! call."
+        );
+        assert!(
+            hipporag_arm.contains("request_id"),
+            "Card 14: recall_phase = \"summary\" must include a request_id field for cross-signal correlation.\n\
+             Not found in HippoRAG arm — add 'request_id = %request_id' to the summary tracing::info! call."
+        );
+    }
+
+    // ── Test 4: ingest summary carries request_id for correlation ─────────────
+    //
+    // Verifies that ingest_blocks' ingest_phase = "summary" call includes
+    // a request_id field so ingest events can be correlated with recall events.
+    #[test]
+    fn test_ingest_summary_carries_request_id() {
+        let src = include_str!("main.rs");
+
+        let fn_start_marker = "async fn ingest_blocks(";
+        let fn_end_marker = "/// Record a session";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn ingest_blocks('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// Record a session' after ingest_blocks")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        assert!(
+            body.contains(r#"ingest_phase = "summary""#),
+            "Card 14: ingest_blocks must have ingest_phase = \"summary\" log."
+        );
+        assert!(
+            body.contains("request_id"),
+            "Card 14: ingest_phase = \"summary\" must include a request_id field.\n\
+             Not found in ingest_blocks body — add 'request_id = request_id' to the summary log."
+        );
+    }
+
+    // ── Test 5: recall semaphore exhaustion detection code exists ─────────────
+    //
+    // Verifies that graph_aware_query uses try_acquire_owned() to detect
+    // semaphore exhaustion and logs recall_semaphore_exhausted = true.
+    #[test]
+    fn test_recall_semaphore_exhaustion_detection_present() {
+        let src = include_str!("main.rs");
+
+        let fn_start_marker = "async fn graph_aware_query(";
+        let fn_end_marker = "QueryMode::Search => unreachable!";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn graph_aware_query('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain 'QueryMode::Search => unreachable!' after graph_aware_query")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        assert!(
+            body.contains("try_acquire_owned"),
+            "Card 14: graph_aware_query must use try_acquire_owned() on the recall semaphore \
+             to detect exhaustion without blocking.\n\
+             Not found — add the try_acquire_owned path per Card 14 spec."
+        );
+        assert!(
+            body.contains("recall_semaphore_exhausted"),
+            "Card 14: graph_aware_query must log recall_semaphore_exhausted = true when the \
+             semaphore is at capacity.\n\
+             Not found — add the exhaustion log per Card 14 spec."
+        );
+    }
+
+    // ── Test 6: spawn_ppr_cache_rebuild emits ppr_cache_phase = "rebuild" ─────
+    //
+    // Verifies that spawn_ppr_cache_rebuild emits structured timing with
+    // ppr_cache_phase = "rebuild", duration_ms, n_entities, n_relationships.
+    #[test]
+    fn test_spawn_ppr_cache_rebuild_emits_timing() {
+        let src = include_str!("main.rs");
+
+        let fn_start_marker = "pub(crate) fn spawn_ppr_cache_rebuild(";
+        let fn_end_marker = "// ── Card 3 tests ────";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'pub(crate) fn spawn_ppr_cache_rebuild('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '// ── Card 3 tests ────' after spawn_ppr_cache_rebuild")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        assert!(
+            body.contains(r#"ppr_cache_phase = "rebuild""#),
+            "Card 14: spawn_ppr_cache_rebuild must emit ppr_cache_phase = \"rebuild\" structured log.\n\
+             Not found — add the timing log per Card 14 spec."
+        );
+
+        let required_fields = ["duration_ms", "n_entities", "n_relationships"];
+        for field in &required_fields {
+            assert!(
+                body.contains(field),
+                "Card 14: spawn_ppr_cache_rebuild ppr_cache_phase log must contain field '{field}'.\n\
+                 Not found — add it to the tracing::info! call."
             );
         }
     }

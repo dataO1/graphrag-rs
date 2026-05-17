@@ -862,6 +862,9 @@ impl GraphRAG {
     ) -> Result<ExtendSummary> {
         use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+        // ── Card 14: extend_graph_inner phase instrumentation ────────────────
+        let extend_total_t0 = std::time::Instant::now();
+
         let total_entities_before = self
             .knowledge_graph
             .as_ref()
@@ -889,6 +892,8 @@ impl GraphRAG {
             });
         }
 
+        // Phase prep: build transient TextChunks from caller input.
+        let prep_t0 = std::time::Instant::now();
         // Build transient TextChunks from caller input so the existing
         // extractor machinery (extend_with_*) can work unchanged. These
         // chunks live for the duration of this call only — they are NOT
@@ -916,9 +921,13 @@ impl GraphRAG {
         };
 
         let mut metrics = ExtractMetrics::default();
+        let prep_ms = prep_t0.elapsed().as_millis();
 
         #[cfg(feature = "tracing")]
         tracing::info!(
+            extend_graph_phase = "prep",
+            duration_ms = prep_ms,
+            n_chunks = total_delta,
             "extend_graph: processing {} chunks (approach='{}', use_gleaning={}, openai.enabled={}, ollama.enabled={})",
             total_delta,
             self.config.approach,
@@ -927,6 +936,8 @@ impl GraphRAG {
             self.config.ollama.enabled,
         );
 
+        // Phase llm_extract_loop: run the extractor over all delta chunks.
+        let llm_extract_t0 = std::time::Instant::now();
         if self.config.entities.use_gleaning && self.config.chat_enabled() {
             self.extend_with_gleaning(&delta_chunks, &mut metrics, &make_pb).await?;
         } else if self.config.chat_enabled() {
@@ -952,8 +963,19 @@ impl GraphRAG {
         } else {
             self.extend_with_pattern_extraction(&delta_chunks, &mut metrics, &make_pb)?;
         }
+        let llm_extract_ms = llm_extract_t0.elapsed().as_millis();
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            extend_graph_phase = "llm_extract_loop",
+            duration_ms = llm_extract_ms,
+            n_chunks = total_delta,
+            entities_extracted = metrics.new_entities,
+            relationships_extracted = metrics.new_relationships,
+            "phase done"
+        );
 
-        // Final totals (re-read; extraction may have added entities).
+        // Phase entity_merge: re-read final totals (extraction merged into graph).
+        let entity_merge_t0 = std::time::Instant::now();
         let (total_entities, total_relationships) = {
             let graph = self
                 .knowledge_graph
@@ -963,10 +985,43 @@ impl GraphRAG {
                 })?;
             (graph.entities().count(), graph.relationships().count())
         };
+        let entity_merge_ms = entity_merge_t0.elapsed().as_millis();
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            extend_graph_phase = "entity_merge",
+            duration_ms = entity_merge_ms,
+            total_entities = total_entities,
+            total_relationships = total_relationships,
+            "phase done"
+        );
 
+        // Phase sidecar_persist: save entity + relationship vectors (workspace).
+        let sidecar_persist_t0 = std::time::Instant::now();
         // Persist (entity + relationship side; chunks are not part of
         // graphrag-core's persistence anymore — Qdrant owns them).
         self.save_to_workspace()?;
+        let sidecar_persist_ms = sidecar_persist_t0.elapsed().as_millis();
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            extend_graph_phase = "sidecar_persist",
+            duration_ms = sidecar_persist_ms,
+            "phase done"
+        );
+
+        let total_extend_ms = extend_total_t0.elapsed().as_millis();
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            extend_graph_phase = "summary",
+            total_ms = total_extend_ms,
+            prep_ms = prep_ms,
+            llm_extract_ms = llm_extract_ms,
+            entity_merge_ms = entity_merge_ms,
+            sidecar_persist_ms = sidecar_persist_ms,
+            n_chunks = total_delta,
+            n_entities_added = metrics.new_entities,
+            n_rels_added = metrics.new_relationships,
+            "extend_graph summary"
+        );
 
         Ok(ExtendSummary {
             chunks_processed: total_delta,
@@ -1075,18 +1130,21 @@ impl GraphRAG {
         // graph mutation happens in the serial consumer below where
         // we hold &mut self.knowledge_graph exclusively.
         use futures::stream::{self, StreamExt};
+        // Card 14: capture per-chunk duration by timing inside the closure.
         let mut stream = stream::iter(delta_chunks.iter().cloned().enumerate())
             .map(|(idx, chunk)| {
                 let extractor = extractor.clone();
                 async move {
+                    let chunk_t0 = std::time::Instant::now();
                     let res = extractor.extract_from_chunk(&chunk).await;
-                    (idx, chunk, res)
+                    let chunk_duration_ms = chunk_t0.elapsed().as_millis();
+                    (idx, chunk, res, chunk_duration_ms)
                 }
             })
             .buffer_unordered(spawn_ahead);
 
         let mut completed = 0usize;
-        while let Some((idx, chunk, result)) = stream.next().await {
+        while let Some((idx, chunk, result, chunk_duration_ms)) = stream.next().await {
             completed += 1;
             #[cfg(feature = "tracing")]
             let live_permits = self
@@ -1094,12 +1152,20 @@ impl GraphRAG {
                 .as_ref()
                 .map(|s| s.current_permits())
                 .unwrap_or(spawn_ahead);
+            // Card 14: per-chunk structured log with duration_ms (short chunk_id).
+            let chunk_id_short = {
+                let s = chunk.id.0.as_str();
+                &s[..8.min(s.len())]
+            };
             tracing::info!(
-                "extend_graph: completed delta chunk {}/{} (idx={}, llm_permits={}, LLM single-pass)",
-                completed,
-                total,
-                idx,
-                live_permits
+                extend_graph_phase = "llm_chunk",
+                chunk_id = chunk_id_short,
+                duration_ms = chunk_duration_ms,
+                idx = idx,
+                completed = completed,
+                total = total,
+                llm_permits = live_permits,
+                "chunk extracted"
             );
             pb.set_message(format!(
                 "Delta chunk {}/{} (LLM single-pass, permits={})",
@@ -4315,5 +4381,140 @@ mod card13_tests {
                  Not found — add a tracing::info! with this hipporag_phase field."
             );
         }
+    }
+}
+
+// ── Card 14: extend_graph instrumentation static tests ───────────────────────
+//
+// These tests verify the Card 14 instrumentation in graphrag-core:
+//   1. extend_graph_inner emits extend_graph_phase = "summary" with required fields.
+//   2. extend_graph_inner emits per-phase logs for prep, llm_extract_loop,
+//      entity_merge, sidecar_persist.
+//   3. AdaptiveSemaphore uses structured fields llm_concurrency_phase grow/shrink.
+//
+// Run:
+//   cargo test -p graphrag-core --lib --features 'async,pagerank' card14_tests
+#[cfg(test)]
+#[cfg(all(feature = "async", feature = "pagerank"))]
+mod card14_tests {
+    // ── Test 1: extend_graph_inner emits a summary with all required fields ────
+    //
+    // Required fields per Card 14 spec:
+    //   total_ms, prep_ms, llm_extract_ms, entity_merge_ms, sidecar_persist_ms,
+    //   n_chunks, n_entities_added, n_rels_added
+    #[test]
+    fn test_extend_graph_inner_summary_log_fields_present() {
+        let src = include_str!("lib.rs");
+
+        // Extract extend_graph_inner body between its signature and the
+        // LLM single-pass function (next async fn after it).
+        let fn_start_marker = "async fn extend_graph_inner(";
+        let fn_end_marker = "/// LLM single-pass extension path";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn extend_graph_inner('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// LLM single-pass extension path' after extend_graph_inner")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        // ── A: summary call site ──────────────────────────────────────────────
+        assert!(
+            body.contains(r#"extend_graph_phase = "summary""#),
+            "Card 14: extend_graph_inner must contain extend_graph_phase = \"summary\" \
+             tracing::info! call.\n\
+             Not found — add the structured summary log at the end of the function."
+        );
+
+        // ── B: all required summary field names ───────────────────────────────
+        let required_fields = [
+            "total_ms",
+            "prep_ms",
+            "llm_extract_ms",
+            "entity_merge_ms",
+            "sidecar_persist_ms",
+            "n_chunks",
+            "n_entities_added",
+            "n_rels_added",
+        ];
+        for field in &required_fields {
+            assert!(
+                body.contains(field),
+                "Card 14: extend_graph_inner summary log must contain field '{field}'.\n\
+                 Not found — add it to the extend_graph_phase = \"summary\" tracing::info! call."
+            );
+        }
+    }
+
+    // ── Test 2: extend_graph_inner emits per-phase logs ───────────────────────
+    //
+    // Verifies per-phase tracing::info! calls for the major phases.
+    #[test]
+    fn test_extend_graph_inner_per_phase_logs_present() {
+        let src = include_str!("lib.rs");
+
+        let fn_start_marker = "async fn extend_graph_inner(";
+        let fn_end_marker = "/// LLM single-pass extension path";
+
+        let fn_start = src
+            .find(fn_start_marker)
+            .expect("source must contain 'async fn extend_graph_inner('");
+        let fn_end = src[fn_start..]
+            .find(fn_end_marker)
+            .expect("source must contain '/// LLM single-pass extension path' after extend_graph_inner")
+            + fn_start;
+
+        let body = &src[fn_start..fn_end];
+
+        let expected_phases = [
+            r#"extend_graph_phase = "prep""#,
+            r#"extend_graph_phase = "llm_extract_loop""#,
+            r#"extend_graph_phase = "entity_merge""#,
+            r#"extend_graph_phase = "sidecar_persist""#,
+        ];
+
+        for phase in &expected_phases {
+            assert!(
+                body.contains(phase),
+                "Card 14: extend_graph_inner must contain a per-phase log for {phase}.\n\
+                 Not found — add a tracing::info! with this extend_graph_phase field."
+            );
+        }
+    }
+
+    // ── Test 3: AdaptiveSemaphore uses structured grow/shrink log fields ───────
+    //
+    // Verifies that the llm_concurrency_phase field is present in the AIMD
+    // grow and shrink log calls in llm_concurrency.rs (included via the crate).
+    #[test]
+    fn test_adaptive_semaphore_structured_grow_shrink_logs() {
+        let src = include_str!("llm_concurrency.rs");
+
+        // ── Grow log ──────────────────────────────────────────────────────────
+        assert!(
+            src.contains(r#"llm_concurrency_phase = "grow""#),
+            "Card 14: AdaptiveSemaphore must emit llm_concurrency_phase = \"grow\" structured log.\n\
+             Not found in llm_concurrency.rs — add structured fields to the grow tracing::info! call."
+        );
+        assert!(
+            src.contains("success_threshold_met"),
+            "Card 14: llm_concurrency grow log must contain 'success_threshold_met' field.\n\
+             Not found — add it to the grow tracing::info! call."
+        );
+
+        // ── Shrink log ────────────────────────────────────────────────────────
+        assert!(
+            src.contains(r#"llm_concurrency_phase = "shrink""#),
+            "Card 14: AdaptiveSemaphore must emit llm_concurrency_phase = \"shrink\" structured log.\n\
+             Not found in llm_concurrency.rs — add structured fields to the shrink tracing::warn! call."
+        );
+        assert!(
+            src.contains(r#"reason = "transport_failure""#),
+            "Card 14: llm_concurrency shrink log must contain reason = \"transport_failure\" field.\n\
+             Not found — add it to the shrink tracing::warn! call."
+        );
     }
 }
