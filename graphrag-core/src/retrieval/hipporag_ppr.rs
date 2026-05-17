@@ -195,13 +195,32 @@ impl HippoRAGRetriever {
         ppr_override: Option<std::sync::Arc<crate::graph::pagerank::PersonalizedPageRank>>,
         pre_embedded: Option<&[f32]>,
     ) -> Result<Vec<ChunkId>> {
+        // Phase instrumentation: one Instant::now() per sub-phase; a structured
+        // summary log at function exit mirrors the Card 13/14 pattern.
+        let retrieve_t0 = std::time::Instant::now();
+
+        // ── Phase 1: embed ────────────────────────────────────────────────────
         // Step 1: Embed query via the dedicated query backend (NPU when configured),
         // or use the caller-supplied pre-computed embedding to skip the embed call.
+        let embed_t0 = std::time::Instant::now();
         let query_vec = match pre_embedded {
             Some(v) => v.to_vec(),
             None => embedder.embed_query(query).await?,
         };
+        let embed_elapsed_ms = if pre_embedded.is_some() {
+            // Skipped — pre-embedded vector supplied by caller (Card 4 fast-path).
+            0u128
+        } else {
+            embed_t0.elapsed().as_millis()
+        };
+        tracing::info!(
+            retrieve_phase = "embed",
+            duration_ms = embed_elapsed_ms,
+            pre_embedded = pre_embedded.is_some(),
+            "retrieve embed done",
+        );
 
+        // ── Phase 2: vector_searches ──────────────────────────────────────────
         // Steps 2, 3, 5 (search phase): fire all three vector-store searches concurrently.
         //
         // `VectorStore: Send + Sync` guarantees a single `&dyn VectorStore` reference
@@ -209,6 +228,7 @@ impl HippoRAGRetriever {
         // changes.  Ordering within `tokio::join!` is deterministic (arm 0 is polled
         // first), so the ScriptedVectorStore mock in tests still consumes responses in
         // the expected entity → relation → dense order.
+        let searches_t0 = std::time::Instant::now();
 
         // Step 2: Top-K entity sidecar hits
         // Step 3: Top-K relation sidecar hits → Fact triples
@@ -219,8 +239,10 @@ impl HippoRAGRetriever {
             vector_store.search(&query_vec, self.config.top_k_facts),
             vector_store.search(&query_vec, self.config.top_k_dense),
         );
-        let _entity_hits = entity_res?;
+        let entity_hits = entity_res?;
         let relation_hits = relation_res?;
+        let n_entity_hits = entity_hits.len();
+        let n_relation_hits = relation_hits.len();
 
         let top_k_facts: Vec<Fact> = relation_hits
             .into_iter()
@@ -241,6 +263,39 @@ impl HippoRAGRetriever {
             .take(self.config.top_k_facts)
             .collect();
 
+        // Step 5: Materialise dense hits (fetched concurrently above in tokio::join!)
+        //
+        // Primary type: ChunkId → f32  (used for combined scoring in step 7).
+        // Legacy type:  EntityId → f32  (used by calculate_passage_weights helper).
+        let dense_hits = dense_res?;
+        let n_dense_hits = dense_hits.len();
+
+        let searches_elapsed_ms = searches_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "vector_searches",
+            duration_ms = searches_elapsed_ms,
+            n_entity_hits = n_entity_hits,
+            n_relation_hits = n_relation_hits,
+            n_dense_hits = n_dense_hits,
+            "retrieve vector_searches done",
+        );
+
+        // entity_hits was captured for the hit count; discard the values now
+        // (they are not used further in the graph-based PPR path).
+        drop(entity_hits);
+
+        let passage_scores_typed: HashMap<ChunkId, f32> = dense_hits
+            .into_iter()
+            .map(|hit| (ChunkId::new(hit.id), hit.score))
+            .collect();
+
+        // Boundary translation: ChunkId → EntityId namespace for helper compatibility.
+        let passage_scores_legacy: HashMap<EntityId, f32> = passage_scores_typed
+            .iter()
+            .map(|(cid, &score)| (chunk_id_as_ppr_node(cid), score))
+            .collect();
+
+        // ── Phase 3: entity_to_passages_build ────────────────────────────────
         // Step 4: Build entity_to_passages from graph mentions.
         //
         // Primary type: EntityId → Vec<ChunkId>  (used for PPR→chunk projection in step 7).
@@ -248,6 +303,8 @@ impl HippoRAGRetriever {
         //
         // The legacy form is built by routing through `chunk_id_as_ppr_node` — the named
         // boundary-translation function defined above (OQ-3 / Item 3 resolution, option b).
+        let e2p_t0 = std::time::Instant::now();
+
         let entity_to_passages_typed: HashMap<EntityId, Vec<ChunkId>> = graph
             .entities()
             .map(|entity| {
@@ -272,22 +329,13 @@ impl HippoRAGRetriever {
                 })
                 .collect();
 
-        // Step 5: Materialise dense hits (fetched concurrently above in tokio::join!)
-        //
-        // Primary type: ChunkId → f32  (used for combined scoring in step 7).
-        // Legacy type:  EntityId → f32  (used by calculate_passage_weights helper).
-        let dense_hits = dense_res?;
-
-        let passage_scores_typed: HashMap<ChunkId, f32> = dense_hits
-            .into_iter()
-            .map(|hit| (ChunkId::new(hit.id), hit.score))
-            .collect();
-
-        // Boundary translation: ChunkId → EntityId namespace for helper compatibility.
-        let passage_scores_legacy: HashMap<EntityId, f32> = passage_scores_typed
-            .iter()
-            .map(|(cid, &score)| (chunk_id_as_ppr_node(cid), score))
-            .collect();
+        let e2p_elapsed_ms = e2p_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "entity_to_passages_build",
+            duration_ms = e2p_elapsed_ms,
+            n_entities = entity_to_passages_typed.len(),
+            "retrieve entity_to_passages_build done",
+        );
 
         // Step 6a: Calculate entity weights from facts
         let entity_weights =
@@ -299,6 +347,7 @@ impl HippoRAGRetriever {
         // Step 6c: Combine into reset probability distribution
         let reset_probabilities = self.combine_weights(entity_weights, passage_weights)?;
 
+        // ── Phase 4: ppr_build_or_use ─────────────────────────────────────────
         // Step 6d: Snapshot PPR from graph (OQ-1: consistent snapshot semantics),
         // or use the pre-built cached instance supplied by the caller.
         //
@@ -313,10 +362,17 @@ impl HippoRAGRetriever {
         //
         // `PersonalizedPageRank` does not implement `Clone`, so we hold either an owned
         // value (None branch) or a shared Arc (Some branch) and unify them via a reference.
+        let ppr_build_t0 = std::time::Instant::now();
+        let ppr_path: &'static str;
+
         let _built_ppr_holder: Option<crate::graph::pagerank::PersonalizedPageRank>;
         let ppr_ref: &crate::graph::pagerank::PersonalizedPageRank = match &ppr_override {
-            Some(cached) => cached.as_ref(),
+            Some(cached) => {
+                ppr_path = "cached";
+                cached.as_ref()
+            }
             None => {
+                ppr_path = "cold_build";
                 _built_ppr_holder = Some(graph.build_pagerank_calculator().map_err(|e| {
                     GraphRAGError::Config {
                         message: format!("Failed to build PPR from graph: {e}"),
@@ -326,11 +382,34 @@ impl HippoRAGRetriever {
             }
         };
 
+        let ppr_build_elapsed_ms = ppr_build_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "ppr_build_or_use",
+            duration_ms = ppr_build_elapsed_ms,
+            ppr_path = ppr_path,
+            "retrieve ppr_build_or_use done",
+        );
+
+        // ── Phase 5: ppr_run ──────────────────────────────────────────────────
         // Run PPR — output is HashMap<EntityId, f64> over entity-graph nodes only.
         // Nodes whose keys originated from `chunk_id_as_ppr_node` will appear here
         // if their IDs matched the graph's entity namespace (rare but possible).
+        //
+        // Note: calculate_scores() does not expose a per-call iteration count in
+        // its return type (it returns HashMap<EntityId, f64>). The max_iterations
+        // cap is available via self.config.max_iterations if needed for context.
+        let ppr_run_t0 = std::time::Instant::now();
         let ppr_scores = ppr_ref.calculate_scores(&reset_probabilities)?;
+        let ppr_run_elapsed_ms = ppr_run_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "ppr_run",
+            duration_ms = ppr_run_elapsed_ms,
+            n_ppr_nodes = ppr_scores.len(),
+            max_iterations_cap = self.config.max_iterations,
+            "retrieve ppr_run done",
+        );
 
+        // ── Phase 6: ppr_project_to_chunks ───────────────────────────────────
         // Step 7: Aggregate entity PPR scores into passage (ChunkId) scores,
         //         then rank via `rank_passages`.
         //
@@ -344,6 +423,7 @@ impl HippoRAGRetriever {
         // `chunk_id_as_ppr_node`) so it can be fed to `rank_passages`, which filters
         // its input to keys that appear in `passage_scores_legacy` — i.e. only chunk
         // nodes, not raw entity nodes.
+        let ppr_project_t0 = std::time::Instant::now();
         let mut chunk_combined_ppr: HashMap<EntityId, f64> = HashMap::new();
 
         // (a) Entity PPR → chunk propagation (entity namespace → chunk namespace)
@@ -380,6 +460,34 @@ impl HippoRAGRetriever {
             .into_iter()
             .map(|r| ppr_node_as_chunk_id(&EntityId::new(r.id)))
             .collect();
+
+        let ppr_project_elapsed_ms = ppr_project_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "ppr_project_to_chunks",
+            duration_ms = ppr_project_elapsed_ms,
+            n_chunks_out = chunk_ids.len(),
+            "retrieve ppr_project_to_chunks done",
+        );
+
+        // ── Summary ───────────────────────────────────────────────────────────
+        let total_elapsed_ms = retrieve_t0.elapsed().as_millis();
+        tracing::info!(
+            retrieve_phase = "summary",
+            total_ms = total_elapsed_ms,
+            embed_ms = embed_elapsed_ms,
+            vector_searches_ms = searches_elapsed_ms,
+            entity_to_passages_ms = e2p_elapsed_ms,
+            ppr_path = ppr_path,
+            ppr_build_ms = ppr_build_elapsed_ms,
+            ppr_run_ms = ppr_run_elapsed_ms,
+            ppr_project_ms = ppr_project_elapsed_ms,
+            n_entity_hits = n_entity_hits,
+            n_relation_hits = n_relation_hits,
+            n_dense_hits = n_dense_hits,
+            n_ppr_chunks_out = chunk_ids.len(),
+            pre_embedded = pre_embedded.is_some(),
+            "retrieve summary",
+        );
 
         Ok(chunk_ids)
     }

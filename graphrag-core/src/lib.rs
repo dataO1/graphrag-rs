@@ -4518,3 +4518,91 @@ mod card14_tests {
         );
     }
 }
+
+// ── Card 15: HippoRAGRetriever::retrieve sub-phase instrumentation ────────────
+//
+// Static-analysis tests verify that `retrieve()` in hipporag_ppr.rs contains
+// the expected `retrieve_phase = "summary"` tracing::info! call with all
+// required fields, plus per-phase logs for each instrumented step.
+//
+// Background: Cards 13+14 narrowed the 15s gap to retrieve_ms=16928 in the
+// live Spark-2-idle trace.  Card 15 drills into retrieve() to find which
+// sub-phase (embed, vector_searches, entity_to_passages_build, ppr_build_or_use,
+// ppr_run, ppr_project_to_chunks) carries the latency.
+//
+// Run:
+//   cargo test -p graphrag-core --lib --features 'async,pagerank' card15_tests
+#[cfg(test)]
+#[cfg(all(feature = "async", feature = "pagerank"))]
+mod card15_tests {
+    // ── Test 1: retrieve() emits a summary log with all required fields ────────
+    //
+    // Required fields per Card 15 spec:
+    //   total_ms, embed_ms, vector_searches_ms, entity_to_passages_ms,
+    //   ppr_path, ppr_build_ms, ppr_run_ms, ppr_project_ms,
+    //   n_entity_hits, n_relation_hits, n_dense_hits, n_ppr_chunks_out, pre_embedded
+    #[test]
+    fn test_retrieve_summary_log_fields_present() {
+        let src = include_str!("retrieval/hipporag_ppr.rs");
+
+        // ── A: summary call site ──────────────────────────────────────────────
+        assert!(
+            src.contains(r#"retrieve_phase = "summary""#),
+            "Card 15: retrieve() must contain a retrieve_phase = \"summary\" \
+             tracing::info! call.\n\
+             Not found in hipporag_ppr.rs — add the structured summary log at \
+             the end of the function."
+        );
+
+        // ── B: all required summary field names ───────────────────────────────
+        let required_fields = [
+            "total_ms",
+            "embed_ms",
+            "vector_searches_ms",
+            "entity_to_passages_ms",
+            "ppr_path",
+            "ppr_build_ms",
+            "ppr_run_ms",
+            "ppr_project_ms",
+            "n_entity_hits",
+            "n_relation_hits",
+            "n_dense_hits",
+            "n_ppr_chunks_out",
+            "pre_embedded",
+        ];
+        for field in &required_fields {
+            assert!(
+                src.contains(field),
+                "Card 15: retrieve() summary log must contain field '{field}'.\n\
+                 Not found in hipporag_ppr.rs — add it to the \
+                 retrieve_phase = \"summary\" tracing::info! call."
+            );
+        }
+    }
+
+    // ── Test 2: per-phase info! calls present in retrieve() ───────────────────
+    //
+    // Verifies that each of the 6 sub-phases emits its own retrieve_phase log.
+    #[test]
+    fn test_retrieve_per_phase_logs_present() {
+        let src = include_str!("retrieval/hipporag_ppr.rs");
+
+        let expected_phases = [
+            r#"retrieve_phase = "embed""#,
+            r#"retrieve_phase = "vector_searches""#,
+            r#"retrieve_phase = "entity_to_passages_build""#,
+            r#"retrieve_phase = "ppr_build_or_use""#,
+            r#"retrieve_phase = "ppr_run""#,
+            r#"retrieve_phase = "ppr_project_to_chunks""#,
+        ];
+
+        for phase in &expected_phases {
+            assert!(
+                src.contains(phase),
+                "Card 15: retrieve() must contain a per-phase log for {phase}.\n\
+                 Not found in hipporag_ppr.rs — add a tracing::info! with this \
+                 retrieve_phase field."
+            );
+        }
+    }
+}
