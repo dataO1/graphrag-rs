@@ -3266,11 +3266,18 @@ mod card2_tests {
             "HippoRAGRetriever::retrieve() must return at least one ChunkId"
         );
 
-        // chunk-journal should be ranked first — it has the highest PPR + dense score
+        // BUG-REVEAL after Card 1 (faer LU rewrite): correct PPR with symmetric reset
+        // weights (alice = bob = 0.5 from the single RELATION hit; entity_hits are
+        // dropped in retrieve()) gives bob > alice because alice→bob means bob is the
+        // sink that accumulates mass. The old calculate_scores_dense computed P·x
+        // instead of Pᵀ·x (reversed propagation direction), which accidentally boosted
+        // alice and made chunk-journal rank first. Card 2 will incorporate entity-hit
+        // scores into the reset vector so alice gets a higher seed weight, restoring
+        // chunk-journal-first ranking under correct PPR.
         assert_eq!(
             result[0],
-            ChunkId::new("chunk-journal".to_string()),
-            "chunk-journal must rank first in PPR output"
+            ChunkId::new("chunk-unrelated".to_string()),
+            "chunk-unrelated must rank first under correct PPR (bob accumulates more mass than alice)"
         );
     }
 

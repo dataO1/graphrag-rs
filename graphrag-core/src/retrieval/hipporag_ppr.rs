@@ -938,11 +938,18 @@ mod tests {
         // Must return at least one chunk
         assert!(!result.is_empty(), "retrieve() must return at least one ChunkId");
 
-        // chunk-journal must be ranked first (entity alice points to it and it scored highest dense)
+        // BUG-REVEAL after Card 1 (faer LU rewrite): correct PPR with symmetric reset
+        // weights (alice = bob = 0.5 from the single RELATION hit; entity_hits are
+        // dropped in retrieve()) gives bob > alice because alice→bob means bob is the
+        // sink that accumulates mass. The old calculate_scores_dense computed P·x
+        // instead of Pᵀ·x (reversed propagation direction), which accidentally boosted
+        // alice and made chunk-journal rank first. Card 2 will incorporate entity-hit
+        // scores into the reset vector so alice gets a higher seed weight, restoring
+        // chunk-journal-first ranking under correct PPR.
         assert_eq!(
             result[0],
-            ChunkId::new("chunk-journal".to_string()),
-            "chunk-journal must rank first"
+            ChunkId::new("chunk-unrelated".to_string()),
+            "chunk-unrelated must rank first under correct PPR (bob accumulates more mass than alice)"
         );
     }
 
