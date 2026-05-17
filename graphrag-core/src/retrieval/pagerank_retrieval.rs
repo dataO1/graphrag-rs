@@ -818,40 +818,37 @@ mod tests {
     fn test_pagerank_config_performance() {
         let graph = create_test_graph();
 
-        // Test parallel vs sequential
-        let parallel_config = PageRankConfig {
-            parallel_enabled: true,
+        // Test two configs that previously varied parallel_enabled; the direct
+        // solver produces identical results regardless, so we just check validity.
+        let config_a = PageRankConfig {
             cache_size: 100,
             ..PageRankConfig::default()
         };
 
-        let sequential_config = PageRankConfig {
-            parallel_enabled: false,
-            cache_size: 100,
+        let config_b = PageRankConfig {
+            cache_size: 200,
             ..PageRankConfig::default()
         };
 
-        let mut parallel_retrieval =
-            PageRankRetrievalSystem::new(5).with_pagerank_config(parallel_config);
-        let mut sequential_retrieval =
-            PageRankRetrievalSystem::new(5).with_pagerank_config(sequential_config);
+        let mut retrieval_a =
+            PageRankRetrievalSystem::new(5).with_pagerank_config(config_a);
+        let mut retrieval_b =
+            PageRankRetrievalSystem::new(5).with_pagerank_config(config_b);
 
-        parallel_retrieval.initialize_vector_index(&graph).unwrap();
-        sequential_retrieval
-            .initialize_vector_index(&graph)
-            .unwrap();
+        retrieval_a.initialize_vector_index(&graph).unwrap();
+        retrieval_b.initialize_vector_index(&graph).unwrap();
 
         let query = "Apple iPhone";
-        let parallel_results = parallel_retrieval
+        let results_a = retrieval_a
             .search_with_pagerank(query, &graph, None)
             .unwrap();
-        let sequential_results = sequential_retrieval
+        let results_b = retrieval_b
             .search_with_pagerank(query, &graph, None)
             .unwrap();
 
         // Both should return valid results
-        assert!(!parallel_results.is_empty());
-        assert!(!sequential_results.is_empty());
+        assert!(!results_a.is_empty());
+        assert!(!results_b.is_empty());
     }
 
     #[test]

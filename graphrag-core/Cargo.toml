@@ -91,7 +91,7 @@ lancedb = [
 basic-retrieval = []
 graph-retrieval = []
 hybrid-retrieval = ["basic-retrieval", "graph-retrieval"]
-pagerank = ["sprs", "nalgebra", "parking_lot", "lru"]
+pagerank = ["sprs", "nalgebra", "parking_lot", "lru", "dep:faer"]
 
 # Processing features
 parallel-processing = ["rayon", "num_cpus"]
@@ -346,6 +346,7 @@ lancedb = { workspace = true, optional = true, features = ["remote"] }
 arrow-array = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 qdrant-client = { workspace = true, optional = true }
+faer = { version = "0.24", default-features = false, features = ["sparse-linalg", "std"], optional = true }
 
 # Force getrandom 0.2 to use js feature for WASM targets
 # This overrides the dependency resolution for transitive dependencies (rand, ureq)

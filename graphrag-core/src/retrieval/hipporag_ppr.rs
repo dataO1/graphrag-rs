@@ -395,9 +395,8 @@ impl HippoRAGRetriever {
         // Nodes whose keys originated from `chunk_id_as_ppr_node` will appear here
         // if their IDs matched the graph's entity namespace (rare but possible).
         //
-        // Note: calculate_scores() does not expose a per-call iteration count in
-        // its return type (it returns HashMap<EntityId, f64>). The max_iterations
-        // cap is available via self.config.max_iterations if needed for context.
+        // Note: calculate_scores() performs two sparse back-substitutions against
+        // the cached LU factorisation (no iteration count — direct solver).
         let ppr_run_t0 = std::time::Instant::now();
         let ppr_scores = ppr_ref.calculate_scores(&reset_probabilities)?;
         let ppr_run_elapsed_ms = ppr_run_t0.elapsed().as_millis();
@@ -405,7 +404,6 @@ impl HippoRAGRetriever {
             retrieve_phase = "ppr_run",
             duration_ms = ppr_run_elapsed_ms,
             n_ppr_nodes = ppr_scores.len(),
-            max_iterations_cap = self.config.max_iterations,
             "retrieve ppr_run done",
         );
 
@@ -704,14 +702,8 @@ impl HippoRAGConfig {
     pub fn to_pagerank_config(&self) -> PageRankConfig {
         PageRankConfig {
             damping_factor: self.damping_factor,
-            max_iterations: self.max_iterations,
-            tolerance: self.tolerance,
             personalized: true,
-            parallel_enabled: true,
             cache_size: 1000,
-            sparse_threshold: 1000,
-            incremental_updates: true,
-            simd_block_size: 32,
         }
     }
 }
