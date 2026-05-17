@@ -228,53 +228,50 @@ impl PersonalizedPageRank {
     ///
     /// Dangling nodes (out_degree=0) contribute nothing to `Pᵀ`; their SMW
     /// correction is handled separately.
+    ///
+    /// # Bug history
+    ///
+    /// An earlier version pre-computed `nnz_per_col[j] = 1 + row.nnz()` then
+    /// allocated flat `row_idx`/`values` arrays up front.  The count was wrong
+    /// whenever node `j` had a self-loop (`j→j`): the self-loop is *merged*
+    /// into the diagonal entry during fill (reducing the written count by 1),
+    /// but the pre-computed count still reserved a slot for it.  That ghost
+    /// slot remained zero-initialised, so `col_ptr[j+1]` was one beyond the
+    /// last entry actually written for column `j`.  faer's `new_checked` then
+    /// read `[…, row_j, 0]` as column `j`'s row indices and asserted
+    /// `row_j < 0`, producing the panic
+    ///   `Assertion failed: i < i_next — i = 16779, i_next = 0`
+    /// on the 29 k-node production graph where node 16779 had a self-loop.
+    ///
+    /// The fix: collect each column's entries fully (with self-loop merging)
+    /// *before* finalising `col_ptr`, so the count is always exact.
     fn build_system_matrix(
         adjacency: &CsMat<f64>,
         out_degrees: &[f64],
         alpha: f64,
         n: usize,
     ) -> SparseColMat<usize, f64> {
-        // Count non-zeros per column first, then build CSC arrays.
-        // Column j has: 1 diagonal + #(outgoing edges from j that are non-dangling).
-        // Diagonal always present.  Off-diagonals: one per non-zero in adjacency row j.
+        // Pass 1: build each column's (row, value) pairs with the self-loop
+        // diagonal merge applied.  We collect into a Vec-of-Vecs so that
+        // col_ptr can be derived from the *actual* number of entries written
+        // rather than from a pre-computed estimate that does not account for
+        // the diagonal merge.
+        let mut all_col_entries: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
 
-        let nnz_per_col: Vec<usize> = (0..n)
-            .map(|j| {
-                let nzs = adjacency
-                    .outer_view(j)
-                    .map(|row| row.nnz())
-                    .unwrap_or(0);
-                1 + nzs // diagonal + off-diagonals
-            })
-            .collect();
-
-        let total_nnz: usize = nnz_per_col.iter().sum();
-
-        // Build col_ptr (CSC column pointers)
-        let mut col_ptr = vec![0usize; n + 1];
         for j in 0..n {
-            col_ptr[j + 1] = col_ptr[j] + nnz_per_col[j];
-        }
-
-        let mut row_idx = vec![0usize; total_nnz];
-        let mut values = vec![0.0f64; total_nnz];
-
-        // Fill in each column
-        for j in 0..n {
-            let start = col_ptr[j];
             let deg = out_degrees[j];
 
-            // Collect entries for column j: diagonal + off-diagonals
-            // Then sort by row index so faer's `new_checked` is satisfied.
+            // Every column has at least the diagonal entry I[j,j].
             let mut col_entries: Vec<(usize, f64)> = Vec::new();
-            col_entries.push((j, 1.0)); // diagonal: I[j,j]
+            col_entries.push((j, 1.0));
 
             if deg > 0.0 {
                 if let Some(row) = adjacency.outer_view(j) {
                     for (i, &w) in row.iter() {
                         // A[i,j] -= α * P^T[i,j] = α * adj[j,i] / deg[j]
                         if i == j {
-                            // Off-diagonal coincides with diagonal; merge
+                            // Self-loop: merge contribution into diagonal.
+                            // This does NOT add a new row-index entry.
                             col_entries[0].1 -= alpha * w / deg;
                         } else {
                             col_entries.push((i, -alpha * w / deg));
@@ -283,9 +280,25 @@ impl PersonalizedPageRank {
                 }
             }
 
-            // Sort by row index (required for CSC sorted format)
+            // Sort by row index (faer's CSC format requires sorted row indices
+            // within each column).
             col_entries.sort_unstable_by_key(|(row, _)| *row);
+            all_col_entries.push(col_entries);
+        }
 
+        // Pass 2: compute col_ptr from the *actual* per-column entry counts.
+        let mut col_ptr = vec![0usize; n + 1];
+        for j in 0..n {
+            col_ptr[j + 1] = col_ptr[j] + all_col_entries[j].len();
+        }
+        let total_nnz = col_ptr[n];
+
+        // Pass 3: flatten into the CSC row_idx / values arrays.
+        let mut row_idx = vec![0usize; total_nnz];
+        let mut values = vec![0.0f64; total_nnz];
+
+        for (j, col_entries) in all_col_entries.into_iter().enumerate() {
+            let start = col_ptr[j];
             for (k, (row, val)) in col_entries.into_iter().enumerate() {
                 row_idx[start + k] = row;
                 values[start + k] = val;
@@ -771,6 +784,101 @@ mod tests {
             eprintln!(
                 "[prpack_fidelity] fixture '{}' n={}: max rel err = {max_rel_err:.2e}",
                 fixture.name, fixture.n
+            );
+        }
+    }
+
+    /// Regression test for the CSC col_ptr monotonicity violation on graphs
+    /// that contain self-loops.
+    ///
+    /// Root cause: the original `build_system_matrix` pre-computed
+    /// `nnz_per_col[j] = 1 + row.nnz()` and allocated the flat `row_idx` /
+    /// `values` arrays up front.  A self-loop `j→j` is *merged* into the
+    /// diagonal during fill (not pushed as an extra entry), so the reserved
+    /// slot was never written.  The ghost slot remained zero-initialised.
+    /// `col_ptr[j+1]` then pointed one past the last written entry, and
+    /// faer's `new_checked` read `[…, row_j, 0]` as column `j`'s row
+    /// indices, asserting `row_j < 0` — reproducing the production panic:
+    ///
+    ///   `Assertion failed: i < i_next — i = 16779, i_next = 0`
+    ///
+    /// This test reproduces the shape that triggered it: a moderate-size
+    /// directed graph (500 nodes) that mimics the production Obsidian KG
+    /// (29 k nodes, ~2 edges per node, ~40% dangling nodes, long-tail degree
+    /// distribution, edges added in unsorted/arbitrary order, and a
+    /// self-loop on every hub node so the pre-fix count mismatch fires).
+    #[test]
+    fn test_csc_col_ptr_monotonicity_self_loop_regression() {
+        // Build a 500-node graph that mirrors the production failure shape:
+        //   - Hub nodes (every 50th node) each have a self-loop + fan-out
+        //   - Long-tail edges: each non-hub node points to its predecessor
+        //   - ~40% of nodes are dangling (out_degree = 0): every node whose
+        //     index is divisible by 5 but not a hub has no outgoing edge
+        //   - Edges are added in non-sequential (unsorted) order
+        let n = 500usize;
+        let mut triplet = sprs::TriMat::new((n, n));
+
+        // Hub nodes: 0, 50, 100, … each with a self-loop and fan-out
+        for h in (0..n).step_by(50) {
+            // Self-loop — this is the entry that triggered the pre-fix panic
+            triplet.add_triplet(h, h, 1.0);
+            // Fan-out to the next 5 non-hub nodes
+            for k in 1..=5usize {
+                let dst = (h + k) % n;
+                triplet.add_triplet(h, dst, 1.0);
+            }
+        }
+
+        // Non-hub edges — added in reverse order (non-sorted) to stress
+        // the sort path and ensure adjacency rows are not pre-sorted
+        for i in (1..n).rev() {
+            // Skip hub nodes (they already have edges above)
+            if i % 50 == 0 {
+                continue;
+            }
+            // ~40% dangling: skip nodes divisible by 5
+            if i % 5 == 0 {
+                continue;
+            }
+            // Point to previous node (creates a long-tail chain)
+            triplet.add_triplet(i, i - 1, 1.0);
+        }
+
+        let adjacency = triplet.to_csr();
+
+        let mut node_mapping = HashMap::new();
+        let mut reverse_mapping = HashMap::new();
+        for i in 0..n {
+            let id = EntityId::new(format!("node_{i}"));
+            node_mapping.insert(id.clone(), i);
+            reverse_mapping.insert(i, id);
+        }
+
+        let mut config = PageRankConfig::default();
+        config.damping_factor = 0.85;
+
+        // Before the fix this call panicked with:
+        //   "Assertion failed: i < i_next — i = <hub_idx>, i_next = 0"
+        // After the fix it must complete without panic.
+        let ppr = PersonalizedPageRank::new(config, adjacency, node_mapping.clone(), reverse_mapping);
+
+        // Sanity-check: scores exist for all nodes and form a valid distribution
+        let mut seeds = HashMap::new();
+        seeds.insert(EntityId::new("node_0".to_string()), 1.0);
+        let scores = ppr.calculate_scores(&seeds).expect("calculate_scores failed");
+
+        assert_eq!(scores.len(), n, "scores should cover all {n} nodes");
+        let total: f64 = scores.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-9,
+            "scores should sum to 1.0 ± 1e-9, got {total}"
+        );
+        for i in 0..n {
+            let id = EntityId::new(format!("node_{i}"));
+            let s = scores.get(&id).copied().unwrap_or(0.0);
+            assert!(
+                s.is_finite() && s >= 0.0,
+                "node_{i} score must be finite and non-negative, got {s}"
             );
         }
     }
